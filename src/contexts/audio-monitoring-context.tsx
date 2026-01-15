@@ -859,60 +859,67 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   }, [setDevicesVolume]);
 
   // Auto-detect day/night mode changes while monitoring (24/7 operation)
+  // TEMPORARILY DISABLED TO DEBUG MEMORY ISSUE
   useEffect(() => {
-    // Clear any existing interval first to prevent memory leaks
-    if (dayNightCheckIntervalRef.current) {
-      clearInterval(dayNightCheckIntervalRef.current);
-      dayNightCheckIntervalRef.current = null;
-    }
+    debugLog('[AudioMonitoring] Day/night auto-switching temporarily disabled for debugging');
+    return () => {};
+  }, []);
 
-    // Only run if day/night mode is enabled
-    if (!dayNightMode) {
-      previousDayModeRef.current = null;
-      return;
-    }
-
-    // Check every minute for day/night transitions
-    dayNightCheckIntervalRef.current = setInterval(() => {
-      // Calculate current day/night status directly to avoid function dependency
-      const now = new Date();
-      const currentHour = now.getHours();
-      const currentIsDaytime = currentHour >= dayStartHour && currentHour < dayEndHour;
-
-      // Initialize on first run
-      if (previousDayModeRef.current === null) {
-        previousDayModeRef.current = currentIsDaytime;
-        debugLog(`[AudioMonitoring] Day/night monitor initialized: ${currentIsDaytime ? 'DAY' : 'NIGHT'}`);
-        return;
-      }
-
-      // Check if day/night mode changed
-      if (previousDayModeRef.current !== currentIsDaytime) {
-        debugLog(`[AudioMonitoring] ⏰ Day/night mode changed: ${previousDayModeRef.current ? 'DAY' : 'NIGHT'} → ${currentIsDaytime ? 'DAY' : 'NIGHT'}`);
-        previousDayModeRef.current = currentIsDaytime;
-
-        // If speakers are currently enabled, restart the ramp with new settings
-        // Use refs to check current state without adding to dependencies
-        if (speakersEnabled && !controllingSpakersRef.current) {
-          const currentVolume = currentVolumeRef.current;
-          debugLog(`[AudioMonitoring] Restarting volume ramp due to day/night change from ${currentVolume}%`);
-          startVolumeRamp(currentVolume);
-        }
-      }
-    }, 60000); // Check every 60 seconds
-
-    debugLog(`[AudioMonitoring] Day/night checker started (enabled: ${dayNightMode})`);
-
-    return () => {
-      if (dayNightCheckIntervalRef.current) {
-        debugLog(`[AudioMonitoring] Day/night checker stopped (cleanup)`);
-        clearInterval(dayNightCheckIntervalRef.current);
-        dayNightCheckIntervalRef.current = null;
-      }
-    };
-    // Only depend on stable values - not functions
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dayNightMode, dayStartHour, dayEndHour]);
+  // TODO: Re-enable after fixing memory leak
+  // useEffect(() => {
+  //   // Clear any existing interval first to prevent memory leaks
+  //   if (dayNightCheckIntervalRef.current) {
+  //     clearInterval(dayNightCheckIntervalRef.current);
+  //     dayNightCheckIntervalRef.current = null;
+  //   }
+  //
+  //   // Only run if day/night mode is enabled
+  //   if (!dayNightMode) {
+  //     previousDayModeRef.current = null;
+  //     return;
+  //   }
+  //
+  //   // Check every minute for day/night transitions
+  //   dayNightCheckIntervalRef.current = setInterval(() => {
+  //     // Calculate current day/night status directly to avoid function dependency
+  //     const now = new Date();
+  //     const currentHour = now.getHours();
+  //     const currentIsDaytime = currentHour >= dayStartHour && currentHour < dayEndHour;
+  //
+  //     // Initialize on first run
+  //     if (previousDayModeRef.current === null) {
+  //       previousDayModeRef.current = currentIsDaytime;
+  //       debugLog(`[AudioMonitoring] Day/night monitor initialized: ${currentIsDaytime ? 'DAY' : 'NIGHT'}`);
+  //       return;
+  //     }
+  //
+  //     // Check if day/night mode changed
+  //     if (previousDayModeRef.current !== currentIsDaytime) {
+  //       debugLog(`[AudioMonitoring] ⏰ Day/night mode changed: ${previousDayModeRef.current ? 'DAY' : 'NIGHT'} → ${currentIsDaytime ? 'DAY' : 'NIGHT'}`);
+  //       previousDayModeRef.current = currentIsDaytime;
+  //
+  //       // If speakers are currently enabled, restart the ramp with new settings
+  //       // Use refs to check current state without adding to dependencies
+  //       if (speakersEnabled && !controllingSpakersRef.current) {
+  //         const currentVolume = currentVolumeRef.current;
+  //         debugLog(`[AudioMonitoring] Restarting volume ramp due to day/night change from ${currentVolume}%`);
+  //         startVolumeRamp(currentVolume);
+  //       }
+  //     }
+  //   }, 60000); // Check every 60 seconds
+  //
+  //   debugLog(`[AudioMonitoring] Day/night checker started (enabled: ${dayNightMode})`);
+  //
+  //   return () => {
+  //     if (dayNightCheckIntervalRef.current) {
+  //       debugLog(`[AudioMonitoring] Day/night checker stopped (cleanup)`);
+  //       clearInterval(dayNightCheckIntervalRef.current);
+  //       dayNightCheckIntervalRef.current = null;
+  //     }
+  //   };
+  //   // Only depend on stable values - not functions
+  //   // eslint-disable-next-line react-hooks/exhaustive-deps
+  // }, [dayNightMode, dayStartHour, dayEndHour]);
 
   // Enable/disable speakers
   const controlSpeakers = useCallback(async (enable: boolean) => {
