@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { AppLayout } from "@/components/layout/app-layout";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -39,11 +39,7 @@ export default function DistributePage() {
   const [results, setResults] = useState<DistributionResult[]>([]);
   const [showResults, setShowResults] = useState(false);
 
-  useEffect(() => {
-    loadData();
-  }, []);
-
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       const [devicesData, audioData] = await Promise.all([
         getDevices(),
@@ -56,7 +52,11 @@ export default function DistributePage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   const toggleDevice = (deviceId: string) => {
     setSelectedDevices((prev) =>
@@ -204,8 +204,11 @@ export default function DistributePage() {
     setStopping(false);
   };
 
-  // Get unique zones
-  const zones = [...new Set(devices.map((d) => d.zone).filter(Boolean))];
+  // Get unique zones - memoized to prevent recalculation on every render
+  const zones = useMemo(() =>
+    [...new Set(devices.map((d) => d.zone).filter(Boolean))],
+    [devices]
+  );
 
   if (loading) {
     return (
