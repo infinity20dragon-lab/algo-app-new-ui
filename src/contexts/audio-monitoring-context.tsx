@@ -32,6 +32,16 @@ export interface AudioLogEntry {
   recordingUrl?: string; // URL to recorded audio clip
 }
 
+// Speaker connectivity status
+export interface SpeakerStatus {
+  speakerId: string;
+  speakerName: string;
+  ipAddress: string;
+  isOnline: boolean;
+  lastChecked: Date;
+  errorMessage?: string;
+}
+
 interface AudioMonitoringContextType {
   // Audio capture state
   isCapturing: boolean;
@@ -44,6 +54,10 @@ interface AudioMonitoringContextType {
   // Speaker state
   audioDetected: boolean;
   speakersEnabled: boolean;
+
+  // Volume mode
+  useGlobalVolume: boolean;
+  setUseGlobalVolume: (useGlobal: boolean) => void;
 
   // Ramp settings
   rampEnabled: boolean;
@@ -94,6 +108,10 @@ interface AudioMonitoringContextType {
   emergencyKillAll: () => Promise<void>;
   emergencyEnableAll: () => Promise<void>;
   controlSingleSpeaker: (speakerId: string, enable: boolean) => Promise<void>;
+
+  // Speaker Status Tracking
+  speakerStatuses: SpeakerStatus[];
+  checkSpeakerConnectivity: () => Promise<void>;
 }
 
 const AudioMonitoringContext = createContext<AudioMonitoringContextType | null>(null);
@@ -187,6 +205,7 @@ const STORAGE_KEYS = {
   TARGET_VOLUME: 'algo_live_target_volume',
   INPUT_GAIN: 'algo_live_input_gain',
   AUDIO_THRESHOLD: 'algo_live_audio_threshold',
+  USE_GLOBAL_VOLUME: 'algo_use_global_volume',
   RAMP_ENABLED: 'algo_live_ramp_enabled',
   RAMP_DURATION: 'algo_live_ramp_duration',
   DAY_NIGHT_MODE: 'algo_live_day_night_mode',
@@ -215,6 +234,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [logs, setLogs] = useState<AudioLogEntry[]>([]);
   const [loggingEnabled, setLoggingEnabledState] = useState(true); // enabled by default
   const [recordingEnabled, setRecordingEnabledState] = useState(false); // disabled by default to save storage
+
+  // Volume mode
+  const [useGlobalVolume, setUseGlobalVolumeState] = useState(false);
+
+  // Speaker status tracking
+  const [speakerStatuses, setSpeakerStatuses] = useState<SpeakerStatus[]>([]);
 
   // Ramp settings
   const [rampEnabled, setRampEnabledState] = useState(true);
@@ -421,6 +446,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const savedDisableDelay = localStorage.getItem(STORAGE_KEYS.DISABLE_DELAY);
       const savedLoggingEnabled = localStorage.getItem(STORAGE_KEYS.LOGGING_ENABLED);
       const savedRecordingEnabled = localStorage.getItem(STORAGE_KEYS.RECORDING_ENABLED);
+      const savedUseGlobalVolume = localStorage.getItem(STORAGE_KEYS.USE_GLOBAL_VOLUME);
       const wasMonitoring = localStorage.getItem(STORAGE_KEYS.IS_MONITORING) === 'true';
 
       debugLog('[AudioMonitoring] Saved state:', {
@@ -485,6 +511,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
       if (savedRecordingEnabled !== null) {
         setRecordingEnabledState(savedRecordingEnabled === 'true');
+      }
+      if (savedUseGlobalVolume !== null) {
+        setUseGlobalVolumeState(savedUseGlobalVolume === 'true');
       }
 
       // Mark as restored
@@ -603,6 +632,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     localStorage.setItem(STORAGE_KEYS.RECORDING_ENABLED, recordingEnabled.toString());
   }, [recordingEnabled]);
 
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving global volume mode:', useGlobalVolume);
+    localStorage.setItem(STORAGE_KEYS.USE_GLOBAL_VOLUME, useGlobalVolume.toString());
+  }, [useGlobalVolume]);
+
   // Watch for target volume changes - restart ramp if speakers are enabled
   useEffect(() => {
     if (!hasRestoredStateRef.current) return;
@@ -619,7 +654,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   }, [targetVolume, speakersEnabled]);
 
   // Set volume on all linked speakers (8180s)
-  // volumePercent is the "ramp percentage" (0-100) which gets applied to each speaker's maxVolume
+  // volumePercent is the "ramp percentage" (0-100)
+  // If useGlobalVolume=true: all speakers use volumePercent directly
+  // If useGlobalVolume=false: volumePercent is scaled by each speaker's maxVolume
   const setDevicesVolume = useCallback(async (volumePercent: number) => {
     const linkedSpeakerIds = new Set<string>();
 
@@ -636,10 +673,25 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const speaker = devices.find(d => d.id === speakerId);
       if (!speaker) return;
 
-      // Calculate this speaker's actual volume based on its individual maxVolume
-      // If volumePercent is 80% and speaker.maxVolume is 70%, actual = 80% of 70% = 56%
-      const speakerMaxVolume = speaker.maxVolume ?? 100;
-      const actualVolume = (volumePercent / 100) * speakerMaxVolume;
+      // Skip speakers without proper credentials
+      if (!speaker.ipAddress || !speaker.apiPassword) {
+        console.warn(`[AudioMonitoring] Skipping ${speaker.name || speakerId}: missing IP or password`);
+        return;
+      }
+
+      // Calculate actual volume based on mode
+      let actualVolume: number;
+      if (useGlobalVolume) {
+        // Global mode: all speakers use same volume, ignore individual max
+        actualVolume = volumePercent;
+        debugLog(`[AudioMonitoring] GLOBAL MODE - Setting ${speaker.name} to ${actualVolume.toFixed(0)}%`);
+      } else {
+        // Individual mode: scale by speaker's maxVolume
+        // If volumePercent is 80% and speaker.maxVolume is 70%, actual = 80% of 70% = 56%
+        const speakerMaxVolume = speaker.maxVolume ?? 100;
+        actualVolume = (volumePercent / 100) * speakerMaxVolume;
+        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Setting ${speaker.name} volume: ${volumePercent}% of max ${speakerMaxVolume}% = ${actualVolume.toFixed(0)}%`);
+      }
 
       // Convert 0-100% to 0-10 scale, then to dB
       // Algo expects: 0=-30dB, 1=-27dB, 2=-24dB, ... 10=0dB
@@ -648,28 +700,36 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const volumeDb = (volumeScale - 10) * 3;
       const volumeDbString = volumeDb === 0 ? "0dB" : `${volumeDb}dB`;
 
-      debugLog(`[AudioMonitoring] Setting ${speaker.name} volume: ${volumePercent}% of max ${speakerMaxVolume}% = ${actualVolume.toFixed(0)}% → ${volumeDbString}`);
+      debugLog(`[AudioMonitoring] ${speaker.name} final: ${actualVolume.toFixed(0)}% → ${volumeDbString}`);
 
       try {
-        await fetch("/api/algo/settings", {
+        const response = await fetch("/api/algo/settings", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ipAddress: speaker.ipAddress,
             password: speaker.apiPassword,
-            authMethod: speaker.authMethod,
+            authMethod: speaker.authMethod || "standard",
             settings: {
               "audio.page.vol": volumeDbString,
             },
           }),
         });
+
+        if (!response.ok) {
+          // Only log as warning (not error) - offline speakers are expected
+          const errorText = await response.text().catch(() => 'Unknown error');
+          debugLog(`[AudioMonitoring] Skipping offline speaker ${speaker.name}: ${errorText}`);
+        }
       } catch (error) {
-        console.error(`Failed to set volume for ${speaker.name}:`, error);
+        // Network error - speaker might be offline, just skip silently
+        debugLog(`[AudioMonitoring] Skipping offline speaker ${speaker.name}`);
       }
     });
 
-    await Promise.all(volumePromises);
-  }, [selectedDevices, devices]);
+    // Use allSettled to continue even if some speakers fail
+    await Promise.allSettled(volumePromises);
+  }, [selectedDevices, devices, useGlobalVolume]);
 
   // Helper function to determine if it's currently daytime
   const isDaytime = useCallback(() => {
@@ -767,6 +827,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // Enable/disable speakers
   const controlSpeakers = useCallback(async (enable: boolean) => {
+    const allSpeakerPromises: Promise<void>[] = [];
+
     for (const deviceId of selectedDevices) {
       const device = devices.find(d => d.id === deviceId);
       if (!device) continue;
@@ -774,30 +836,43 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       if (device.type === "8301" && device.linkedSpeakerIds && device.linkedSpeakerIds.length > 0) {
         const linkedSpeakers = devices.filter(d => device.linkedSpeakerIds?.includes(d.id));
 
-        try {
-          debugLog(`[AudioMonitoring] ${enable ? 'Enabling' : 'Disabling'} speakers for ${device.name}`);
+        debugLog(`[AudioMonitoring] ${enable ? 'Enabling' : 'Disabling'} ${linkedSpeakers.length} speakers for ${device.name}`);
 
-          const response = await fetch("/api/algo/speakers/mcast", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              speakers: linkedSpeakers.map(s => ({
-                ipAddress: s.ipAddress,
-                password: s.apiPassword,
-                authMethod: s.authMethod,
-              })),
-              enable,
-            }),
-          });
+        // Control each speaker individually for better error resilience
+        linkedSpeakers.forEach(speaker => {
+          const promise = (async () => {
+            try {
+              const response = await fetch("/api/algo/speakers/mcast", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  speakers: [{
+                    ipAddress: speaker.ipAddress,
+                    password: speaker.apiPassword,
+                    authMethod: speaker.authMethod,
+                  }],
+                  enable,
+                }),
+              });
 
-          if (!response.ok) {
-            console.error(`Failed to ${enable ? 'enable' : 'disable'} speakers`);
-          }
-        } catch (error) {
-          console.error(`Failed to control speakers for ${device.name}:`, error);
-        }
+              if (!response.ok) {
+                console.error(`Failed to ${enable ? 'enable' : 'disable'} speaker ${speaker.name}: HTTP ${response.status}`);
+              } else {
+                debugLog(`[AudioMonitoring] Successfully ${enable ? 'enabled' : 'disabled'} ${speaker.name}`);
+              }
+            } catch (error) {
+              console.error(`Failed to control speaker ${speaker.name}:`, error);
+              // Continue with other speakers - don't throw
+            }
+          })();
+          allSpeakerPromises.push(promise);
+        });
       }
     }
+
+    // Wait for all speakers to complete (parallel execution)
+    // Individual failures won't crash the system
+    await Promise.allSettled(allSpeakerPromises);
   }, [selectedDevices, devices]);
 
   // Emergency Controls
@@ -914,6 +989,96 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       console.error(`Failed to control speaker ${speaker.name}:`, error);
     }
   }, [devices, addLog]);
+
+  // Check connectivity of all linked speakers
+  const checkSpeakerConnectivity = useCallback(async () => {
+    const linkedSpeakerIds = new Set<string>();
+
+    // Get all linked speakers from selected paging devices
+    for (const deviceId of selectedDevices) {
+      const device = devices.find(d => d.id === deviceId);
+      if (!device) continue;
+      if (device.type === "8301" && device.linkedSpeakerIds) {
+        device.linkedSpeakerIds.forEach(id => linkedSpeakerIds.add(id));
+      }
+    }
+
+    if (linkedSpeakerIds.size === 0) {
+      setSpeakerStatuses([]);
+      return;
+    }
+
+    // Build device list for health check API
+    const speakersToCheck = Array.from(linkedSpeakerIds)
+      .map(id => devices.find(d => d.id === id))
+      .filter((s): s is AlgoDevice => !!s && !!s.ipAddress && !!s.apiPassword);
+
+    if (speakersToCheck.length === 0) {
+      setSpeakerStatuses([]);
+      return;
+    }
+
+    debugLog(`[AudioMonitoring] Checking connectivity for ${speakersToCheck.length} speakers...`);
+
+    try {
+      const response = await fetch("/api/algo/health", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          devices: speakersToCheck.map(s => ({
+            id: s.id,
+            ipAddress: s.ipAddress,
+            apiPassword: s.apiPassword,
+            authMethod: s.authMethod || "standard",
+          })),
+          timeout: 3000,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Health check failed: ${response.status}`);
+      }
+
+      const result = await response.json();
+
+      // Convert API response to SpeakerStatus array
+      const statuses: SpeakerStatus[] = result.devices.map((d: { id: string; ipAddress: string; isOnline: boolean; error?: string }) => {
+        const speaker = devices.find(s => s.id === d.id);
+        return {
+          speakerId: d.id,
+          speakerName: speaker?.name || 'Unknown',
+          ipAddress: d.ipAddress,
+          isOnline: d.isOnline,
+          lastChecked: new Date(),
+          errorMessage: d.error,
+        };
+      });
+
+      setSpeakerStatuses(statuses);
+
+      const onlineCount = statuses.filter(s => s.isOnline).length;
+      const offlineCount = statuses.filter(s => !s.isOnline).length;
+
+      addLog({
+        type: offlineCount > 0 ? "speakers_disabled" : "speakers_enabled",
+        message: `Connectivity check: ${onlineCount} online, ${offlineCount} offline`,
+      });
+
+      debugLog(`[AudioMonitoring] Connectivity check complete: ${onlineCount} online, ${offlineCount} offline`);
+    } catch (error) {
+      console.error('[AudioMonitoring] Connectivity check failed:', error);
+      // Set all as unknown status on error
+      const statuses: SpeakerStatus[] = speakersToCheck.map(s => ({
+        speakerId: s.id,
+        speakerName: s.name || 'Unknown',
+        ipAddress: s.ipAddress || 'Unknown',
+        isOnline: false,
+        lastChecked: new Date(),
+        errorMessage: 'Check failed',
+      }));
+      setSpeakerStatuses(statuses);
+    }
+  }, [selectedDevices, devices, addLog]);
 
   // Audio activity detection with sustained audio requirement
   useEffect(() => {
@@ -1053,23 +1218,43 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       message: `Monitoring started with threshold: ${audioThreshold}%`,
     });
 
-    // CRITICAL FIX: Enable multicast on speakers IMMEDIATELY at volume 0
-    // This keeps speakers always listening, so short audio bursts aren't missed
-    // Only volume will change when audio is detected (much faster than enabling multicast)
-    debugLog('[AudioMonitoring] Enabling multicast on all speakers (always-on mode)');
-    await setDevicesVolume(0); // Muted initially
-    await controlSpeakers(true); // Enable multicast immediately
-    setSpeakersEnabled(true); // Mark speakers as enabled (always on during monitoring)
-
-    addLog({
-      type: "speakers_enabled",
-      speakersEnabled: true,
-      volume: 0,
-      message: `Speakers enabled in always-on mode (muted) - ready for instant response`,
-    });
-
+    // Start audio capture IMMEDIATELY - don't wait for speaker setup
+    // This ensures the UI responds instantly and audio is being captured
     startCapture(inputDevice);
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, controlSpeakers]);
+
+    // Check speaker connectivity first (in background)
+    checkSpeakerConnectivity();
+
+    // Enable multicast on speakers in parallel (don't block audio capture)
+    // This keeps speakers always listening, so short audio bursts aren't missed
+    debugLog('[AudioMonitoring] Enabling multicast on all speakers (always-on mode)');
+
+    // Run speaker setup in background - offline speakers shouldn't block monitoring
+    (async () => {
+      try {
+        // CRITICAL: Set all speakers to volume 0 BEFORE enabling multicast
+        // This prevents static noise if any speaker has default volume > 0
+        await setDevicesVolume(0); // Muted initially
+
+        // Wait briefly to ensure volume command is fully processed by devices
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        await controlSpeakers(true); // Enable multicast
+        setSpeakersEnabled(true); // Mark speakers as enabled
+
+        addLog({
+          type: "speakers_enabled",
+          speakersEnabled: true,
+          volume: 0,
+          message: `Speakers enabled in always-on mode (muted) - ready for instant response`,
+        });
+      } catch (error) {
+        console.error('[AudioMonitoring] Error during speaker setup:', error);
+        // Continue anyway - audio capture is already running
+        setSpeakersEnabled(true);
+      }
+    })();
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, controlSpeakers, checkSpeakerConnectivity]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');
@@ -1183,6 +1368,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     return header + rows;
   }, [logs]);
 
+  const setUseGlobalVolume = useCallback((useGlobal: boolean) => {
+    setUseGlobalVolumeState(useGlobal);
+    debugLog(`[AudioMonitoring] Volume mode changed to: ${useGlobal ? 'GLOBAL' : 'INDIVIDUAL'}`);
+  }, []);
+
   return (
     <AudioMonitoringContext.Provider
       value={{
@@ -1194,6 +1384,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         audioThreshold,
         audioDetected,
         speakersEnabled,
+        useGlobalVolume,
+        setUseGlobalVolume,
         rampEnabled,
         rampDuration,
         dayNightMode,
@@ -1230,6 +1422,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         emergencyKillAll,
         emergencyEnableAll,
         controlSingleSpeaker,
+        speakerStatuses,
+        checkSpeakerConnectivity,
       }}
     >
       {children}

@@ -29,6 +29,9 @@ import {
   Power,
   PowerOff,
   AlertTriangle,
+  Wifi,
+  WifiOff,
+  RefreshCw,
 } from "lucide-react";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage } from "@/lib/firebase/config";
@@ -53,6 +56,8 @@ export default function LiveBroadcastPage() {
     audioThreshold,
     audioDetected,
     speakersEnabled,
+    useGlobalVolume,
+    setUseGlobalVolume,
     rampEnabled,
     rampDuration,
     dayNightMode,
@@ -86,6 +91,8 @@ export default function LiveBroadcastPage() {
     emergencyKillAll,
     emergencyEnableAll,
     controlSingleSpeaker,
+    speakerStatuses,
+    checkSpeakerConnectivity,
   } = useAudioMonitoring();
 
   const [audioFiles, setAudioFiles] = useState<AudioFile[]>([]);
@@ -95,6 +102,8 @@ export default function LiveBroadcastPage() {
   const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
   const [saving, setSaving] = useState(false);
+  const [editingSpeakerId, setEditingSpeakerId] = useState<string | null>(null);
+  const [localMaxVolumes, setLocalMaxVolumes] = useState<Record<string, number>>({});
 
   const preToneAudioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -111,6 +120,13 @@ export default function LiveBroadcastPage() {
     loadData();
     loadInputDevices();
   }, []);
+
+  // Close any open volume editor when global mode is enabled
+  useEffect(() => {
+    if (useGlobalVolume && editingSpeakerId) {
+      setEditingSpeakerId(null);
+    }
+  }, [useGlobalVolume, editingSpeakerId]);
 
   const loadData = async () => {
     try {
@@ -368,7 +384,7 @@ export default function LiveBroadcastPage() {
                       {isCapturing ? `${audioLevel.toFixed(1)}%` : "-- %"}
                     </span>
                   </div>
-                  <VUMeter level={isCapturing ? audioLevel : 0} barCount={24} />
+                  <VUMeter level={isCapturing ? audioLevel : 0} barCount={24} showPeakHold={false} />
 
                   {/* Threshold indicator */}
                   <div className="mt-4 flex items-center gap-2">
@@ -459,48 +475,170 @@ export default function LiveBroadcastPage() {
                 {/* Individual Speaker Controls */}
                 {contextDevices.filter(d => d.type !== "8301").length > 0 && (
                   <div className="space-y-2">
-                    <Label className="text-[var(--text-muted)] text-xs uppercase tracking-wider">
-                      Individual Speakers
-                    </Label>
-                    <div className="grid gap-2 max-h-[200px] overflow-y-auto">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Label className="text-[var(--text-muted)] text-xs uppercase tracking-wider">
+                          Individual Speakers
+                        </Label>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-2 text-xs"
+                          onClick={() => checkSpeakerConnectivity()}
+                        >
+                          <RefreshCw className="h-3 w-3 mr-1" />
+                          Check
+                        </Button>
+                        {speakerStatuses.length > 0 && (
+                          <span className="text-xs text-[var(--text-muted)]">
+                            ({speakerStatuses.filter(s => s.isOnline).length}/{speakerStatuses.length} online)
+                          </span>
+                        )}
+                      </div>
+                      {useGlobalVolume && (
+                        <span className="text-xs text-[var(--accent-orange)] bg-[var(--accent-orange)]/10 px-2 py-1 rounded">
+                          Overridden by Global Mode
+                        </span>
+                      )}
+                    </div>
+                    <div className={`grid gap-3 max-h-[400px] overflow-y-auto transition-opacity ${useGlobalVolume ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
                       {contextDevices
                         .filter(d => d.type !== "8301")
-                        .map((speaker) => (
-                          <div
-                            key={speaker.id}
-                            className="flex items-center justify-between p-3 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]"
-                          >
-                            <div className="flex items-center gap-3">
-                              <Speaker className="h-4 w-4 text-[var(--text-muted)]" />
-                              <div>
-                                <p className="text-sm font-medium text-[var(--text-primary)]">
-                                  {speaker.name}
-                                </p>
-                                <p className="text-xs text-[var(--text-muted)]">
-                                  Max: {speaker.maxVolume ?? 100}%
-                                </p>
+                        .map((speaker) => {
+                          const isEditing = editingSpeakerId === speaker.id && !useGlobalVolume;
+                          // Display as 0-10 level, store as 0-100%
+                          const storedMaxVolume = speaker.maxVolume ?? 100;
+                          const displayLevel = Math.round(storedMaxVolume / 10);
+                          const localLevel = localMaxVolumes[speaker.id] !== undefined
+                            ? Math.round(localMaxVolumes[speaker.id] / 10)
+                            : displayLevel;
+                          // Get speaker status
+                          const speakerStatus = speakerStatuses.find(s => s.speakerId === speaker.id);
+
+                          return (
+                            <div
+                              key={speaker.id}
+                              className={`p-3 rounded-xl bg-[var(--bg-secondary)] border space-y-3 transition-all ${
+                                useGlobalVolume
+                                  ? 'border-[var(--border-color)]/50 cursor-not-allowed'
+                                  : 'border-[var(--border-color)]'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                  <Speaker className={`h-4 w-4 ${useGlobalVolume ? 'text-[var(--text-muted)]/50' : 'text-[var(--text-muted)]'}`} />
+                                  <div>
+                                    <p className={`text-sm font-medium flex items-center gap-2 ${useGlobalVolume ? 'text-[var(--text-primary)]/60' : 'text-[var(--text-primary)]'}`}>
+                                      {speaker.name}
+                                      {speakerStatus && (
+                                        speakerStatus.isOnline
+                                          ? <Wifi className="h-3 w-3 text-[var(--accent-green)]" title="Online" />
+                                          : <WifiOff className="h-3 w-3 text-[var(--accent-red)]" title={speakerStatus.errorMessage || "Offline"} />
+                                      )}
+                                    </p>
+                                    <button
+                                      onClick={() => {
+                                        if (!isEditing && !useGlobalVolume) {
+                                          setLocalMaxVolumes(prev => ({
+                                            ...prev,
+                                            [speaker.id]: storedMaxVolume
+                                          }));
+                                          setEditingSpeakerId(speaker.id);
+                                        }
+                                      }}
+                                      disabled={useGlobalVolume}
+                                      className={`text-xs ${
+                                        useGlobalVolume
+                                          ? 'text-[var(--text-muted)]/50 cursor-not-allowed line-through'
+                                          : 'text-[var(--accent-blue)] hover:underline cursor-pointer'
+                                      }`}
+                                      title={useGlobalVolume ? "Disabled - Global volume mode is active" : "Click to edit"}
+                                    >
+                                      Max: Level {displayLevel}/10 {!useGlobalVolume && '(click to edit)'}
+                                    </button>
+                                  </div>
+                                </div>
+                                <div className="flex gap-2">
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="text-[var(--accent-green)] border-[var(--accent-green)]/50 hover:bg-[var(--accent-green)]/10"
+                                    onClick={() => controlSingleSpeaker(speaker.id, true)}
+                                    disabled={useGlobalVolume}
+                                  >
+                                    <Power className="h-3 w-3" />
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="text-[var(--accent-red)] border-[var(--accent-red)]/50 hover:bg-[var(--accent-red)]/10"
+                                    onClick={() => controlSingleSpeaker(speaker.id, false)}
+                                    disabled={useGlobalVolume}
+                                  >
+                                    <PowerOff className="h-3 w-3" />
+                                  </Button>
+                                </div>
                               </div>
+
+                              {isEditing && !useGlobalVolume && (
+                                <div className="space-y-2 pt-2 border-t border-[var(--border-color)]">
+                                  <div className="flex items-center justify-between">
+                                    <Label className="text-xs">Max Volume Level</Label>
+                                    <span className="text-xs font-mono text-[var(--accent-blue)]">Level {localLevel}/10</span>
+                                  </div>
+                                  <Slider
+                                    min={0}
+                                    max={10}
+                                    value={localLevel}
+                                    onChange={(e) => {
+                                      const level = parseInt(e.target.value);
+                                      // Convert 0-10 to 0-100% for storage
+                                      setLocalMaxVolumes(prev => ({
+                                        ...prev,
+                                        [speaker.id]: level * 10
+                                      }));
+                                    }}
+                                  />
+                                  <p className="text-xs text-[var(--text-muted)]">
+                                    Algo speakers use 0-10 scale (0=mute, 10=max)
+                                  </p>
+                                  <div className="flex gap-2 pt-1">
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      className="flex-1 text-xs"
+                                      onClick={async () => {
+                                        try {
+                                          const { updateDevice } = await import("@/lib/firebase/firestore");
+                                          const volumeToSave = localMaxVolumes[speaker.id];
+                                          await updateDevice(speaker.id, { maxVolume: volumeToSave });
+                                          speaker.maxVolume = volumeToSave;
+                                          setEditingSpeakerId(null);
+                                          await loadData(); // Refresh devices
+                                        } catch (error) {
+                                          console.error("Failed to update max volume:", error);
+                                          alert("Failed to save max volume");
+                                        }
+                                      }}
+                                    >
+                                      Save
+                                    </Button>
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      className="flex-1 text-xs"
+                                      onClick={() => {
+                                        setEditingSpeakerId(null);
+                                      }}
+                                    >
+                                      Cancel
+                                    </Button>
+                                  </div>
+                                </div>
+                              )}
                             </div>
-                            <div className="flex gap-2">
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="text-[var(--accent-green)] border-[var(--accent-green)]/50 hover:bg-[var(--accent-green)]/10"
-                                onClick={() => controlSingleSpeaker(speaker.id, true)}
-                              >
-                                <Power className="h-3 w-3" />
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="text-[var(--accent-red)] border-[var(--accent-red)]/50 hover:bg-[var(--accent-red)]/10"
-                                onClick={() => controlSingleSpeaker(speaker.id, false)}
-                              >
-                                <PowerOff className="h-3 w-3" />
-                              </Button>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                     </div>
                   </div>
                 )}
@@ -608,18 +746,46 @@ export default function LiveBroadcastPage() {
                   />
                 </div>
 
-                {/* Target Volume */}
-                <div className="space-y-3">
+                {/* Volume Mode Selection */}
+                <div className="p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)] space-y-4">
                   <div className="flex items-center justify-between">
-                    <Label>Target Speaker Volume</Label>
-                    <span className="text-sm font-mono text-[var(--accent-blue)]">{targetVolume}% (Lv. {Math.round((targetVolume / 100) * 10)}/10)</span>
+                    <div>
+                      <Label className="!text-[var(--text-primary)]">Use Global Volume</Label>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">
+                        {useGlobalVolume
+                          ? "All speakers use same volume (individual settings ignored)"
+                          : "Each speaker uses its own max volume setting"}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={useGlobalVolume}
+                      onCheckedChange={setUseGlobalVolume}
+                    />
                   </div>
-                  <Slider
-                    min={0}
-                    max={100}
-                    value={targetVolume}
-                    onChange={(e) => setTargetVolume(parseInt(e.target.value))}
-                  />
+
+                  {useGlobalVolume ? (
+                    <div className="space-y-2 pt-2 border-t border-[var(--border-color)]">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-xs">Global Volume Level</Label>
+                        <span className="text-xs font-mono text-[var(--accent-blue)]">{targetVolume}% (Lv. {Math.round(targetVolume / 10)}/10)</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={100}
+                        value={targetVolume}
+                        onChange={(e) => setTargetVolume(parseInt(e.target.value))}
+                      />
+                      <p className="text-xs text-[var(--text-muted)]">
+                        All speakers will play at this volume level
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="pt-2 border-t border-[var(--border-color)]">
+                      <p className="text-xs text-[var(--accent-blue)]">
+                        ✓ Using individual speaker max volumes (editable in Emergency Controls below)
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 {/* Volume Ramp */}
@@ -923,10 +1089,14 @@ export default function LiveBroadcastPage() {
                 <CardHeader className="py-3">
                   <CardTitle className="text-xs text-[var(--text-muted)]">Debug</CardTitle>
                 </CardHeader>
-                <CardContent className="py-0 pb-3">
-                  <div className="space-y-1 text-xs font-mono text-[var(--text-muted)]">
-                    <div>Devices: {selectedDevices.length > 0 ? selectedDevices.join(', ').slice(0, 30) + '...' : 'None'}</div>
-                    <div>Input: {selectedInputDevice || 'Default'}</div>
+                <CardContent className="py-0 pb-3 overflow-x-auto">
+                  <div className="space-y-1 text-xs font-mono text-[var(--text-muted)] min-w-0">
+                    <div className="truncate" title={selectedDevices.join(', ')}>
+                      Devices: {selectedDevices.length > 0 ? selectedDevices.join(', ') : 'None'}
+                    </div>
+                    <div className="truncate" title={selectedInputDevice || 'Default'}>
+                      Input: {selectedInputDevice || 'Default'}
+                    </div>
                     <div>Monitoring: {isCapturing ? 'Active' : 'Stopped'}</div>
                   </div>
                 </CardContent>
