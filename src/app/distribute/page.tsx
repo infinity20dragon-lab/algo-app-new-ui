@@ -1,5 +1,7 @@
 "use client";
 
+/* @refresh reset */
+
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { AppLayout } from "@/components/layout/app-layout";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
