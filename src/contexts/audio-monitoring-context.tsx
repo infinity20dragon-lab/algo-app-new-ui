@@ -867,7 +867,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
     // Check every minute for day/night transitions
     const checkInterval = setInterval(() => {
-      const currentIsDaytime = isDaytime();
+      // Calculate current day/night status directly to avoid function dependency
+      const now = new Date();
+      const currentHour = now.getHours();
+      const currentIsDaytime = currentHour >= dayStartHour && currentHour < dayEndHour;
 
       // Initialize on first run
       if (previousDayModeRef.current === null) {
@@ -882,6 +885,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         previousDayModeRef.current = currentIsDaytime;
 
         // If speakers are currently enabled, restart the ramp with new settings
+        // Use refs to check current state without adding to dependencies
         if (speakersEnabled && !controllingSpakersRef.current) {
           const currentVolume = currentVolumeRef.current;
           debugLog(`[AudioMonitoring] Restarting volume ramp due to day/night change from ${currentVolume}%`);
@@ -893,7 +897,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     return () => {
       clearInterval(checkInterval);
     };
-  }, [dayNightMode, isDaytime, speakersEnabled, startVolumeRamp]);
+    // Only depend on stable values - not functions
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dayNightMode, dayStartHour, dayEndHour]);
 
   // Enable/disable speakers
   const controlSpeakers = useCallback(async (enable: boolean) => {
