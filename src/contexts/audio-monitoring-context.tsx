@@ -258,6 +258,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const hasRestoredStateRef = useRef<boolean>(false);
   const isInitializedRef = useRef<boolean>(false);
   const previousDayModeRef = useRef<boolean | null>(null);
+  const dayNightCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Sustained audio tracking
   const sustainedAudioStartRef = useRef<number | null>(null);
@@ -859,6 +860,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // Auto-detect day/night mode changes while monitoring (24/7 operation)
   useEffect(() => {
+    // Clear any existing interval first to prevent memory leaks
+    if (dayNightCheckIntervalRef.current) {
+      clearInterval(dayNightCheckIntervalRef.current);
+      dayNightCheckIntervalRef.current = null;
+    }
+
     // Only run if day/night mode is enabled
     if (!dayNightMode) {
       previousDayModeRef.current = null;
@@ -866,7 +873,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
 
     // Check every minute for day/night transitions
-    const checkInterval = setInterval(() => {
+    dayNightCheckIntervalRef.current = setInterval(() => {
       // Calculate current day/night status directly to avoid function dependency
       const now = new Date();
       const currentHour = now.getHours();
@@ -894,8 +901,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
     }, 60000); // Check every 60 seconds
 
+    debugLog(`[AudioMonitoring] Day/night checker started (enabled: ${dayNightMode})`);
+
     return () => {
-      clearInterval(checkInterval);
+      if (dayNightCheckIntervalRef.current) {
+        debugLog(`[AudioMonitoring] Day/night checker stopped (cleanup)`);
+        clearInterval(dayNightCheckIntervalRef.current);
+        dayNightCheckIntervalRef.current = null;
+      }
     };
     // Only depend on stable values - not functions
     // eslint-disable-next-line react-hooks/exhaustive-deps
