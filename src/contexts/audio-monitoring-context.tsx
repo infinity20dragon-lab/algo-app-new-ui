@@ -712,12 +712,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
 
       // Convert 0-100% to dB
-      // SPECIAL CASE: 0% = -45dB (IDLE state - eliminates buzzing)
+      // SPECIAL CASE: 0% = -60dB (IDLE state - DEEP silence, -45dB still had static)
       // Normal range: Algo expects 1=-27dB, 2=-24dB, ... 10=0dB
       // Formula: dB = (level - 10) * 3
       let volumeDbString: string;
       if (actualVolume === 0) {
-        volumeDbString = "-45dB"; // IDLE state - true silence
+        volumeDbString = "-60dB"; // IDLE state - DEEP silence
       } else {
         const volumeScale = Math.round((actualVolume / 100) * 10);
         const volumeDb = (volumeScale - 10) * 3;
@@ -789,7 +789,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     return rampDuration * 1000;
   }, [rampEnabled, dayNightMode, isDaytime, rampDuration, nightRampDuration]);
 
-  // Set all speakers to -45dB (idle state - eliminates buzzing)
+  // Set all speakers to -60dB (idle state - DEEP silence, -45dB still had static)
   const setDevicesVolumeToIdle = useCallback(async () => {
     const linkedSpeakerIds = new Set<string>();
 
@@ -802,7 +802,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
     }
 
-    debugLog(`[AudioMonitoring] Setting ${linkedSpeakerIds.size} speakers to IDLE (-45dB)`);
+    debugLog(`[AudioMonitoring] Setting ${linkedSpeakerIds.size} speakers to IDLE (-60dB)`);
 
     const volumePromises = Array.from(linkedSpeakerIds).map(async (speakerId) => {
       const speaker = devices.find(d => d.id === speakerId);
@@ -817,11 +817,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             password: speaker.apiPassword,
             authMethod: speaker.authMethod || "standard",
             settings: {
-              "audio.page.vol": "-45dB", // TRUE SILENCE - eliminates buzzing
+              "audio.page.vol": "-60dB", // DEEP SILENCE - even quieter than -45dB
             },
           }),
         });
-        debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} to IDLE (-45dB)`);
+        debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} to IDLE (-60dB)`);
       } catch (error) {
         debugLog(`[AudioMonitoring] ❌ Failed to set ${speaker.name} to idle`);
       }
@@ -843,12 +843,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Global mode: Ramp to targetVolume (all speakers use same volume)
     const rampTarget = useGlobalVolume ? targetVolume : 100;
 
-    // If ramp duration is 0 (instant), jump directly from -45dB to target volume
+    // If ramp duration is 0 (instant), jump directly from -60dB to target volume
     if (effectiveRampDuration === 0) {
       if (useGlobalVolume) {
-        debugLog(`[AudioMonitoring] GLOBAL MODE - Instant jump: -45dB → ${targetVolume}%`);
+        debugLog(`[AudioMonitoring] GLOBAL MODE - Instant jump: -60dB → ${targetVolume}%`);
       } else {
-        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Instant jump: -45dB → each speaker to its max`);
+        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Instant jump: -60dB → each speaker to its max`);
       }
       currentVolumeRef.current = rampTarget;
       setDevicesVolume(rampTarget);
@@ -856,8 +856,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
 
     // OPTIMIZATION: Start ramp at level 1 (10%), NOT 0%
-    // This skips all the inaudible negative dB levels (-45dB, -30dB, -27dB, etc.)
-    // Ramp: -45dB → 10% → 20% → ... → target (much faster!)
+    // This skips all the inaudible negative dB levels (-60dB, -45dB, -30dB, -27dB, etc.)
+    // Ramp: -60dB → 10% → 20% → ... → target (much faster!)
     const rampStart = 10; // Level 1 (10%) = -27dB (first audible level)
     currentVolumeRef.current = rampStart;
 
@@ -867,9 +867,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     const volumeIncrement = volumeDiff / steps;
 
     if (useGlobalVolume) {
-      debugLog(`[AudioMonitoring] GLOBAL MODE - Optimized ramp: -45dB → ${rampStart}% → ${targetVolume}% over ${effectiveRampDuration/1000}s`);
+      debugLog(`[AudioMonitoring] GLOBAL MODE - Optimized ramp: -60dB → ${rampStart}% → ${targetVolume}% over ${effectiveRampDuration/1000}s`);
     } else {
-      debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Optimized ramp: -45dB → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
+      debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Optimized ramp: -60dB → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
     }
 
     // Set initial volume to level 1 (10%) - skip inaudible levels!
@@ -908,7 +908,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       volumeRampIntervalRef.current = null;
     }
     currentVolumeRef.current = 0;
-    // Set all speakers to -45dB (true silence, eliminates buzzing)
+    // Set all speakers to -60dB (DEEP silence, -45dB still had static)
     setDevicesVolumeToIdle();
   }, []);
 
