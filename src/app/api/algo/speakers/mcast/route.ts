@@ -8,13 +8,14 @@ interface SpeakerMcastRequest {
     password: string;
     authMethod: AlgoAuthMethod;
   }>;
-  enable: boolean; // true = receiver mode (2), false = none (0)
+  enable?: boolean; // true = receiver mode (2), false = none (0) - DEPRECATED
+  mode?: number; // Direct mode: 0=disabled, 1=transmitter, 2=receiver
 }
 
 export async function POST(request: NextRequest) {
   try {
     const body: SpeakerMcastRequest = await request.json();
-    const { speakers, enable } = body;
+    const { speakers, enable, mode } = body;
 
     if (!speakers || speakers.length === 0) {
       return NextResponse.json(
@@ -23,7 +24,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const mcastMode = enable ? "2" : "0"; // 2 = receiver, 0 = none
+    // Support both new 'mode' parameter and legacy 'enable' parameter
+    let mcastMode: string;
+    if (mode !== undefined) {
+      // New way: Direct mode (0, 1, or 2)
+      mcastMode = String(mode);
+    } else {
+      // Legacy way: enable boolean (backward compatibility)
+      mcastMode = enable ? "2" : "0";
+    }
+
     const results: Array<{ ip: string; success: boolean; error?: string }> = [];
 
     // Control all speakers in parallel for speed
@@ -51,7 +61,8 @@ export async function POST(request: NextRequest) {
     const allSuccess = results.every((r) => r.success);
     return NextResponse.json({
       success: allSuccess,
-      enabled: enable,
+      mode: mcastMode,
+      enabled: enable, // Legacy field for backward compatibility
       results,
     });
   } catch (error) {

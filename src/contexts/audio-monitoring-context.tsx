@@ -712,12 +712,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
 
       // Convert 0-100% to dB
-      // SPECIAL CASE: 0% = -60dB (IDLE state - DEEP silence, -45dB still had static)
+      // SPECIAL CASE: 0% = -45dB (IDLE state - quietest before needing multicast control)
       // Normal range: Algo expects 1=-27dB, 2=-24dB, ... 10=0dB
       // Formula: dB = (level - 10) * 3
       let volumeDbString: string;
       if (actualVolume === 0) {
-        volumeDbString = "-60dB"; // IDLE state - DEEP silence
+        volumeDbString = "-45dB"; // IDLE state - level -5 (quietest volume)
       } else {
         const volumeScale = Math.round((actualVolume / 100) * 10);
         const volumeDb = (volumeScale - 10) * 3;
@@ -789,7 +789,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     return rampDuration * 1000;
   }, [rampEnabled, dayNightMode, isDaytime, rampDuration, nightRampDuration]);
 
-  // Set all speakers to -60dB (idle state - DEEP silence, -45dB still had static)
+  // Set all speakers to -45dB (idle state - quietest volume before needing multicast control)
   const setDevicesVolumeToIdle = useCallback(async () => {
     const linkedSpeakerIds = new Set<string>();
 
@@ -802,7 +802,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
     }
 
-    debugLog(`[AudioMonitoring] Setting ${linkedSpeakerIds.size} speakers to IDLE (-60dB)`);
+    debugLog(`[AudioMonitoring] Setting ${linkedSpeakerIds.size} speakers to IDLE (-45dB)`);
 
     const volumePromises = Array.from(linkedSpeakerIds).map(async (speakerId) => {
       const speaker = devices.find(d => d.id === speakerId);
@@ -817,11 +817,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             password: speaker.apiPassword,
             authMethod: speaker.authMethod || "standard",
             settings: {
-              "audio.page.vol": "-60dB", // DEEP SILENCE - even quieter than -45dB
+              "audio.page.vol": "-45dB", // IDLE state - quietest volume (level -5)
             },
           }),
         });
-        debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} to IDLE (-60dB)`);
+        debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} to IDLE (-45dB)`);
       } catch (error) {
         debugLog(`[AudioMonitoring] ❌ Failed to set ${speaker.name} to idle`);
       }
@@ -843,12 +843,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Global mode: Ramp to targetVolume (all speakers use same volume)
     const rampTarget = useGlobalVolume ? targetVolume : 100;
 
-    // If ramp duration is 0 (instant), jump directly from -60dB to target volume
+    // If ramp duration is 0 (instant), jump directly from -45dB to target volume
     if (effectiveRampDuration === 0) {
       if (useGlobalVolume) {
-        debugLog(`[AudioMonitoring] GLOBAL MODE - Instant jump: -60dB → ${targetVolume}%`);
+        debugLog(`[AudioMonitoring] GLOBAL MODE - Instant jump: -45dB → ${targetVolume}%`);
       } else {
-        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Instant jump: -60dB → each speaker to its max`);
+        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Instant jump: -45dB → each speaker to its max`);
       }
       currentVolumeRef.current = rampTarget;
       setDevicesVolume(rampTarget);
@@ -856,8 +856,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
 
     // OPTIMIZATION: Start ramp at level 1 (10%), NOT 0%
-    // This skips all the inaudible negative dB levels (-60dB, -45dB, -30dB, -27dB, etc.)
-    // Ramp: -60dB → 10% → 20% → ... → target (much faster!)
+    // This skips all the inaudible negative dB levels (-45dB, -30dB, -27dB, etc.)
+    // Ramp: -45dB (static) → 10% (audible) → 20% → ... → target (much faster!)
     const rampStart = 10; // Level 1 (10%) = -27dB (first audible level)
     currentVolumeRef.current = rampStart;
 
@@ -867,9 +867,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     const volumeIncrement = volumeDiff / steps;
 
     if (useGlobalVolume) {
-      debugLog(`[AudioMonitoring] GLOBAL MODE - Optimized ramp: -60dB → ${rampStart}% → ${targetVolume}% over ${effectiveRampDuration/1000}s`);
+      debugLog(`[AudioMonitoring] GLOBAL MODE - Optimized ramp: -45dB → ${rampStart}% → ${targetVolume}% over ${effectiveRampDuration/1000}s`);
     } else {
-      debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Optimized ramp: -60dB → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
+      debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Optimized ramp: -45dB → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
     }
 
     // Set initial volume to level 1 (10%) - skip inaudible levels!
@@ -908,7 +908,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       volumeRampIntervalRef.current = null;
     }
     currentVolumeRef.current = 0;
-    // Set all speakers to -60dB (DEEP silence, -45dB still had static)
+    // Set all speakers to -45dB (quietest volume - still has static at this level)
     setDevicesVolumeToIdle();
   }, []);
 
@@ -968,7 +968,88 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dayNightMode, dayStartHour, dayEndHour]);
 
-  // Enable/disable speakers
+  // Set paging device multicast mode (0=disabled, 1=transmitter, 2=receiver)
+  const setPagingMulticast = useCallback(async (mode: 0 | 1 | 2) => {
+    const pagingDevices = devices.filter(d => d.type === "8301");
+
+    if (pagingDevices.length === 0) {
+      debugLog('[AudioMonitoring] No paging devices found');
+      return;
+    }
+
+    debugLog(`[AudioMonitoring] Setting ${pagingDevices.length} paging device(s) to multicast mode ${mode}`);
+
+    await Promise.allSettled(
+      pagingDevices.map(async (paging) => {
+        try {
+          await fetch("/api/algo/speakers/mcast", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              speakers: [{
+                ipAddress: paging.ipAddress,
+                password: paging.apiPassword,
+                authMethod: paging.authMethod,
+              }],
+              mode,
+            }),
+          });
+          debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to mode ${mode}`);
+        } catch (error) {
+          console.error(`Failed to set ${paging.name} multicast mode:`, error);
+        }
+      })
+    );
+  }, [devices]);
+
+  // Set all speakers multicast mode (0=disabled, 1=transmitter, 2=receiver)
+  const setSpeakersMulticast = useCallback(async (mode: 0 | 1 | 2) => {
+    const linkedSpeakerIds = new Set<string>();
+
+    for (const deviceId of selectedDevices) {
+      const device = devices.find(d => d.id === deviceId);
+      if (!device) continue;
+
+      if (device.type === "8301" && device.linkedSpeakerIds) {
+        device.linkedSpeakerIds.forEach(id => linkedSpeakerIds.add(id));
+      }
+    }
+
+    const speakers = Array.from(linkedSpeakerIds)
+      .map(id => devices.find(d => d.id === id))
+      .filter((s): s is AlgoDevice => !!s);
+
+    if (speakers.length === 0) {
+      debugLog('[AudioMonitoring] No speakers to control');
+      return;
+    }
+
+    debugLog(`[AudioMonitoring] Setting ${speakers.length} speakers to multicast mode ${mode}`);
+
+    await Promise.allSettled(
+      speakers.map(async (speaker) => {
+        try {
+          await fetch("/api/algo/speakers/mcast", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              speakers: [{
+                ipAddress: speaker.ipAddress,
+                password: speaker.apiPassword,
+                authMethod: speaker.authMethod,
+              }],
+              mode,
+            }),
+          });
+          debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} to mode ${mode}`);
+        } catch (error) {
+          console.error(`Failed to set ${speaker.name} multicast mode:`, error);
+        }
+      })
+    );
+  }, [selectedDevices, devices]);
+
+  // Enable/disable speakers (LEGACY - kept for backward compatibility)
   const controlSpeakers = useCallback(async (enable: boolean) => {
     const allSpeakerPromises: Promise<void>[] = [];
 
@@ -1023,43 +1104,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] EMERGENCY: Killing all speakers');
     addLog({
       type: "speakers_disabled",
-      message: "EMERGENCY KILL: Disabling all speakers immediately",
+      message: "EMERGENCY KILL: Shutting down paging and all speakers IMMEDIATELY",
     });
 
-    // Get all linked speakers
-    const linkedSpeakerIds = new Set<string>();
-    for (const deviceId of selectedDevices) {
-      const device = devices.find(d => d.id === deviceId);
-      if (!device) continue;
-      if (device.type === "8301" && device.linkedSpeakerIds) {
-        device.linkedSpeakerIds.forEach(id => linkedSpeakerIds.add(id));
-      }
-    }
+    // NEW FLOW: Emergency shutdown
+    // 1. Mute all speakers to -45dB
+    await setDevicesVolume(0);
 
-    // Set all speakers to volume 0 and disable multicast
-    const speakers = Array.from(linkedSpeakerIds).map(id => devices.find(d => d.id === id)).filter(Boolean);
+    // 2. Disable paging transmitter (INSTANT silence - no more audio broadcast!)
+    await setPagingMulticast(0);
 
-    // First mute all
-    await Promise.all(speakers.map(async (speaker) => {
-      if (!speaker) return;
-      try {
-        await fetch("/api/algo/settings", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ipAddress: speaker.ipAddress,
-            password: speaker.apiPassword,
-            authMethod: speaker.authMethod,
-            settings: { "audio.page.vol": "-45dB" }, // IDLE state - eliminates buzzing
-          }),
-        });
-      } catch (error) {
-        console.error(`Failed to mute ${speaker.name}:`, error);
-      }
-    }));
-
-    // Then disable multicast
-    await controlSpeakers(false);
+    // 3. Disable all speaker receivers
+    await setSpeakersMulticast(0);
 
     // Reset state
     setSpeakersEnabled(false);
@@ -1069,23 +1125,32 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       clearInterval(volumeRampIntervalRef.current);
       volumeRampIntervalRef.current = null;
     }
-  }, [selectedDevices, devices, controlSpeakers, addLog]);
+
+    debugLog('[AudioMonitoring] ✓ EMERGENCY KILL COMPLETE: All devices mode 0, volume -45dB');
+  }, [setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
 
   const emergencyEnableAll = useCallback(async () => {
     debugLog('[AudioMonitoring] EMERGENCY: Enabling all speakers');
     addLog({
       type: "speakers_enabled",
-      message: "EMERGENCY ENABLE: Enabling all speakers at target volume",
+      message: "EMERGENCY ENABLE: Activating paging and all speakers at target volume",
     });
 
-    // Enable multicast on all speakers
-    await controlSpeakers(true);
-    setSpeakersEnabled(true);
+    // NEW FLOW: Emergency enable
+    // 1. Set speakers to mode 2 (receivers)
+    await setSpeakersMulticast(2);
 
-    // Set to target volume
+    // 2. Enable paging transmitter (mode 1 - START broadcasting!)
+    await setPagingMulticast(1);
+
+    // 3. Set to target volume (instant - no ramp in emergency)
     await setDevicesVolume(targetVolume);
+
+    setSpeakersEnabled(true);
     currentVolumeRef.current = targetVolume;
-  }, [controlSpeakers, setDevicesVolume, targetVolume, addLog]);
+
+    debugLog('[AudioMonitoring] ✓ EMERGENCY ENABLE COMPLETE: Paging ON, Speakers listening, Volume set');
+  }, [setSpeakersMulticast, setPagingMulticast, setDevicesVolume, targetVolume, addLog]);
 
   const controlSingleSpeaker = useCallback(async (speakerId: string, enable: boolean) => {
     const speaker = devices.find(d => d.id === speakerId);
@@ -1272,15 +1337,19 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             audioLevel,
             speakersEnabled: true,
             volume: targetVolume,
-            message: `Volume ramping to ${targetVolume}% (instant - no multicast enable delay)`,
+            message: `Volume ramping to ${targetVolume}% (paging mode 1 → speakers receive audio)`,
           });
 
           (async () => {
             // Start recording the audio
             await startRecording();
 
-            // NO controlSpeakers(true) needed - speakers already listening!
-            // Just ramp the volume - this is much faster
+            // NEW FLOW: Enable paging transmitter (mode 1) - INSTANT audio!
+            // Speakers are already in mode 2 (listening), so they'll receive immediately
+            debugLog('[AudioMonitoring] AUDIO DETECTED - Setting paging to mode 1 (transmitter)');
+            await setPagingMulticast(1);
+
+            // Then ramp the volume
             startVolumeRamp();
             controllingSpakersRef.current = false;
           })();
@@ -1331,18 +1400,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 // Stop recording and upload
                 const recordingUrl = await stopRecordingAndUpload();
 
+                // NEW FLOW: Disable paging transmitter (mode 0) - NO MORE AUDIO!
+                // Speakers stay in mode 2 (listening), ready for next audio
+                debugLog('[AudioMonitoring] AUDIO ENDED - Setting paging to mode 0 (disabled)');
+                await setPagingMulticast(0);
+
+                // Mute speakers
+                stopVolumeRamp();
+                await setDevicesVolume(0);
+
                 // Log with recording URL if available
                 addLog({
                   type: "volume_change",
-                  speakersEnabled: true, // Speakers STAY enabled
+                  speakersEnabled: true, // Speakers STAY in mode 2 (ready)
                   volume: 0,
-                  message: `Volume muted after ${disableDelay/1000}s of silence (audio duration: ${duration}s) - speakers still listening${recordingUrl ? ' 🎙️ Recording saved' : ''}`,
+                  message: `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingUrl ? ' 🎙️ Recording saved' : ''}`,
                   recordingUrl: recordingUrl || undefined,
                 });
 
-                stopVolumeRamp();
-                await setDevicesVolume(0);
-                // NO controlSpeakers(false) - keep listening for next audio!
                 controllingSpakersRef.current = false;
               })();
             }
@@ -1351,7 +1426,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -1368,36 +1443,44 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Check speaker connectivity first (in background)
     checkSpeakerConnectivity();
 
-    // Enable multicast on speakers in parallel (don't block audio capture)
-    // This keeps speakers always listening, so short audio bursts aren't missed
-    debugLog('[AudioMonitoring] Enabling multicast on all speakers (always-on mode)');
+    // NEW FLOW: Set up devices for instant response with NO STATIC
+    debugLog('[AudioMonitoring] NEW FLOW: Setting up paging (mode 0) and speakers (mode 2, -45dB)');
 
     // Run speaker setup in background - offline speakers shouldn't block monitoring
     (async () => {
       try {
-        // CRITICAL: Set all speakers to volume 0 BEFORE enabling multicast
-        // This prevents static noise if any speaker has default volume > 0
-        await setDevicesVolume(0); // Muted initially
+        // Step 1: Set all speakers to -45dB (silent)
+        debugLog('[AudioMonitoring] Step 1: Setting speakers to -45dB');
+        await setDevicesVolume(0); // 0% = -45dB
 
-        // Wait briefly to ensure volume command is fully processed by devices
+        // Wait briefly to ensure volume command is fully processed
         await new Promise(resolve => setTimeout(resolve, 200));
 
-        await controlSpeakers(true); // Enable multicast
-        setSpeakersEnabled(true); // Mark speakers as enabled
+        // Step 2: Set paging device to mode 0 (disabled - NOT transmitting)
+        debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 0 (disabled)');
+        await setPagingMulticast(0);
+
+        // Step 3: Set all speakers to mode 2 (receiver - ready to listen)
+        debugLog('[AudioMonitoring] Step 3: Setting speakers to mode 2 (receiver)');
+        await setSpeakersMulticast(2);
+
+        setSpeakersEnabled(true); // Mark as ready
 
         addLog({
           type: "speakers_enabled",
           speakersEnabled: true,
           volume: 0,
-          message: `Speakers enabled in always-on mode (muted) - ready for instant response`,
+          message: `Monitoring ready: Paging=OFF, Speakers=LISTENING, Volume=-45dB (NO STATIC!)`,
         });
+
+        debugLog('[AudioMonitoring] ✓ Setup complete: Paging mode 0, Speakers mode 2, Volume -45dB');
       } catch (error) {
         console.error('[AudioMonitoring] Error during speaker setup:', error);
         // Continue anyway - audio capture is already running
         setSpeakersEnabled(true);
       }
     })();
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, controlSpeakers, checkSpeakerConnectivity]);
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, checkSpeakerConnectivity]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');
@@ -1412,7 +1495,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       type: "speakers_disabled",
       message: duration
         ? `Monitoring stopped (audio was playing for ${duration}s)`
-        : 'Monitoring stopped - disabling speakers',
+        : 'Monitoring stopped - shutting down all devices',
     });
 
     stopCapture();
@@ -1424,17 +1507,27 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       audioDetectionTimeoutRef.current = null;
     }
 
-    // Always disable multicast when monitoring stops (cleanup always-on mode)
+    // NEW FLOW: Clean shutdown - set everything to mode 0 and -45dB
     if (!controllingSpakersRef.current) {
       controllingSpakersRef.current = true;
       setSpeakersEnabled(false);
       setAudioDetected(false);
+
+      debugLog('[AudioMonitoring] STOP: Shutting down paging and speakers to mode 0, volume -45dB');
+
+      // Step 1: Set speakers to -45dB
       await setDevicesVolume(0);
-      await controlSpeakers(false);
+
+      // Step 2: Set paging device to mode 0 (disabled)
+      await setPagingMulticast(0);
+
+      // Step 3: Set all speakers to mode 0 (disabled)
+      await setSpeakersMulticast(0);
+
       controllingSpakersRef.current = false;
-      debugLog('[AudioMonitoring] Multicast disabled - speakers no longer listening');
+      debugLog('[AudioMonitoring] ✓ Clean shutdown complete: All devices mode 0, speakers -45dB');
     }
-  }, [stopCapture, stopVolumeRamp, controlSpeakers, setDevicesVolume, addLog]);
+  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
 
   const setVolume = useCallback((vol: number) => {
     setVolumeState(vol);
