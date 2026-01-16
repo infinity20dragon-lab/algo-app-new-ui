@@ -37,9 +37,9 @@ import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage } from "@/lib/firebase/config";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
-import { getDevices, getAudioFiles, addAudioFile } from "@/lib/firebase/firestore";
+import { getDevices, getAudioFiles, addAudioFile, getZones } from "@/lib/firebase/firestore";
 import { useAuth } from "@/contexts/auth-context";
-import type { AudioFile } from "@/lib/algo/types";
+import type { AudioFile, Zone } from "@/lib/algo/types";
 import { formatDuration } from "@/lib/utils";
 
 export default function LiveBroadcastPage() {
@@ -104,6 +104,9 @@ export default function LiveBroadcastPage() {
   const [saving, setSaving] = useState(false);
   const [editingSpeakerId, setEditingSpeakerId] = useState<string | null>(null);
   const [localMaxVolumes, setLocalMaxVolumes] = useState<Record<string, number>>({});
+  const [zones, setZones] = useState<Zone[]>([]);
+  const [selectedZones, setSelectedZones] = useState<string[]>([]);
+  const [useZoneMode, setUseZoneMode] = useState(false);
 
   const preToneAudioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -130,12 +133,14 @@ export default function LiveBroadcastPage() {
 
   const loadData = async () => {
     try {
-      const [devicesData, audioData] = await Promise.all([
+      const [devicesData, audioData, zonesData] = await Promise.all([
         getDevices(),
         getAudioFiles(),
+        getZones(),
       ]);
       setContextDevices(devicesData);
       setAudioFiles(audioData);
+      setZones(zonesData);
     } catch (error) {
       console.error("Failed to load data:", error);
     } finally {
@@ -161,6 +166,62 @@ export default function LiveBroadcastPage() {
       setSelectedDevices([]);
     } else {
       setSelectedDevices(contextDevices.map((d) => d.id));
+    }
+  };
+
+  // Zone-based selection
+  const toggleZone = async (zoneId: string) => {
+    const newZones = selectedZones.includes(zoneId)
+      ? selectedZones.filter((id) => id !== zoneId)
+      : [...selectedZones, zoneId];
+
+    setSelectedZones(newZones);
+    await updateDevicesForZones(newZones);
+  };
+
+  const selectAllZones = async () => {
+    const newZones = selectedZones.length === zones.length ? [] : zones.map(z => z.id);
+    setSelectedZones(newZones);
+    await updateDevicesForZones(newZones);
+  };
+
+  const updateDevicesForZones = async (zoneIds: string[]) => {
+    // Get all devices assigned to selected zones (speakers only, not paging devices)
+    const devicesInZones = contextDevices.filter(device =>
+      device.zone && zoneIds.includes(device.zone) && device.type !== "8301"
+    );
+    const deviceIds = devicesInZones.map(d => d.id);
+
+    console.log('[Live] Zone selection changed:', zoneIds);
+    console.log('[Live] Speakers in selected zones:', deviceIds);
+
+    // Update selected devices
+    setSelectedDevices(deviceIds);
+
+    // If monitoring is active, dynamically update speaker states
+    // IMPORTANT: We NEVER touch the paging device (8301) - it stays in sending mode
+    // We ONLY enable/disable individual speakers based on zone selection
+    if (isCapturing) {
+      console.log('[Live] Monitoring is active - dynamically updating SPEAKERS ONLY (paging device untouched)');
+
+      // Get all speakers (exclude paging devices - we NEVER control those)
+      const allSpeakers = contextDevices.filter(d => d.type !== "8301");
+
+      // Disable speakers NOT in selected zones (volume → 0, multicast → none)
+      const speakersToDisable = allSpeakers.filter(s => !deviceIds.includes(s.id));
+      for (const speaker of speakersToDisable) {
+        console.log(`[Live] Disabling speaker ${speaker.name} (not in selected zones)`);
+        await controlSingleSpeaker(speaker.id, false);
+      }
+
+      // Enable speakers in selected zones (multicast → enabled, volume applied)
+      const speakersToEnable = allSpeakers.filter(s => deviceIds.includes(s.id));
+      for (const speaker of speakersToEnable) {
+        console.log(`[Live] Enabling speaker ${speaker.name} (in selected zones)`);
+        await controlSingleSpeaker(speaker.id, true);
+      }
+
+      console.log(`[Live] Zone switch complete - ${speakersToEnable.length} speakers ON, ${speakersToDisable.length} speakers OFF`);
     }
   };
 
@@ -900,6 +961,99 @@ export default function LiveBroadcastPage() {
 
           {/* Right Column - Devices & Broadcast */}
           <div className="space-y-6">
+            {/* Zone Selection */}
+            {zones.length > 0 && (
+              <Card>
+                <CardHeader>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2 rounded-lg bg-[var(--accent-purple)]/15">
+                        <Map className="h-5 w-5 text-[var(--accent-purple)]" />
+                      </div>
+                      <div>
+                        <CardTitle>Zone Selection</CardTitle>
+                        <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                          Select zones to broadcast to
+                        </p>
+                      </div>
+                    </div>
+                    <Switch
+                      checked={useZoneMode}
+                      onCheckedChange={setUseZoneMode}
+                    />
+                  </div>
+                </CardHeader>
+                {useZoneMode && (
+                  <CardContent>
+                    <div className="space-y-3">
+                      {/* Select All Zones Button */}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-full"
+                        onClick={selectAllZones}
+                      >
+                        {selectedZones.length === zones.length ? "Deselect All Zones" : "Select All Zones"}
+                      </Button>
+
+                      {/* Zone List */}
+                      <div className="space-y-2 max-h-[250px] overflow-y-auto">
+                        {zones.map((zone) => {
+                          const devicesInZone = contextDevices.filter(d => d.zone === zone.id);
+                          const isSelected = selectedZones.includes(zone.id);
+
+                          return (
+                            <button
+                              key={zone.id}
+                              onClick={() => toggleZone(zone.id)}
+                              className={`flex items-center gap-3 w-full rounded-xl border p-3 text-left transition-all ${
+                                isSelected
+                                  ? "border-[var(--accent-purple)]/50 bg-[var(--accent-purple)]/10"
+                                  : "border-[var(--border-color)] hover:border-[var(--border-active)] hover:bg-[var(--bg-tertiary)]"
+                              }`}
+                              style={{
+                                borderLeft: isSelected ? `4px solid ${zone.color}` : undefined,
+                              }}
+                            >
+                              <div
+                                className={`flex h-5 w-5 items-center justify-center rounded-full border-2 ${
+                                  isSelected
+                                    ? "border-[var(--accent-purple)] bg-[var(--accent-purple)]"
+                                    : "border-[var(--border-color)]"
+                                }`}
+                              >
+                                {isSelected && (
+                                  <div className="h-2 w-2 rounded-full bg-white" />
+                                )}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <p className="truncate font-medium text-[var(--text-primary)]">
+                                  {zone.name}
+                                </p>
+                                <p className="truncate text-xs text-[var(--text-muted)]">
+                                  {devicesInZone.length} speaker{devicesInZone.length !== 1 ? 's' : ''}
+                                </p>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Active Zones Summary */}
+                      {selectedZones.length > 0 && (
+                        <div className="p-3 rounded-xl bg-[var(--accent-purple)]/10 border border-[var(--accent-purple)]/30">
+                          <p className="text-xs text-[var(--accent-purple)] font-medium">
+                            Broadcasting to {selectedZones.length} zone{selectedZones.length !== 1 ? 's' : ''}
+                            {' '}({selectedDevices.length} speaker{selectedDevices.length !== 1 ? 's' : ''})
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </CardContent>
+                )}
+              </Card>
+            )}
+
             {/* Device Selection */}
             <Card>
               <CardHeader>
@@ -908,11 +1062,20 @@ export default function LiveBroadcastPage() {
                     <div className="p-2 rounded-lg bg-[var(--accent-green)]/15">
                       <Speaker className="h-5 w-5 text-[var(--accent-green)]" />
                     </div>
-                    <CardTitle>Target Devices</CardTitle>
+                    <div>
+                      <CardTitle>Target Devices</CardTitle>
+                      {useZoneMode && (
+                        <p className="text-xs text-[var(--accent-purple)] mt-0.5">
+                          Controlled by zone selection
+                        </p>
+                      )}
+                    </div>
                   </div>
-                  <Button variant="outline" size="sm" onClick={selectAllDevices}>
-                    {selectedDevices.length === contextDevices.length ? "Deselect" : "Select All"}
-                  </Button>
+                  {!useZoneMode && (
+                    <Button variant="outline" size="sm" onClick={selectAllDevices}>
+                      {selectedDevices.length === contextDevices.length ? "Deselect" : "Select All"}
+                    </Button>
+                  )}
                 </div>
               </CardHeader>
               <CardContent>
@@ -928,38 +1091,48 @@ export default function LiveBroadcastPage() {
                     </p>
                   </div>
                 ) : (
-                  <div className="space-y-2 max-h-[300px] overflow-y-auto">
-                    {contextDevices.map((device) => (
-                      <button
-                        key={device.id}
-                        onClick={() => toggleDevice(device.id)}
-                        className={`flex items-center gap-3 w-full rounded-xl border p-3 text-left transition-all ${
-                          selectedDevices.includes(device.id)
-                            ? "border-[var(--accent-blue)]/50 bg-[var(--accent-blue)]/10"
-                            : "border-[var(--border-color)] hover:border-[var(--border-active)] hover:bg-[var(--bg-tertiary)]"
-                        }`}
-                      >
-                        <div
-                          className={`flex h-5 w-5 items-center justify-center rounded-full border-2 ${
+                  <div className={`space-y-2 max-h-[300px] overflow-y-auto ${useZoneMode ? 'opacity-60 pointer-events-none' : ''}`}>
+                    {contextDevices.map((device) => {
+                      const deviceZone = zones.find(z => z.id === device.zone);
+                      return (
+                        <button
+                          key={device.id}
+                          onClick={() => !useZoneMode && toggleDevice(device.id)}
+                          disabled={useZoneMode}
+                          className={`flex items-center gap-3 w-full rounded-xl border p-3 text-left transition-all ${
                             selectedDevices.includes(device.id)
-                              ? "border-[var(--accent-blue)] bg-[var(--accent-blue)]"
-                              : "border-[var(--border-color)]"
+                              ? "border-[var(--accent-blue)]/50 bg-[var(--accent-blue)]/10"
+                              : "border-[var(--border-color)] hover:border-[var(--border-active)] hover:bg-[var(--bg-tertiary)]"
                           }`}
                         >
-                          {selectedDevices.includes(device.id) && (
-                            <div className="h-2 w-2 rounded-full bg-white" />
-                          )}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate font-medium text-[var(--text-primary)]">
-                            {device.name}
-                          </p>
-                          <p className="truncate text-xs text-[var(--text-muted)]">
-                            {device.ipAddress}
-                          </p>
-                        </div>
-                      </button>
-                    ))}
+                          <div
+                            className={`flex h-5 w-5 items-center justify-center rounded-full border-2 ${
+                              selectedDevices.includes(device.id)
+                                ? "border-[var(--accent-blue)] bg-[var(--accent-blue)]"
+                                : "border-[var(--border-color)]"
+                            }`}
+                          >
+                            {selectedDevices.includes(device.id) && (
+                              <div className="h-2 w-2 rounded-full bg-white" />
+                            )}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate font-medium text-[var(--text-primary)]">
+                              {device.name}
+                            </p>
+                            <p className="truncate text-xs text-[var(--text-muted)]">
+                              {deviceZone ? (
+                                <span style={{ color: deviceZone.color }}>
+                                  {deviceZone.name}
+                                </span>
+                              ) : (
+                                device.ipAddress
+                              )}
+                            </p>
+                          </div>
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </CardContent>

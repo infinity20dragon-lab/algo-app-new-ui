@@ -4,6 +4,7 @@ import {
   getDocs,
   getDoc,
   addDoc,
+  setDoc,
   updateDoc,
   deleteDoc,
   query,
@@ -12,7 +13,7 @@ import {
   type DocumentData,
 } from "firebase/firestore";
 import { db } from "./config";
-import type { AlgoDevice, Zone, AudioFile, DistributionLog } from "@/lib/algo/types";
+import type { AlgoDevice, Zone, AudioFile, DistributionLog, ZoneRouting } from "@/lib/algo/types";
 
 // ============ Devices ============
 
@@ -81,22 +82,65 @@ export async function getZone(id: string): Promise<Zone | null> {
   return { id: snapshot.id, ...convertTimestamps(snapshot.data()) } as Zone;
 }
 
-export async function addZone(zone: Omit<Zone, "id" | "createdAt">): Promise<string> {
+export async function addZone(zone: Omit<Zone, "id" | "createdAt" | "updatedAt">): Promise<string> {
+  const now = Timestamp.now();
   const docRef = await addDoc(zonesCollection, {
     ...zone,
-    createdAt: Timestamp.now(),
+    createdAt: now,
+    updatedAt: now,
   });
   return docRef.id;
 }
 
 export async function updateZone(id: string, data: Partial<Zone>): Promise<void> {
   const docRef = doc(db, "zones", id);
-  await updateDoc(docRef, data);
+  await updateDoc(docRef, {
+    ...data,
+    updatedAt: Timestamp.now(),
+  });
 }
 
 export async function deleteZone(id: string): Promise<void> {
   const docRef = doc(db, "zones", id);
   await deleteDoc(docRef);
+
+  // Also delete the routing configuration
+  const routingRef = doc(db, "zoneRouting", id);
+  try {
+    await deleteDoc(routingRef);
+  } catch (error) {
+    // Routing doc might not exist, that's okay
+    console.log("No routing config to delete for zone:", id);
+  }
+}
+
+// ============ Zone Routing ============
+
+const zoneRoutingCollection = collection(db, "zoneRouting");
+
+export async function getZoneRouting(zoneId: string): Promise<ZoneRouting | null> {
+  const docRef = doc(db, "zoneRouting", zoneId);
+  const snapshot = await getDoc(docRef);
+  if (!snapshot.exists()) return null;
+  return { id: snapshot.id, ...convertTimestamps(snapshot.data()) } as ZoneRouting;
+}
+
+export async function getAllZoneRouting(): Promise<Record<string, ZoneRouting>> {
+  const snapshot = await getDocs(zoneRoutingCollection);
+  const routing: Record<string, ZoneRouting> = {};
+  snapshot.docs.forEach((doc) => {
+    routing[doc.id] = { id: doc.id, ...convertTimestamps(doc.data()) } as ZoneRouting;
+  });
+  return routing;
+}
+
+export async function setZoneRouting(zoneId: string, routing: Omit<ZoneRouting, "id" | "updatedAt">): Promise<void> {
+  const docRef = doc(db, "zoneRouting", zoneId);
+  await setDoc(docRef, {
+    ...routing,
+    zoneId,
+    updatedAt: Timestamp.now(),
+  }, { merge: true });
 }
 
 // ============ Audio Files ============

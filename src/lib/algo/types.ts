@@ -9,7 +9,7 @@ export interface AlgoDevice {
   ipAddress: string;
   authMethod: AlgoAuthMethod;
   apiPassword: string;
-  zone: string;
+  zone: string | null; // Zone ID this device is assigned to, or null if unassigned
   volume: number; // Default/initial volume
   maxVolume?: number; // Maximum volume this speaker can reach (0-100, default 100)
   isOnline: boolean;
@@ -102,10 +102,22 @@ export interface AlgoMulticastConfig {
 export interface Zone {
   id: string;
   name: string;
-  slug: string;
+  color: string;
   deviceIds: string[];
-  defaultVolume: number;
+  slug?: string;
+  defaultVolume?: number;
   createdAt: Date;
+  updatedAt?: Date;
+}
+
+// Zone Routing Configuration (stored separately)
+export interface ZoneRouting {
+  id: string; // same as zone id
+  zoneId: string;
+  fire: boolean;
+  medical: boolean;
+  allCall: boolean;
+  updatedAt?: Date;
 }
 
 // Audio File Type
