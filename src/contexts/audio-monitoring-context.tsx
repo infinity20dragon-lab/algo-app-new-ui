@@ -711,12 +711,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Setting ${speaker.name} to ${volumePercent.toFixed(0)}% of its max ${speakerMaxVolume}% = ${actualVolume.toFixed(0)}% (Level ${Math.round(actualVolume/10)})`);
       }
 
-      // Convert 0-100% to 0-10 scale, then to dB
-      // Algo expects: 0=-30dB, 1=-27dB, 2=-24dB, ... 10=0dB
+      // Convert 0-100% to dB
+      // SPECIAL CASE: 0% = -45dB (IDLE state - eliminates buzzing)
+      // Normal range: Algo expects 1=-27dB, 2=-24dB, ... 10=0dB
       // Formula: dB = (level - 10) * 3
-      const volumeScale = Math.round((actualVolume / 100) * 10);
-      const volumeDb = (volumeScale - 10) * 3;
-      const volumeDbString = volumeDb === 0 ? "0dB" : `${volumeDb}dB`;
+      let volumeDbString: string;
+      if (actualVolume === 0) {
+        volumeDbString = "-45dB"; // IDLE state - true silence
+      } else {
+        const volumeScale = Math.round((actualVolume / 100) * 10);
+        const volumeDb = (volumeScale - 10) * 3;
+        volumeDbString = volumeDb === 0 ? "0dB" : `${volumeDb}dB`;
+      }
 
       debugLog(`[AudioMonitoring] ${speaker.name} final: ${actualVolume.toFixed(0)}% → ${volumeDbString}`);
 
