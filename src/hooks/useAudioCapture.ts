@@ -290,5 +290,6 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}) {
     resumeRecording,
     setVolume,
     getInputDevices,
+    mediaStream: mediaStreamRef.current, // Expose the monitoring stream
   };
 }

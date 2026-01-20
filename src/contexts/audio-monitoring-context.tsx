@@ -276,6 +276,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     startCapture,
     stopCapture,
     setVolume: setGainVolume,
+    mediaStream: monitoringStream,
   } = useAudioCapture();
 
   // Helper to add log entry
@@ -333,15 +334,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
-      // Get the audio stream from the microphone
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: selectedInputDevice || undefined,
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        }
-      });
+      // REUSE the monitoring stream instead of creating a new one
+      if (!monitoringStream) {
+        console.warn('[Recording] No monitoring stream available, skipping recording');
+        return;
+      }
 
       // Get best supported mimeType
       const mimeType = getBestAudioMimeType();
@@ -352,7 +349,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         options.mimeType = mimeType;
       }
 
-      const mediaRecorder = new MediaRecorder(stream, options);
+      const mediaRecorder = new MediaRecorder(monitoringStream, options);
 
       recordedChunksRef.current = [];
       recordingStartTimeRef.current = new Date().toISOString();
@@ -366,11 +363,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       mediaRecorder.start(100); // Collect data every 100ms
       mediaRecorderRef.current = mediaRecorder;
 
-      debugLog('[Recording] Started recording audio with mimeType:', mimeType || 'default');
+      debugLog('[Recording] Started recording audio from monitoring stream with mimeType:', mimeType || 'default');
     } catch (error) {
       console.error('[Recording] Failed to start recording:', error);
     }
-  }, [recordingEnabled, user, selectedInputDevice, getBestAudioMimeType]);
+  }, [recordingEnabled, user, monitoringStream, getBestAudioMimeType]);
 
   // Stop recording and upload to Firebase
   const stopRecordingAndUpload = useCallback(async (): Promise<string | null> => {
@@ -427,8 +424,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             recordingStartTimeRef.current = null;
             mediaRecorderRef.current = null;
 
-            // Stop all tracks
-            mediaRecorder.stream.getTracks().forEach(track => track.stop());
+            // DON'T stop the stream tracks - we're reusing the monitoring stream!
+            // The monitoring stream should only be stopped when stopMonitoring() is called
 
             resolve(downloadUrl);
           } catch (error) {
