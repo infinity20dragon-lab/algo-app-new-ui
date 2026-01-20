@@ -13,6 +13,7 @@ import {
   X,
   Map,
   Activity,
+  Network,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
@@ -31,6 +32,7 @@ const navItems: NavItem[] = [
   { title: "Station Zones", href: "/zones", icon: Map, section: "Overview" },
   { title: "Call Routing", href: "/distribute", icon: Activity, section: "Overview" },
   { title: "Audio Input", href: "/live", icon: Mic, section: "Audio" },
+  { title: "Multi-Input Routing", href: "/input-routing", icon: Network, section: "Audio" },
   { title: "Output & Speakers", href: "/devices", icon: Speaker, section: "Audio" },
   { title: "Settings", href: "/settings", icon: Settings, section: "System" },
 ];

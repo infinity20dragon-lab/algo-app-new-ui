@@ -19,6 +19,8 @@ export interface AlgoDevice {
   updatedAt: Date;
   // For paging devices (8301): IDs of linked speakers to auto-enable/disable
   linkedSpeakerIds?: string[];
+  // Multi-input routing: which input channel this speaker listens to
+  inputAssignment?: "medical" | "fire" | "allCall" | null;
 }
 
 // Algo API Response Types
@@ -148,4 +150,14 @@ export interface DistributionLog {
     error?: string;
   }>;
   createdAt: Date;
+}
+
+// Multi-Input Channel Type
+export type InputChannelType = "medical" | "fire" | "allCall";
+
+export interface InputChannel {
+  type: InputChannelType;
+  deviceId: string | null; // Which audio input device to use
+  isActive: boolean; // Is this channel currently receiving audio
+  audioLevel: number; // Current audio level (0-100)
 }

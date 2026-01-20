@@ -300,6 +300,26 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     });
   }, [loggingEnabled]);
 
+  // Get best supported audio mimeType
+  const getBestAudioMimeType = useCallback(() => {
+    const types = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/mp4',
+    ];
+
+    for (const type of types) {
+      if (MediaRecorder.isTypeSupported(type)) {
+        console.log('[Recording] Using mimeType:', type);
+        return type;
+      }
+    }
+
+    console.warn('[Recording] No preferred mimeType supported, using default');
+    return '';
+  }, []);
+
   // Start recording audio
   const startRecording = useCallback(async () => {
     try {
@@ -323,10 +343,16 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       });
 
-      // Create media recorder
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm',
-      });
+      // Get best supported mimeType
+      const mimeType = getBestAudioMimeType();
+
+      // Create media recorder with best supported format
+      const options: MediaRecorderOptions = {};
+      if (mimeType) {
+        options.mimeType = mimeType;
+      }
+
+      const mediaRecorder = new MediaRecorder(stream, options);
 
       recordedChunksRef.current = [];
       recordingStartTimeRef.current = new Date().toISOString();
@@ -340,11 +366,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       mediaRecorder.start(100); // Collect data every 100ms
       mediaRecorderRef.current = mediaRecorder;
 
-      debugLog('[Recording] Started recording audio');
+      debugLog('[Recording] Started recording audio with mimeType:', mimeType || 'default');
     } catch (error) {
       console.error('[Recording] Failed to start recording:', error);
     }
-  }, [recordingEnabled, user, selectedInputDevice]);
+  }, [recordingEnabled, user, selectedInputDevice, getBestAudioMimeType]);
 
   // Stop recording and upload to Firebase
   const stopRecordingAndUpload = useCallback(async (): Promise<string | null> => {
@@ -358,30 +384,29 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
         mediaRecorder.onstop = async () => {
           try {
-            // Create blob from recorded chunks (WebM format)
-            const webmBlob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
+            // Get the mimeType that was actually used
+            const actualMimeType = mediaRecorder.mimeType || 'audio/webm';
 
-            if (webmBlob.size === 0) {
+            // Create blob from recorded chunks
+            const audioBlob = new Blob(recordedChunksRef.current, { type: actualMimeType });
+
+            if (audioBlob.size === 0) {
               console.warn('[Recording] No audio data recorded');
               resolve(null);
               return;
             }
 
-            // Try to convert WebM to MP3 for better phone compatibility
-            let finalBlob: Blob;
-            let fileExtension: string;
-
-            try {
-              console.log(`[Recording] Converting ${webmBlob.size} bytes from WebM to MP3...`);
-              finalBlob = await convertToMp3(webmBlob);
-              fileExtension = 'mp3';
-              console.log(`[Recording] Converted to MP3: ${finalBlob.size} bytes`);
-            } catch (conversionError) {
-              // Fallback to WebM if MP3 conversion fails
-              console.error('[Recording] MP3 conversion failed, falling back to WebM:', conversionError);
-              finalBlob = webmBlob;
-              fileExtension = 'webm';
+            // Determine file extension from mimeType
+            let fileExtension = 'webm';
+            if (actualMimeType.includes('opus')) {
+              fileExtension = 'opus';
+            } else if (actualMimeType.includes('ogg')) {
+              fileExtension = 'ogg';
+            } else if (actualMimeType.includes('mp4')) {
+              fileExtension = 'm4a';
             }
+
+            console.log(`[Recording] Saving ${audioBlob.size} bytes as ${fileExtension} (${actualMimeType})`);
 
             // Generate filename with timestamp
             const timestamp = recordingStartTimeRef.current!.replace(/[:.]/g, '-');
@@ -391,7 +416,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             // Upload to Firebase Storage
             debugLog(`[Recording] Uploading ${fileExtension.toUpperCase()} to ${filePath}`);
             const fileRef = storageRef(storage, filePath);
-            await uploadBytes(fileRef, finalBlob);
+            await uploadBytes(fileRef, audioBlob);
 
             // Get download URL
             const downloadUrl = await getDownloadURL(fileRef);
