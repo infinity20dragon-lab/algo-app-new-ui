@@ -105,6 +105,17 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}) {
         video: false,
       });
 
+      // DEBUG: Log information about the captured stream
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        const track = audioTracks[0];
+        console.log('[AudioCapture] 🎤 Started monitoring:');
+        console.log('  - Device Label:', track.label);
+        console.log('  - Device ID:', track.getSettings().deviceId);
+        console.log('  - Sample Rate:', track.getSettings().sampleRate);
+        console.log('  - Channel Count:', track.getSettings().channelCount);
+      }
+
       mediaStreamRef.current = stream;
 
       // Create audio context

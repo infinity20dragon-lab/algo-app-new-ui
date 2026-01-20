@@ -340,6 +340,19 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
+      // DEBUG: Log information about the monitoring stream
+      const audioTracks = monitoringStream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        const track = audioTracks[0];
+        console.log('[Recording] 🎙️ Recording from monitoring stream:');
+        console.log('  - Device Label:', track.label);
+        console.log('  - Device ID:', track.getSettings().deviceId);
+        console.log('  - Sample Rate:', track.getSettings().sampleRate);
+        console.log('  - Channel Count:', track.getSettings().channelCount);
+      } else {
+        console.warn('[Recording] ⚠️ No audio tracks in monitoring stream!');
+      }
+
       // Get best supported mimeType
       const mimeType = getBestAudioMimeType();
 
