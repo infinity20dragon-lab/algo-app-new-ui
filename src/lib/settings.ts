@@ -51,3 +51,16 @@ export function getDefaultVolume(): number {
 
   return 50; // Default
 }
+
+/**
+ * Get whether to always keep paging device in transmitter mode
+ * @returns true if paging device should always be in mode 1, false to toggle based on audio
+ */
+export function getAlwaysKeepPagingOn(): boolean {
+  if (typeof window === "undefined") {
+    return false; // Server-side default
+  }
+
+  const saved = localStorage.getItem("algoapp-always-keep-paging-on");
+  return saved === "true";
+}

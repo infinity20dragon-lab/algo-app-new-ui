@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/contexts/auth-context";
-import { Settings2, User, Info, Shield, Volume2, VolumeX, CheckCircle2 } from "lucide-react";
+import { Settings2, User, Info, Shield, Volume2, VolumeX, CheckCircle2, Radio } from "lucide-react";
+import { Switch } from "@/components/ui/switch";
 import { useState, useEffect } from "react";
 
 export default function SettingsPage() {
@@ -14,12 +15,14 @@ export default function SettingsPage() {
 
   const [idleVolume, setIdleVolume] = useState<number>(-45);
   const [defaultVolume, setDefaultVolume] = useState<number>(50);
+  const [alwaysKeepPagingOn, setAlwaysKeepPagingOn] = useState<boolean>(false);
   const [savedMessage, setSavedMessage] = useState<string | null>(null);
 
   // Load settings from localStorage
   useEffect(() => {
     const savedIdleVolume = localStorage.getItem("algoapp-idle-volume");
     const savedDefaultVolume = localStorage.getItem("algoapp-default-volume");
+    const savedPagingMode = localStorage.getItem("algoapp-always-keep-paging-on");
 
     if (savedIdleVolume) {
       setIdleVolume(parseInt(savedIdleVolume));
@@ -27,14 +30,18 @@ export default function SettingsPage() {
     if (savedDefaultVolume) {
       setDefaultVolume(parseInt(savedDefaultVolume));
     }
+    if (savedPagingMode) {
+      setAlwaysKeepPagingOn(savedPagingMode === "true");
+    }
   }, []);
 
   const handleSaveSettings = () => {
     try {
       localStorage.setItem("algoapp-idle-volume", idleVolume.toString());
       localStorage.setItem("algoapp-default-volume", defaultVolume.toString());
+      localStorage.setItem("algoapp-always-keep-paging-on", alwaysKeepPagingOn.toString());
 
-      setSavedMessage("Settings saved! Restart monitoring for idle volume to take effect.");
+      setSavedMessage("Settings saved! Restart monitoring for changes to take effect.");
       setTimeout(() => setSavedMessage(null), 5000);
     } catch (error) {
       setSavedMessage("Error: Failed to save settings");
@@ -130,22 +137,56 @@ export default function SettingsPage() {
                 Idle Volume Level
               </Label>
               <div className="flex items-center gap-3">
-                <Input
+                <select
                   id="idleVolume"
-                  type="number"
-                  min={-60}
-                  max={0}
                   value={idleVolume}
-                  onChange={(e) => setIdleVolume(parseInt(e.target.value) || -45)}
-                  className="w-24"
-                />
-                <span className="text-sm text-[var(--text-secondary)]">dB</span>
+                  onChange={(e) => setIdleVolume(parseInt(e.target.value))}
+                  className="px-3 py-2 rounded-md border border-[var(--border-color)] bg-[var(--bg-secondary)] text-[var(--text-primary)]"
+                >
+                  <option value={-60}>Level -10 (-60dB)</option>
+                  <option value={-57}>Level -9 (-57dB)</option>
+                  <option value={-54}>Level -8 (-54dB)</option>
+                  <option value={-51}>Level -7 (-51dB)</option>
+                  <option value={-48}>Level -6 (-48dB)</option>
+                  <option value={-45}>Level -5 (-45dB) - Default</option>
+                  <option value={-42}>Level -4 (-42dB)</option>
+                  <option value={-39}>Level -3 (-39dB)</option>
+                  <option value={-36}>Level -2 (-36dB)</option>
+                  <option value={-33}>Level -1 (-33dB)</option>
+                  <option value={-30}>Level 0 (-30dB)</option>
+                </select>
                 <span className="text-sm text-[var(--text-muted)] font-mono">
-                  Current: {idleVolume}dB
+                  Current: Level {Math.round((idleVolume + 45) / 3) - 5}
                 </span>
               </div>
               <p className="text-sm text-[var(--text-muted)]">
-                Volume level for speakers when idle/off (-60dB to 0dB). Default: -45dB. Restart monitoring for changes to take effect.
+                Volume level for speakers when idle/off (Level -10 to Level 0). Default: Level -5 (-45dB). Restart monitoring for changes to take effect.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="pagingMode" className="flex items-center gap-2">
+                <Radio className="h-4 w-4 text-[var(--text-muted)]" />
+                Paging Device Mode
+              </Label>
+              <div className="flex items-center gap-3 p-4 rounded-xl border border-[var(--border-color)] bg-[var(--bg-secondary)]">
+                <Switch
+                  id="pagingMode"
+                  checked={alwaysKeepPagingOn}
+                  onCheckedChange={setAlwaysKeepPagingOn}
+                />
+                <div className="flex-1">
+                  <Label htmlFor="pagingMode" className="text-sm font-medium cursor-pointer">
+                    Always Keep Paging Device in Transmitter Mode
+                  </Label>
+                  <p className="text-xs text-[var(--text-muted)] mt-1">
+                    {alwaysKeepPagingOn
+                      ? "Paging device stays in Mode 1 (transmitting) at all times - no switching"
+                      : "Paging device toggles: Mode 0 (off) when idle, Mode 1 (transmitting) when audio detected"}
+                  </p>
+                </div>
+              </div>
+              <p className="text-sm text-[var(--text-muted)]">
+                Enable this if you experience delays or issues with mode switching. Keeps paging device always ready to transmit.
               </p>
             </div>
             <div className="flex items-center gap-3">

@@ -16,6 +16,7 @@ import { storage } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import type { AlgoDevice, InputChannelType } from "@/lib/algo/types";
 import { Play, Square, Radio, Mic, Volume2, AlertCircle, CheckCircle2, Film } from "lucide-react";
+import { getAlwaysKeepPagingOn } from "@/lib/settings";
 
 interface InputChannel {
   type: InputChannelType;
@@ -316,9 +317,11 @@ export default function InputRoutingPage() {
       message: `Activating ${speakers.length} speaker(s) for ${channelType}`,
     });
 
-    // Enable paging device
+    // Enable paging device (only if not always on)
+    const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
     const pagingDevices = devices.filter((d) => d.type === "8301");
-    if (pagingDevices.length > 0) {
+    if (pagingDevices.length > 0 && !alwaysKeepPagingOn) {
+      // Only toggle paging if not always on
       await fetch("/api/algo/speakers/mcast", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -394,9 +397,11 @@ export default function InputRoutingPage() {
       }),
     });
 
-    // Disable paging device
+    // Disable paging device (only if not always on)
+    const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
     const pagingDevices = devices.filter((d) => d.type === "8301");
-    if (pagingDevices.length > 0) {
+    if (pagingDevices.length > 0 && !alwaysKeepPagingOn) {
+      // Only toggle paging if not always on
       await fetch("/api/algo/speakers/mcast", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

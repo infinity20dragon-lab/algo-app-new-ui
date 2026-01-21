@@ -6,7 +6,7 @@ import type { AlgoDevice } from "@/lib/algo/types";
 import { storage } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { useAuth } from "@/contexts/auth-context";
-import { getIdleVolumeString } from "@/lib/settings";
+import { getIdleVolumeString, getAlwaysKeepPagingOn } from "@/lib/settings";
 
 // Debug mode - set to false for production to reduce console noise
 const DEBUG_MODE = process.env.NODE_ENV === 'development';
@@ -1382,8 +1382,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
             // NEW FLOW: Enable paging transmitter (mode 1) - INSTANT audio!
             // Speakers are already in mode 2 (listening), so they'll receive immediately
-            debugLog('[AudioMonitoring] AUDIO DETECTED - Setting paging to mode 1 (transmitter)');
-            await setPagingMulticast(1);
+            const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
+            if (!alwaysKeepPagingOn) {
+              // Only toggle paging if not always on
+              debugLog('[AudioMonitoring] AUDIO DETECTED - Setting paging to mode 1 (transmitter)');
+              await setPagingMulticast(1);
+            } else {
+              debugLog('[AudioMonitoring] AUDIO DETECTED - Paging already at mode 1 (always on)');
+            }
 
             // Then ramp the volume
             startVolumeRamp();
@@ -1438,8 +1444,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
                 // NEW FLOW: Disable paging transmitter (mode 0) - NO MORE AUDIO!
                 // Speakers stay in mode 2 (listening), ready for next audio
-                debugLog('[AudioMonitoring] AUDIO ENDED - Setting paging to mode 0 (disabled)');
-                await setPagingMulticast(0);
+                const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
+                if (!alwaysKeepPagingOn) {
+                  // Only toggle paging if not always on
+                  debugLog('[AudioMonitoring] AUDIO ENDED - Setting paging to mode 0 (disabled)');
+                  await setPagingMulticast(0);
+                } else {
+                  debugLog('[AudioMonitoring] AUDIO ENDED - Keeping paging at mode 1 (always on)');
+                }
 
                 // Mute speakers
                 stopVolumeRamp();
@@ -1492,9 +1504,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         // Wait briefly to ensure volume command is fully processed
         await new Promise(resolve => setTimeout(resolve, 200));
 
-        // Step 2: Set paging device to mode 0 (disabled - NOT transmitting)
-        debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 0 (disabled)');
-        await setPagingMulticast(0);
+        // Step 2: Set paging device mode (check settings)
+        const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
+        if (alwaysKeepPagingOn) {
+          debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 1 (ALWAYS ON - transmitter)');
+          await setPagingMulticast(1);
+        } else {
+          debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 0 (disabled - will toggle on audio)');
+          await setPagingMulticast(0);
+        }
 
         // Step 3: Set all speakers to mode 2 (receiver - ready to listen)
         debugLog('[AudioMonitoring] Step 3: Setting speakers to mode 2 (receiver)');
@@ -1506,10 +1524,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           type: "speakers_enabled",
           speakersEnabled: true,
           volume: 0,
-          message: `Monitoring ready: Paging=OFF, Speakers=LISTENING, Volume=${getIdleVolumeString()} (NO STATIC!)`,
+          message: alwaysKeepPagingOn
+            ? `Monitoring ready: Paging=ALWAYS ON (Mode 1), Speakers=LISTENING, Volume=${getIdleVolumeString()}`
+            : `Monitoring ready: Paging=OFF, Speakers=LISTENING, Volume=${getIdleVolumeString()} (NO STATIC!)`,
         });
 
-        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging mode 0, Speakers mode 2, Volume ${getIdleVolumeString()}`);
+        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging mode ${alwaysKeepPagingOn ? 1 : 0}, Speakers mode 2, Volume ${getIdleVolumeString()}`);
       } catch (error) {
         console.error('[AudioMonitoring] Error during speaker setup:', error);
         // Continue anyway - audio capture is already running
