@@ -143,24 +143,29 @@ export default function SettingsPage() {
                   onChange={(e) => setIdleVolume(parseInt(e.target.value))}
                   className="px-3 py-2 rounded-md border border-[var(--border-color)] bg-[var(--bg-secondary)] text-[var(--text-primary)]"
                 >
-                  <option value={-60}>Level -10 (-60dB)</option>
-                  <option value={-57}>Level -9 (-57dB)</option>
-                  <option value={-54}>Level -8 (-54dB)</option>
-                  <option value={-51}>Level -7 (-51dB)</option>
-                  <option value={-48}>Level -6 (-48dB)</option>
                   <option value={-45}>Level -5 (-45dB) - Default</option>
                   <option value={-42}>Level -4 (-42dB)</option>
                   <option value={-39}>Level -3 (-39dB)</option>
                   <option value={-36}>Level -2 (-36dB)</option>
                   <option value={-33}>Level -1 (-33dB)</option>
                   <option value={-30}>Level 0 (-30dB)</option>
+                  <option value={-27}>Level 1 (-27dB)</option>
+                  <option value={-24}>Level 2 (-24dB)</option>
+                  <option value={-21}>Level 3 (-21dB)</option>
+                  <option value={-18}>Level 4 (-18dB)</option>
+                  <option value={-15}>Level 5 (-15dB)</option>
+                  <option value={-12}>Level 6 (-12dB)</option>
+                  <option value={-9}>Level 7 (-9dB)</option>
+                  <option value={-6}>Level 8 (-6dB)</option>
+                  <option value={-3}>Level 9 (-3dB)</option>
+                  <option value={0}>Level 10 (0dB) - Max</option>
                 </select>
                 <span className="text-sm text-[var(--text-muted)] font-mono">
-                  Current: Level {Math.round((idleVolume + 45) / 3) - 5}
+                  Current: Level {(idleVolume + 45) / 3 - 5}
                 </span>
               </div>
               <p className="text-sm text-[var(--text-muted)]">
-                Volume level for speakers when idle/off (Level -10 to Level 0). Default: Level -5 (-45dB). Restart monitoring for changes to take effect.
+                Volume level for speakers when idle/off (Level -5 to Level 10). Default: Level -5 (-45dB). Restart monitoring for changes to take effect.
               </p>
             </div>
             <div className="space-y-2">
