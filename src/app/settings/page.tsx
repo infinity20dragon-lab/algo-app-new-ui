@@ -6,16 +6,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/contexts/auth-context";
-import { Settings2, User, Info, Shield, Volume2, VolumeX } from "lucide-react";
+import { Settings2, User, Info, Shield, Volume2, VolumeX, CheckCircle2 } from "lucide-react";
 import { useState, useEffect } from "react";
-import { useToast } from "@/hooks/use-toast";
 
 export default function SettingsPage() {
   const { user } = useAuth();
-  const { toast } = useToast();
 
   const [idleVolume, setIdleVolume] = useState<number>(-45);
   const [defaultVolume, setDefaultVolume] = useState<number>(50);
+  const [savedMessage, setSavedMessage] = useState<string | null>(null);
 
   // Load settings from localStorage
   useEffect(() => {
@@ -35,16 +34,11 @@ export default function SettingsPage() {
       localStorage.setItem("algoapp-idle-volume", idleVolume.toString());
       localStorage.setItem("algoapp-default-volume", defaultVolume.toString());
 
-      toast({
-        title: "Settings Saved",
-        description: "Your settings have been saved successfully. Restart monitoring for idle volume to take effect.",
-      });
+      setSavedMessage("Settings saved! Restart monitoring for idle volume to take effect.");
+      setTimeout(() => setSavedMessage(null), 5000);
     } catch (error) {
-      toast({
-        title: "Error",
-        description: "Failed to save settings",
-        variant: "destructive",
-      });
+      setSavedMessage("Error: Failed to save settings");
+      setTimeout(() => setSavedMessage(null), 5000);
     }
   };
 
@@ -154,7 +148,15 @@ export default function SettingsPage() {
                 Volume level for speakers when idle/off (-60dB to 0dB). Default: -45dB. Restart monitoring for changes to take effect.
               </p>
             </div>
-            <Button onClick={handleSaveSettings}>Save Settings</Button>
+            <div className="flex items-center gap-3">
+              <Button onClick={handleSaveSettings}>Save Settings</Button>
+              {savedMessage && (
+                <div className="flex items-center gap-2 text-sm text-[var(--accent-green)]">
+                  <CheckCircle2 className="h-4 w-4" />
+                  <span>{savedMessage}</span>
+                </div>
+              )}
+            </div>
           </CardContent>
         </Card>
 
