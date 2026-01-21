@@ -6,6 +6,7 @@ import type { AlgoDevice } from "@/lib/algo/types";
 import { storage } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { useAuth } from "@/contexts/auth-context";
+import { getIdleVolumeString } from "@/lib/settings";
 
 // Debug mode - set to false for production to reduce console noise
 const DEBUG_MODE = process.env.NODE_ENV === 'development';
@@ -747,12 +748,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
 
       // Convert 0-100% to dB
-      // SPECIAL CASE: 0% = -45dB (IDLE state - quietest before needing multicast control)
+      // SPECIAL CASE: 0% = idle volume (IDLE state - quietest before needing multicast control)
       // Normal range: Algo expects 1=-27dB, 2=-24dB, ... 10=0dB
       // Formula: dB = (level - 10) * 3
       let volumeDbString: string;
       if (actualVolume === 0) {
-        volumeDbString = "-45dB"; // IDLE state - level -5 (quietest volume)
+        volumeDbString = getIdleVolumeString(); // IDLE state - level -5 (quietest volume)
       } else {
         const volumeScale = Math.round((actualVolume / 100) * 10);
         const volumeDb = (volumeScale - 10) * 3;
@@ -824,7 +825,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     return rampDuration * 1000;
   }, [rampEnabled, dayNightMode, isDaytime, rampDuration, nightRampDuration]);
 
-  // Set all speakers to -45dB (idle state - quietest volume before needing multicast control)
+  // Set all speakers to getIdleVolumeString() (idle state - quietest volume before needing multicast control)
   const setDevicesVolumeToIdle = useCallback(async () => {
     const linkedSpeakerIds = new Set<string>();
 
@@ -837,7 +838,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
     }
 
-    debugLog(`[AudioMonitoring] Setting ${linkedSpeakerIds.size} speakers to IDLE (-45dB)`);
+    debugLog(`[AudioMonitoring] Setting ${linkedSpeakerIds.size} speakers to IDLE (${getIdleVolumeString()})`);
 
     const volumePromises = Array.from(linkedSpeakerIds).map(async (speakerId) => {
       const speaker = devices.find(d => d.id === speakerId);
@@ -852,11 +853,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             password: speaker.apiPassword,
             authMethod: speaker.authMethod || "standard",
             settings: {
-              "audio.page.vol": "-45dB", // IDLE state - quietest volume (level -5)
+              "audio.page.vol": getIdleVolumeString(), // IDLE state - quietest volume (level -5)
             },
           }),
         });
-        debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} to IDLE (-45dB)`);
+        debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} to IDLE (${getIdleVolumeString()})`);
       } catch (error) {
         debugLog(`[AudioMonitoring] ❌ Failed to set ${speaker.name} to idle`);
       }
@@ -878,12 +879,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Global mode: Ramp to targetVolume (all speakers use same volume)
     const rampTarget = useGlobalVolume ? targetVolume : 100;
 
-    // If ramp duration is 0 (instant), jump directly from -45dB to target volume
+    // If ramp duration is 0 (instant), jump directly from idle volume to target volume
     if (effectiveRampDuration === 0) {
       if (useGlobalVolume) {
-        debugLog(`[AudioMonitoring] GLOBAL MODE - Instant jump: -45dB → ${targetVolume}%`);
+        debugLog(`[AudioMonitoring] GLOBAL MODE - Instant jump: ${getIdleVolumeString()} → ${targetVolume}%`);
       } else {
-        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Instant jump: -45dB → each speaker to its max`);
+        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Instant jump: ${getIdleVolumeString()} → each speaker to its max`);
       }
       currentVolumeRef.current = rampTarget;
       setDevicesVolume(rampTarget);
@@ -891,8 +892,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
 
     // OPTIMIZATION: Start ramp at level 1 (10%), NOT 0%
-    // This skips all the inaudible negative dB levels (-45dB, -30dB, -27dB, etc.)
-    // Ramp: -45dB (static) → 10% (audible) → 20% → ... → target (much faster!)
+    // This skips all the inaudible negative dB levels (getIdleVolumeString(), -30dB, -27dB, etc.)
+    // Ramp: getIdleVolumeString() (static) → 10% (audible) → 20% → ... → target (much faster!)
     const rampStart = 10; // Level 1 (10%) = -27dB (first audible level)
     currentVolumeRef.current = rampStart;
 
@@ -902,9 +903,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     const volumeIncrement = volumeDiff / steps;
 
     if (useGlobalVolume) {
-      debugLog(`[AudioMonitoring] GLOBAL MODE - Optimized ramp: -45dB → ${rampStart}% → ${targetVolume}% over ${effectiveRampDuration/1000}s`);
+      debugLog(`[AudioMonitoring] GLOBAL MODE - Optimized ramp: ${getIdleVolumeString()} → ${rampStart}% → ${targetVolume}% over ${effectiveRampDuration/1000}s`);
     } else {
-      debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Optimized ramp: -45dB → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
+      debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Optimized ramp: ${getIdleVolumeString()} → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
     }
 
     // Set initial volume to level 1 (10%) - skip inaudible levels!
@@ -943,7 +944,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       volumeRampIntervalRef.current = null;
     }
     currentVolumeRef.current = 0;
-    // Set all speakers to -45dB (quietest volume - still has static at this level)
+    // Set all speakers to getIdleVolumeString() (quietest volume - still has static at this level)
     setDevicesVolumeToIdle();
   }, []);
 
@@ -1143,7 +1144,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     });
 
     // NEW FLOW: Emergency shutdown
-    // 1. Mute all speakers to -45dB
+    // 1. Mute all speakers to getIdleVolumeString()
     await setDevicesVolume(0);
 
     // 2. Disable paging transmitter (INSTANT silence - no more audio broadcast!)
@@ -1161,7 +1162,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       volumeRampIntervalRef.current = null;
     }
 
-    debugLog('[AudioMonitoring] ✓ EMERGENCY KILL COMPLETE: All devices mode 0, volume -45dB');
+    debugLog(`[AudioMonitoring] ✓ EMERGENCY KILL COMPLETE: All devices mode 0, volume ${getIdleVolumeString()}`);
   }, [setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
 
   const emergencyEnableAll = useCallback(async () => {
@@ -1224,7 +1225,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             ipAddress: speaker.ipAddress,
             password: speaker.apiPassword,
             authMethod: speaker.authMethod,
-            settings: { "audio.page.vol": "-45dB" }, // IDLE state - eliminates buzzing
+            settings: { "audio.page.vol": getIdleVolumeString() }, // IDLE state - eliminates buzzing
           }),
         });
       }
@@ -1479,14 +1480,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     checkSpeakerConnectivity();
 
     // NEW FLOW: Set up devices for instant response with NO STATIC
-    debugLog('[AudioMonitoring] NEW FLOW: Setting up paging (mode 0) and speakers (mode 2, -45dB)');
+    debugLog(`[AudioMonitoring] NEW FLOW: Setting up paging (mode 0) and speakers (mode 2, ${getIdleVolumeString()})`);
 
     // Run speaker setup in background - offline speakers shouldn't block monitoring
     (async () => {
       try {
-        // Step 1: Set all speakers to -45dB (silent)
-        debugLog('[AudioMonitoring] Step 1: Setting speakers to -45dB');
-        await setDevicesVolume(0); // 0% = -45dB
+        // Step 1: Set all speakers to idle volume (silent)
+        debugLog(`[AudioMonitoring] Step 1: Setting speakers to ${getIdleVolumeString()}`);
+        await setDevicesVolume(0); // 0% = idle volume
 
         // Wait briefly to ensure volume command is fully processed
         await new Promise(resolve => setTimeout(resolve, 200));
@@ -1505,10 +1506,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           type: "speakers_enabled",
           speakersEnabled: true,
           volume: 0,
-          message: `Monitoring ready: Paging=OFF, Speakers=LISTENING, Volume=-45dB (NO STATIC!)`,
+          message: `Monitoring ready: Paging=OFF, Speakers=LISTENING, Volume=${getIdleVolumeString()} (NO STATIC!)`,
         });
 
-        debugLog('[AudioMonitoring] ✓ Setup complete: Paging mode 0, Speakers mode 2, Volume -45dB');
+        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging mode 0, Speakers mode 2, Volume ${getIdleVolumeString()}`);
       } catch (error) {
         console.error('[AudioMonitoring] Error during speaker setup:', error);
         // Continue anyway - audio capture is already running
@@ -1542,15 +1543,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       audioDetectionTimeoutRef.current = null;
     }
 
-    // NEW FLOW: Clean shutdown - set everything to mode 0 and -45dB
+    // NEW FLOW: Clean shutdown - set everything to mode 0 and getIdleVolumeString()
     if (!controllingSpakersRef.current) {
       controllingSpakersRef.current = true;
       setSpeakersEnabled(false);
       setAudioDetected(false);
 
-      debugLog('[AudioMonitoring] STOP: Shutting down paging and speakers to mode 0, volume -45dB');
+      debugLog(`[AudioMonitoring] STOP: Shutting down paging and speakers to mode 0, volume ${getIdleVolumeString()}`);
 
-      // Step 1: Set speakers to -45dB
+      // Step 1: Set speakers to idle volume
       await setDevicesVolume(0);
 
       // Step 2: Set paging device to mode 0 (disabled)
@@ -1560,7 +1561,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       await setSpeakersMulticast(0);
 
       controllingSpakersRef.current = false;
-      debugLog('[AudioMonitoring] ✓ Clean shutdown complete: All devices mode 0, speakers -45dB');
+      debugLog(`[AudioMonitoring] ✓ Clean shutdown complete: All devices mode 0, speakers ${getIdleVolumeString()}`);
     }
   }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
 

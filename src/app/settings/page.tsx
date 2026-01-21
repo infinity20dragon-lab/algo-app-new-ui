@@ -6,10 +6,47 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/contexts/auth-context";
-import { Settings2, User, Info, Shield, Volume2 } from "lucide-react";
+import { Settings2, User, Info, Shield, Volume2, VolumeX } from "lucide-react";
+import { useState, useEffect } from "react";
+import { useToast } from "@/hooks/use-toast";
 
 export default function SettingsPage() {
   const { user } = useAuth();
+  const { toast } = useToast();
+
+  const [idleVolume, setIdleVolume] = useState<number>(-45);
+  const [defaultVolume, setDefaultVolume] = useState<number>(50);
+
+  // Load settings from localStorage
+  useEffect(() => {
+    const savedIdleVolume = localStorage.getItem("algoapp-idle-volume");
+    const savedDefaultVolume = localStorage.getItem("algoapp-default-volume");
+
+    if (savedIdleVolume) {
+      setIdleVolume(parseInt(savedIdleVolume));
+    }
+    if (savedDefaultVolume) {
+      setDefaultVolume(parseInt(savedDefaultVolume));
+    }
+  }, []);
+
+  const handleSaveSettings = () => {
+    try {
+      localStorage.setItem("algoapp-idle-volume", idleVolume.toString());
+      localStorage.setItem("algoapp-default-volume", defaultVolume.toString());
+
+      toast({
+        title: "Settings Saved",
+        description: "Your settings have been saved successfully. Restart monitoring for idle volume to take effect.",
+      });
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: "Failed to save settings",
+        variant: "destructive",
+      });
+    }
+  };
 
   return (
     <AppLayout>
@@ -86,13 +123,38 @@ export default function SettingsPage() {
                 type="number"
                 min={0}
                 max={100}
-                defaultValue={50}
+                value={defaultVolume}
+                onChange={(e) => setDefaultVolume(parseInt(e.target.value) || 50)}
               />
               <p className="text-sm text-[var(--text-muted)]">
                 Default volume level for new distributions (0-100)
               </p>
             </div>
-            <Button>Save Settings</Button>
+            <div className="space-y-2">
+              <Label htmlFor="idleVolume" className="flex items-center gap-2">
+                <VolumeX className="h-4 w-4 text-[var(--text-muted)]" />
+                Idle Volume Level
+              </Label>
+              <div className="flex items-center gap-3">
+                <Input
+                  id="idleVolume"
+                  type="number"
+                  min={-60}
+                  max={0}
+                  value={idleVolume}
+                  onChange={(e) => setIdleVolume(parseInt(e.target.value) || -45)}
+                  className="w-24"
+                />
+                <span className="text-sm text-[var(--text-secondary)]">dB</span>
+                <span className="text-sm text-[var(--text-muted)] font-mono">
+                  Current: {idleVolume}dB
+                </span>
+              </div>
+              <p className="text-sm text-[var(--text-muted)]">
+                Volume level for speakers when idle/off (-60dB to 0dB). Default: -45dB. Restart monitoring for changes to take effect.
+              </p>
+            </div>
+            <Button onClick={handleSaveSettings}>Save Settings</Button>
           </CardContent>
         </Card>
 

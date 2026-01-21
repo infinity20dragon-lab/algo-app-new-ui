@@ -49,6 +49,16 @@ export default function InputRoutingPage() {
   const [recordingEnabled, setRecordingEnabled] = useState(true);
   const [silenceDelay, setSilenceDelay] = useState(2000); // ms before stopping recording
 
+  // Logging
+  const [logs, setLogs] = useState<Array<{
+    timestamp: string;
+    channel: InputChannelType | "system";
+    type: "audio_detected" | "audio_silent" | "speakers_enabled" | "speakers_disabled" | "recording_saved" | "system";
+    message: string;
+    recordingUrl?: string;
+  }>>([]);
+  const [loggingEnabled, setLoggingEnabled] = useState(true);
+
   // Available audio input devices
   const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
 
@@ -74,6 +84,55 @@ export default function InputRoutingPage() {
     }
     loadAudioDevices();
   }, []);
+
+  // Add log entry
+  const addLog = useCallback((entry: {
+    channel: InputChannelType | "system";
+    type: "audio_detected" | "audio_silent" | "speakers_enabled" | "speakers_disabled" | "recording_saved" | "system";
+    message: string;
+    recordingUrl?: string;
+  }) => {
+    if (!loggingEnabled) return;
+
+    const logEntry = {
+      ...entry,
+      timestamp: new Date().toISOString(),
+    };
+
+    console.log(`[InputRouting] ${logEntry.message}`, logEntry);
+
+    setLogs((prev) => {
+      const newLogs = [...prev, logEntry];
+      // Keep only last 500 entries
+      if (newLogs.length > 500) {
+        return newLogs.slice(-500);
+      }
+      return newLogs;
+    });
+  }, [loggingEnabled]);
+
+  // Clear logs
+  const clearLogs = useCallback(() => {
+    setLogs([]);
+  }, []);
+
+  // Export logs as CSV
+  const exportLogs = useCallback(() => {
+    const header = "Timestamp,Channel,Type,Message,Recording URL\n";
+    const rows = logs.map((log) => {
+      const timestamp = new Date(log.timestamp).toLocaleString();
+      return `"${timestamp}","${log.channel}","${log.type}","${log.message}","${log.recordingUrl || ''}"`;
+    }).join("\n");
+
+    const csv = header + rows;
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `multi-input-logs-${new Date().toISOString()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [logs]);
 
   // Get speakers for each input type
   const getSpeakersForInput = useCallback((inputType: InputChannelType): AlgoDevice[] => {
@@ -243,8 +302,19 @@ export default function InputRoutingPage() {
 
     if (speakers.length === 0) {
       console.log(`[InputRouting] No speakers assigned to ${channelType}`);
+      addLog({
+        channel: channelType,
+        type: "system",
+        message: `Audio detected but no speakers assigned to ${channelType}`,
+      });
       return;
     }
+
+    addLog({
+      channel: channelType,
+      type: "speakers_enabled",
+      message: `Activating ${speakers.length} speaker(s) for ${channelType}`,
+    });
 
     // Enable paging device
     const pagingDevices = devices.filter((d) => d.type === "8301");
@@ -296,13 +366,19 @@ export default function InputRoutingPage() {
     }
 
     console.log(`[InputRouting] ✅ Activated ${speakers.length} speakers for ${channelType}`);
-  }, [devices, getSpeakersForInput, useGlobalVolume, globalVolume]);
+  }, [devices, getSpeakersForInput, useGlobalVolume, globalVolume, addLog]);
 
   // Deactivate speakers for a specific channel
   const deactivateSpeakersForChannel = useCallback(async (channelType: InputChannelType) => {
     console.log(`[InputRouting] 🛑 ${channelType.toUpperCase()} AUDIO ENDED - Deactivating speakers`);
 
     const speakers = getSpeakersForInput(channelType);
+
+    addLog({
+      channel: channelType,
+      type: "speakers_disabled",
+      message: `Deactivating ${speakers.length} speaker(s) for ${channelType}`,
+    });
 
     // Mute speakers to -45dB
     await fetch("/api/algo/speakers/volume", {
@@ -336,11 +412,17 @@ export default function InputRoutingPage() {
     }
 
     console.log(`[InputRouting] ✅ Deactivated ${speakers.length} speakers for ${channelType}`);
-  }, [devices, getSpeakersForInput]);
+  }, [devices, getSpeakersForInput, addLog]);
 
   // Start monitoring all 3 channels
   const startMonitoring = useCallback(async () => {
     console.log("[InputRouting] Starting multi-input monitoring");
+
+    addLog({
+      channel: "system",
+      type: "system",
+      message: `Multi-input monitoring started - Threshold: ${threshold}dB, Gain: ${gain.toFixed(1)}x`,
+    });
 
     // Create audio context if needed
     if (!audioContextRef.current) {
@@ -398,7 +480,7 @@ export default function InputRoutingPage() {
 
     // Start monitoring loop
     monitorChannels();
-  }, [channels, gain]);
+  }, [channels, gain, threshold, addLog]);
 
   // Monitor all channels for audio activity
   const monitorChannels = useCallback(() => {
@@ -429,6 +511,13 @@ export default function InputRoutingPage() {
             silenceTimersRef.current.delete(channel.type);
           }
 
+          // Log audio detection
+          addLog({
+            channel: channel.type,
+            type: "audio_detected",
+            message: `Audio detected on ${channel.type} - Level: ${audioLevel}%`,
+          });
+
           // Activate speakers
           activateSpeakersForChannel(channel.type);
 
@@ -440,6 +529,13 @@ export default function InputRoutingPage() {
 
         // If this channel just became inactive
         if (!isActive && channel.isActive) {
+          // Log audio silence
+          addLog({
+            channel: channel.type,
+            type: "audio_silent",
+            message: `Audio below threshold on ${channel.type} - Starting ${(silenceDelay / 1000).toFixed(1)}s silence delay`,
+          });
+
           // Set silence timer to deactivate speakers and stop recording
           const timer = setTimeout(async () => {
             await deactivateSpeakersForChannel(channel.type);
@@ -447,6 +543,15 @@ export default function InputRoutingPage() {
             // Stop recording and upload
             if (channel.isRecording) {
               const recordingUrl = await stopRecordingAndUpload(channel.type);
+
+              // Log recording saved
+              addLog({
+                channel: channel.type,
+                type: "recording_saved",
+                message: `Recording saved for ${channel.type}${recordingUrl ? ' 🎙️' : ' (failed)'}`,
+                recordingUrl: recordingUrl || undefined,
+              });
+
               console.log(`[InputRouting] ${channel.type} recording saved:`, recordingUrl || 'failed');
             }
 
@@ -467,11 +572,17 @@ export default function InputRoutingPage() {
     });
 
     animationFrameRef.current = requestAnimationFrame(monitorChannels);
-  }, [isMonitoring, threshold, silenceDelay, startRecording, stopRecordingAndUpload, activateSpeakersForChannel, deactivateSpeakersForChannel]);
+  }, [isMonitoring, threshold, silenceDelay, startRecording, stopRecordingAndUpload, activateSpeakersForChannel, deactivateSpeakersForChannel, addLog]);
 
   // Stop monitoring
   const stopMonitoring = useCallback(() => {
     console.log("[InputRouting] Stopping multi-input monitoring");
+
+    addLog({
+      channel: "system",
+      type: "system",
+      message: "Multi-input monitoring stopped - All channels shut down",
+    });
 
     // Cancel animation frame
     if (animationFrameRef.current) {
@@ -510,7 +621,7 @@ export default function InputRoutingPage() {
     );
 
     setIsMonitoring(false);
-  }, [channels, stopRecordingAndUpload]);
+  }, [channels, stopRecordingAndUpload, addLog]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -833,6 +944,107 @@ export default function InputRoutingPage() {
           </CardContent>
         </Card>
       )}
+
+      {/* Activity Log */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle>Activity Log</CardTitle>
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="logging-toggle" className="text-sm font-normal">
+                  Enable Logging
+                </Label>
+                <Switch
+                  id="logging-toggle"
+                  checked={loggingEnabled}
+                  onCheckedChange={setLoggingEnabled}
+                />
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={clearLogs}
+                disabled={logs.length === 0}
+              >
+                Clear
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={exportLogs}
+                disabled={logs.length === 0}
+              >
+                Export CSV
+              </Button>
+            </div>
+          </div>
+          <CardDescription>
+            Real-time activity tracking for multi-input monitoring
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-2 max-h-96 overflow-y-auto">
+            {logs.length === 0 ? (
+              <p className="text-center text-muted-foreground py-8">
+                No activity logged yet. {!loggingEnabled && "Logging is disabled."}
+              </p>
+            ) : (
+              logs.slice().reverse().map((log, idx) => {
+                const getChannelColor = (channel: string) => {
+                  switch (channel) {
+                    case "medical": return "text-blue-600 bg-blue-100 dark:bg-blue-950";
+                    case "fire": return "text-red-600 bg-red-100 dark:bg-red-950";
+                    case "allCall": return "text-purple-600 bg-purple-100 dark:bg-purple-950";
+                    default: return "text-gray-600 bg-gray-100 dark:bg-gray-800";
+                  }
+                };
+
+                const getTypeIcon = (type: string) => {
+                  switch (type) {
+                    case "audio_detected": return "🎤";
+                    case "audio_silent": return "🔇";
+                    case "speakers_enabled": return "🔊";
+                    case "speakers_disabled": return "🔕";
+                    case "recording_saved": return "🎙️";
+                    default: return "ℹ️";
+                  }
+                };
+
+                return (
+                  <div
+                    key={`${log.timestamp}-${idx}`}
+                    className="flex items-start gap-3 p-3 bg-gray-50 dark:bg-gray-900 rounded-lg text-sm"
+                  >
+                    <span className="text-lg">{getTypeIcon(log.type)}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <Badge className={getChannelColor(log.channel)}>
+                          {log.channel.toUpperCase()}
+                        </Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {new Date(log.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-sm">{log.message}</p>
+                      {log.recordingUrl && (
+                        <a
+                          href={log.recordingUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-blue-600 hover:underline mt-1 inline-block"
+                        >
+                          📎 Download Recording
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Help Text */}
       <Card className="border-blue-500 bg-blue-50 dark:bg-blue-950">
