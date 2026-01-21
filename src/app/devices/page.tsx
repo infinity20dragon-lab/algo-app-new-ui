@@ -521,12 +521,12 @@ export default function DevicesPage() {
                     />
                   </div>
 
-                  {/* Max Volume - only for speakers, not paging devices */}
+                  {/* Operating Volume - only for speakers, not paging devices */}
                   {formData.type !== "8301" && (
                     <div className="space-y-2">
                       <Label htmlFor="maxVolume" className="flex items-center gap-2">
                         <Volume2 className="h-4 w-4 text-[var(--accent-orange)]" />
-                        Max Volume: {formData.maxVolume}%
+                        Operating Volume: {formData.maxVolume}%
                       </Label>
                       <Slider
                         id="maxVolume"
@@ -542,7 +542,7 @@ export default function DevicesPage() {
                         showValue
                       />
                       <p className="text-xs text-[var(--text-muted)]">
-                        Maximum volume this speaker can reach during alerts (e.g., set lower for lobby)
+                        Volume this speaker runs at during monitoring. When volume ramp is enabled, speaker ramps from idle to this level when audio is detected.
                       </p>
                     </div>
                   )}

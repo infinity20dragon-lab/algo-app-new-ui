@@ -1365,16 +1365,28 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             type: "audio_detected",
             audioLevel,
             audioThreshold,
-            message: `Audio sustained ${sustainDuration}ms at ${audioLevel.toFixed(1)}% - ramping volume (speakers already listening)`,
+            message: rampEnabled
+              ? `Audio sustained ${sustainDuration}ms at ${audioLevel.toFixed(1)}% - ramping volume (speakers already listening)`
+              : `Audio sustained ${sustainDuration}ms at ${audioLevel.toFixed(1)}% (speakers already listening)`,
           });
 
-          addLog({
-            type: "volume_change",
-            audioLevel,
-            speakersEnabled: true,
-            volume: targetVolume,
-            message: `Volume ramping to ${targetVolume}% (paging mode 1 → speakers receive audio)`,
-          });
+          if (rampEnabled) {
+            addLog({
+              type: "volume_change",
+              audioLevel,
+              speakersEnabled: true,
+              volume: targetVolume,
+              message: `Volume ramping to ${targetVolume}% (paging mode 1 → speakers receive audio)`,
+            });
+          } else {
+            addLog({
+              type: "volume_change",
+              audioLevel,
+              speakersEnabled: true,
+              volume: targetVolume,
+              message: `Speakers at operating volume ${targetVolume}% (paging mode 1 → speakers receive audio)`,
+            });
+          }
 
           (async () => {
             // Start recording the audio
@@ -1391,8 +1403,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               debugLog('[AudioMonitoring] AUDIO DETECTED - Paging already at mode 1 (always on)');
             }
 
-            // Then ramp the volume
-            startVolumeRamp();
+            // Then ramp the volume (only if ramp enabled)
+            if (rampEnabled) {
+              debugLog('[AudioMonitoring] Ramp ENABLED - Starting volume ramp');
+              startVolumeRamp();
+            } else {
+              debugLog('[AudioMonitoring] Ramp DISABLED - Speakers already at operating volume, no ramp needed');
+            }
             controllingSpakersRef.current = false;
           })();
         }
@@ -1453,16 +1470,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   debugLog('[AudioMonitoring] AUDIO ENDED - Keeping paging at mode 1 (always on)');
                 }
 
-                // Mute speakers
-                stopVolumeRamp();
-                await setDevicesVolume(0);
+                // Ramp down or keep at operating volume
+                if (rampEnabled) {
+                  debugLog('[AudioMonitoring] Ramp ENABLED - Ramping volume down to idle');
+                  stopVolumeRamp();
+                  await setDevicesVolume(0);
+                } else {
+                  debugLog('[AudioMonitoring] Ramp DISABLED - Keeping speakers at operating volume');
+                  // Speakers stay at operating volume - no change needed
+                }
 
                 // Log with recording URL if available
                 addLog({
                   type: "volume_change",
                   speakersEnabled: true, // Speakers STAY in mode 2 (ready)
-                  volume: 0,
-                  message: `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingUrl ? ' 🎙️ Recording saved' : ''}`,
+                  volume: rampEnabled ? 0 : targetVolume,
+                  message: rampEnabled
+                    ? `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingUrl ? ' 🎙️ Recording saved' : ''}`
+                    : `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - Speakers stay at operating volume${recordingUrl ? ' 🎙️ Recording saved' : ''}`,
                   recordingUrl: recordingUrl || undefined,
                 });
 
@@ -1492,14 +1517,21 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     checkSpeakerConnectivity();
 
     // NEW FLOW: Set up devices for instant response with NO STATIC
-    debugLog(`[AudioMonitoring] NEW FLOW: Setting up paging (mode 0) and speakers (mode 2, ${getIdleVolumeString()})`);
+    debugLog(`[AudioMonitoring] NEW FLOW: Setting up paging and speakers (mode 2)`);
 
     // Run speaker setup in background - offline speakers shouldn't block monitoring
     (async () => {
       try {
-        // Step 1: Set all speakers to idle volume (silent)
-        debugLog(`[AudioMonitoring] Step 1: Setting speakers to ${getIdleVolumeString()}`);
-        await setDevicesVolume(0); // 0% = idle volume
+        // Step 1: Set speakers to starting volume (depends on ramp setting)
+        if (rampEnabled) {
+          // Ramp enabled: Start at idle volume, will ramp up when audio detected
+          debugLog(`[AudioMonitoring] Step 1: Ramp ENABLED - Setting speakers to idle volume ${getIdleVolumeString()}`);
+          await setDevicesVolume(0); // 0% = idle volume
+        } else {
+          // Ramp disabled: Start at operating volume, stay there
+          debugLog(`[AudioMonitoring] Step 1: Ramp DISABLED - Setting speakers to operating volume`);
+          await setDevicesVolume(100); // 100% scales to each speaker's maxVolume (operating volume)
+        }
 
         // Wait briefly to ensure volume command is fully processed
         await new Promise(resolve => setTimeout(resolve, 200));
@@ -1520,16 +1552,20 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
         setSpeakersEnabled(true); // Mark as ready
 
+        const volumeMsg = rampEnabled
+          ? `Idle Volume=${getIdleVolumeString()} (will ramp when audio detected)`
+          : `Operating Volume (ramp disabled)`;
+
         addLog({
           type: "speakers_enabled",
           speakersEnabled: true,
-          volume: 0,
+          volume: rampEnabled ? 0 : 100,
           message: alwaysKeepPagingOn
-            ? `Monitoring ready: Paging=ALWAYS ON (Mode 1), Speakers=LISTENING, Volume=${getIdleVolumeString()}`
-            : `Monitoring ready: Paging=OFF, Speakers=LISTENING, Volume=${getIdleVolumeString()} (NO STATIC!)`,
+            ? `Monitoring ready: Paging=ALWAYS ON (Mode 1), Speakers=LISTENING, ${volumeMsg}`
+            : `Monitoring ready: Paging=OFF, Speakers=LISTENING, ${volumeMsg}`,
         });
 
-        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging mode ${alwaysKeepPagingOn ? 1 : 0}, Speakers mode 2, Volume ${getIdleVolumeString()}`);
+        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging mode ${alwaysKeepPagingOn ? 1 : 0}, Speakers mode 2, ${volumeMsg}`);
       } catch (error) {
         console.error('[AudioMonitoring] Error during speaker setup:', error);
         // Continue anyway - audio capture is already running
