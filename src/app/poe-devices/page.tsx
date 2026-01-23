@@ -244,6 +244,7 @@ export default function PoEDevicesPage() {
           ipAddress: poeSwitch.ipAddress,
           password: poeSwitch.password,
           type: poeSwitch.type,
+          switchId: poeSwitch.id,
         }),
       });
       const data = await response.json();
@@ -251,6 +252,7 @@ export default function PoEDevicesPage() {
         alert(`Test failed: ${data.error || "Unknown error"}`);
       } else {
         alert(data.message);
+        await loadData(); // Refresh to show updated status
       }
     } catch (error) {
       alert("Failed to connect to switch");

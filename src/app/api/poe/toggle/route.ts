@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getPoESwitch, getPoEDevice, updatePoEDevice } from "@/lib/firebase/firestore";
+import { getPoESwitch, getPoEDevice, updatePoEDevice, updatePoESwitch } from "@/lib/firebase/firestore";
 import { createPoEController } from "@/lib/poe/controller";
 
 export async function POST(request: Request) {
@@ -51,6 +51,13 @@ export async function POST(request: Request) {
     await updatePoEDevice(deviceId, {
       isEnabled: enabled,
       lastToggled: new Date(),
+      isOnline: true,
+    });
+
+    // Update switch online status
+    await updatePoESwitch(poeDevice.switchId, {
+      isOnline: true,
+      lastSeen: new Date(),
     });
 
     return NextResponse.json({
@@ -62,8 +69,24 @@ export async function POST(request: Request) {
 
   } catch (error) {
     console.error("PoE toggle error:", error);
+
+    // Mark switch as offline if it's a timeout/connection error
+    const errorMessage = error instanceof Error ? error.message : "Failed to toggle PoE device";
+    if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT") || errorMessage.includes("ECONNREFUSED")) {
+      try {
+        const poeDevice = await getPoEDevice(deviceId);
+        if (poeDevice) {
+          await updatePoESwitch(poeDevice.switchId, {
+            isOnline: false,
+          });
+        }
+      } catch (updateError) {
+        console.error("Failed to update switch offline status:", updateError);
+      }
+    }
+
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to toggle PoE device" },
+      { error: errorMessage },
       { status: 500 }
     );
   }

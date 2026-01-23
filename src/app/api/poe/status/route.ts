@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getPoESwitch, getPoEDevices, updatePoEDevice } from "@/lib/firebase/firestore";
+import { getPoESwitch, getPoEDevices, updatePoEDevice, updatePoESwitch } from "@/lib/firebase/firestore";
 import { createPoEController } from "@/lib/poe/controller";
 
 export async function POST(request: Request) {
@@ -31,6 +31,12 @@ export async function POST(request: Request) {
 
     const portStatuses = await controller.getPortStatuses();
 
+    // Update switch online status
+    await updatePoESwitch(switchId, {
+      isOnline: true,
+      lastSeen: new Date(),
+    });
+
     // Get all devices for this switch
     const allDevices = await getPoEDevices();
     const switchDevices = allDevices.filter(d => d.switchId === switchId);
@@ -42,6 +48,7 @@ export async function POST(request: Request) {
         // Port status differs from stored state - update it
         await updatePoEDevice(device.id, {
           isEnabled: portStatus.enabled,
+          isOnline: true,
         });
       }
     });
@@ -57,8 +64,24 @@ export async function POST(request: Request) {
 
   } catch (error) {
     console.error("PoE status error:", error);
+
+    // Mark switch as offline on error
+    const errorMessage = error instanceof Error ? error.message : "Failed to get PoE status";
+    if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT") || errorMessage.includes("ECONNREFUSED")) {
+      try {
+        const { switchId: id } = await request.json();
+        if (id) {
+          await updatePoESwitch(id, {
+            isOnline: false,
+          });
+        }
+      } catch (updateError) {
+        console.error("Failed to update switch offline status:", updateError);
+      }
+    }
+
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to get PoE status" },
+      { error: errorMessage },
       { status: 500 }
     );
   }

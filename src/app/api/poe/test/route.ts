@@ -4,7 +4,7 @@ import { createPoEController } from "@/lib/poe/controller";
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { ipAddress, password, type = "netgear_gs308ep" } = body;
+    const { ipAddress, password, type = "netgear_gs308ep", switchId } = body;
 
     if (!ipAddress) {
       return NextResponse.json(
@@ -27,6 +27,15 @@ export async function POST(request: Request) {
     });
 
     const isOnline = await controller.testConnection();
+
+    // Update switch status if switchId provided
+    if (switchId && isOnline) {
+      const { updatePoESwitch } = await import("@/lib/firebase/firestore");
+      await updatePoESwitch(switchId, {
+        isOnline: true,
+        lastSeen: new Date(),
+      });
+    }
 
     return NextResponse.json({
       success: true,

@@ -52,7 +52,7 @@ function merge(str1: string, str2: string): string {
 /**
  * Helper to make HTTP requests using Node's http module
  */
-function httpRequest(options: http.RequestOptions, body?: string): Promise<{ statusCode: number; headers: http.IncomingHttpHeaders; body: string }> {
+function httpRequest(options: http.RequestOptions, body?: string, timeout: number = 5000): Promise<{ statusCode: number; headers: http.IncomingHttpHeaders; body: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request(options, (res) => {
       let data = '';
@@ -68,6 +68,12 @@ function httpRequest(options: http.RequestOptions, body?: string): Promise<{ sta
           body: data,
         });
       });
+    });
+
+    // Set timeout
+    req.setTimeout(timeout, () => {
+      req.destroy();
+      reject(new Error(`Request timeout after ${timeout}ms`));
     });
 
     req.on('error', reject);
