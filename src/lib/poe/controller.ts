@@ -4,6 +4,8 @@
  */
 
 import crypto from 'crypto';
+import http from 'http';
+import { URL } from 'url';
 
 export interface PoESwitchCredentials {
   ipAddress: string;
@@ -48,6 +50,37 @@ function merge(str1: string, str2: string): string {
 }
 
 /**
+ * Helper to make HTTP requests using Node's http module
+ */
+function httpRequest(options: http.RequestOptions, body?: string): Promise<{ statusCode: number; headers: http.IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(options, (res) => {
+      let data = '';
+
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      res.on('end', () => {
+        resolve({
+          statusCode: res.statusCode || 0,
+          headers: res.headers,
+          body: data,
+        });
+      });
+    });
+
+    req.on('error', reject);
+
+    if (body) {
+      req.write(body);
+    }
+
+    req.end();
+  });
+}
+
+/**
  * Netgear GS308EP Controller
  */
 export class NetgearGS308EPController {
@@ -63,18 +96,19 @@ export class NetgearGS308EPController {
    * Get the rand value from the login page
    */
   private async getRandValue(): Promise<string> {
-    const response = await fetch(`http://${this.ipAddress}/login.cgi`, {
+    const response = await httpRequest({
+      hostname: this.ipAddress,
+      port: 80,
+      path: '/login.cgi',
       method: 'GET',
     });
 
-    if (!response.ok) {
-      throw new Error(`Failed to fetch login page: ${response.status}`);
+    if (response.statusCode !== 200) {
+      throw new Error(`Failed to fetch login page: ${response.statusCode}`);
     }
 
-    const html = await response.text();
-
     // Extract rand from HTML: <input type=hidden id='rand' value='374961091' disabled>
-    const randMatch = html.match(/id='rand'\s+value='([^']+)'/);
+    const randMatch = response.body.match(/id='rand'\s+value='([^']+)'/);
     if (!randMatch) {
       throw new Error('Rand value not found in login page');
     }
@@ -93,28 +127,33 @@ export class NetgearGS308EPController {
     const merged = merge(this.password, rand);
     const hashedPassword = md5(merged);
 
-    const response = await fetch(`http://${this.ipAddress}/login.cgi`, {
+    const postData = `password=${hashedPassword}`;
+
+    const response = await httpRequest({
+      hostname: this.ipAddress,
+      port: 80,
+      path: '/login.cgi',
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData),
         'Origin': `http://${this.ipAddress}`,
         'Referer': `http://${this.ipAddress}/login.cgi`,
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
       },
-      body: `password=${hashedPassword}`,
-    });
+    }, postData);
 
-    if (!response.ok) {
-      throw new Error(`Login failed: ${response.status}`);
+    if (response.statusCode !== 200) {
+      throw new Error(`Login failed: ${response.statusCode}`);
     }
 
     // Extract SID cookie
-    const cookies = response.headers.get('set-cookie');
+    const cookies = response.headers['set-cookie'];
     if (!cookies) {
       throw new Error('No cookies received from login');
     }
 
-    const sidMatch = cookies.match(/SID=([^;]+)/);
+    const sidMatch = cookies.join(';').match(/SID=([^;]+)/);
     if (!sidMatch) {
       throw new Error('SID cookie not found');
     }
@@ -126,21 +165,22 @@ export class NetgearGS308EPController {
    * Get hash token from PoE config page
    */
   private async getHashToken(sidCookie: string): Promise<string> {
-    const response = await fetch(`http://${this.ipAddress}/PoEPortConfig.cgi`, {
+    const response = await httpRequest({
+      hostname: this.ipAddress,
+      port: 80,
+      path: '/PoEPortConfig.cgi',
       method: 'GET',
       headers: {
         'Cookie': sidCookie,
       },
     });
 
-    if (!response.ok) {
-      throw new Error(`Failed to get PoE config page: ${response.status}`);
+    if (response.statusCode !== 200) {
+      throw new Error(`Failed to get PoE config page: ${response.statusCode}`);
     }
 
-    const html = await response.text();
-
     // Extract hash from HTML: <input type=hidden name='hash' id='hash' value="...">
-    const hashMatch = html.match(/name='hash'[^>]*value="([^"]+)"/);
+    const hashMatch = response.body.match(/name='hash'[^>]*value="([^"]+)"/);
     if (!hashMatch) {
       throw new Error('Hash token not found in HTML');
     }
@@ -180,18 +220,23 @@ export class NetgearGS308EPController {
       DISCONNECT_TYP: '2',
     });
 
-    const response = await fetch(`http://${this.ipAddress}/PoEPortConfig.cgi`, {
+    const postData = formData.toString();
+
+    const response = await httpRequest({
+      hostname: this.ipAddress,
+      port: 80,
+      path: '/PoEPortConfig.cgi',
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData),
         'Cookie': sidCookie,
         'X-Requested-With': 'XMLHttpRequest',
       },
-      body: formData.toString(),
-    });
+    }, postData);
 
-    if (!response.ok) {
-      throw new Error(`Failed to toggle port: ${response.status}`);
+    if (response.statusCode !== 200) {
+      throw new Error(`Failed to toggle port: ${response.statusCode}`);
     }
   }
 
@@ -217,25 +262,26 @@ export class NetgearGS308EPController {
     const sidCookie = await this.login();
 
     // Get PoE config page
-    const response = await fetch(`http://${this.ipAddress}/PoEPortConfig.cgi`, {
+    const response = await httpRequest({
+      hostname: this.ipAddress,
+      port: 80,
+      path: '/PoEPortConfig.cgi',
       method: 'GET',
       headers: {
         'Cookie': sidCookie,
       },
     });
 
-    if (!response.ok) {
-      throw new Error(`Failed to get PoE config page: ${response.status}`);
+    if (response.statusCode !== 200) {
+      throw new Error(`Failed to get PoE config page: ${response.statusCode}`);
     }
-
-    const html = await response.text();
 
     // Parse HTML to extract port statuses
     // Look for patterns like: <input type="hidden" class="port" value="2"> and <input type="hidden" class="hidPortPwr" id="hidPortPwr" value="0">
     const portStatuses: Array<{ port: number; enabled: boolean }> = [];
 
     // Find all port list items
-    const portMatches = html.matchAll(/<li class="poe_port_list_item[^>]*>[\s\S]*?<input type="hidden" class="port" value="(\d+)"[\s\S]*?<input type="hidden" class="hidPortPwr"[^>]*value="(\d+)"/g);
+    const portMatches = response.body.matchAll(/<li class="poe_port_list_item[^>]*>[\s\S]*?<input type="hidden" class="port" value="(\d+)"[\s\S]*?<input type="hidden" class="hidPortPwr"[^>]*value="(\d+)"/g);
 
     for (const match of portMatches) {
       const portNumber = parseInt(match[1]);
