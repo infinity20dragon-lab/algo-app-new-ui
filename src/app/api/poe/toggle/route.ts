@@ -2,10 +2,36 @@ import { NextResponse } from "next/server";
 import { getPoESwitch, getPoEDevice, updatePoEDevice, updatePoESwitch } from "@/lib/firebase/firestore";
 import { createPoEController } from "@/lib/poe/controller";
 
+// Queue to prevent concurrent toggles to the same device
+const toggleQueues = new Map<string, Promise<void>>();
+
+async function queueToggle(deviceId: string, fn: () => Promise<void>): Promise<void> {
+  // Get existing queue for this device
+  const existingQueue = toggleQueues.get(deviceId) || Promise.resolve();
+
+  // Chain this toggle after the existing queue
+  const newQueue = existingQueue.then(fn).catch((error) => {
+    console.error(`[Queue] Toggle failed for device ${deviceId}:`, error);
+    throw error;
+  });
+
+  toggleQueues.set(deviceId, newQueue);
+
+  // Clean up completed queue after execution
+  await newQueue.finally(() => {
+    if (toggleQueues.get(deviceId) === newQueue) {
+      toggleQueues.delete(deviceId);
+    }
+  });
+}
+
 export async function POST(request: Request) {
+  let deviceId: string | undefined;
+
   try {
     const body = await request.json();
-    const { deviceId, enabled } = body;
+    deviceId = body.deviceId;
+    const { enabled } = body;
 
     if (!deviceId) {
       return NextResponse.json(
@@ -39,25 +65,32 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create controller and toggle port
-    const controller = createPoEController(poeSwitch.type, {
-      ipAddress: poeSwitch.ipAddress,
-      password: poeSwitch.password,
-    });
+    // Queue the toggle to prevent concurrent requests to the same device
+    console.log(`[PoE Queue] Queuing ${enabled ? 'ON' : 'OFF'} for device "${poeDevice.name}"`);
+    await queueToggle(deviceId, async () => {
+      console.log(`[PoE Queue] Executing ${enabled ? 'ON' : 'OFF'} for device "${poeDevice.name}"`);
 
-    await controller.togglePort(poeDevice.portNumber, enabled);
+      // Create controller and toggle port
+      const controller = createPoEController(poeSwitch.type, {
+        ipAddress: poeSwitch.ipAddress,
+        password: poeSwitch.password,
+      });
 
-    // Update device state in Firestore
-    await updatePoEDevice(deviceId, {
-      isEnabled: enabled,
-      lastToggled: new Date(),
-      isOnline: true,
-    });
+      await controller.togglePort(poeDevice.portNumber, enabled);
+      console.log(`[PoE Queue] Completed ${enabled ? 'ON' : 'OFF'} for device "${poeDevice.name}"`);
 
-    // Update switch online status
-    await updatePoESwitch(poeDevice.switchId, {
-      isOnline: true,
-      lastSeen: new Date(),
+      // Update device state in Firestore
+      await updatePoEDevice(deviceId, {
+        isEnabled: enabled,
+        lastToggled: new Date(),
+        isOnline: true,
+      });
+
+      // Update switch online status
+      await updatePoESwitch(poeDevice.switchId, {
+        isOnline: true,
+        lastSeen: new Date(),
+      });
     });
 
     return NextResponse.json({
