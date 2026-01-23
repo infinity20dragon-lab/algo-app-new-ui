@@ -37,7 +37,7 @@ import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage } from "@/lib/firebase/config";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
-import { getDevices, getAudioFiles, addAudioFile, getZones } from "@/lib/firebase/firestore";
+import { getDevices, getAudioFiles, addAudioFile, getZones, getPoEDevices } from "@/lib/firebase/firestore";
 import { useAuth } from "@/contexts/auth-context";
 import type { AudioFile, Zone } from "@/lib/algo/types";
 import { formatDuration } from "@/lib/utils";
@@ -88,6 +88,7 @@ export default function LiveBroadcastPage() {
     setRecordingEnabled,
     devices: contextDevices,
     setDevices: setContextDevices,
+    setPoeDevices,
     emergencyKillAll,
     emergencyEnableAll,
     controlSingleSpeaker,
@@ -133,14 +134,16 @@ export default function LiveBroadcastPage() {
 
   const loadData = async () => {
     try {
-      const [devicesData, audioData, zonesData] = await Promise.all([
+      const [devicesData, audioData, zonesData, poeDevicesData] = await Promise.all([
         getDevices(),
         getAudioFiles(),
         getZones(),
+        getPoEDevices(),
       ]);
       setContextDevices(devicesData);
       setAudioFiles(audioData);
       setZones(zonesData);
+      setPoeDevices(poeDevicesData);
     } catch (error) {
       console.error("Failed to load data:", error);
     } finally {
