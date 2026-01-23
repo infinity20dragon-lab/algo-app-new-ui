@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useState, useRef, useCallback, useEffect } from "react";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
-import type { AlgoDevice } from "@/lib/algo/types";
+import type { AlgoDevice, PoEDevice } from "@/lib/algo/types";
 import { storage } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { useAuth } from "@/contexts/auth-context";
@@ -93,6 +93,10 @@ interface AudioMonitoringContextType {
   // For controlling speakers
   devices: AlgoDevice[];
   setDevices: (devices: AlgoDevice[]) => void;
+
+  // For controlling PoE devices (lights, etc.)
+  poeDevices: PoEDevice[];
+  setPoeDevices: (devices: PoEDevice[]) => void;
 
   // Logging
   logs: AudioLogEntry[];
@@ -228,6 +232,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [audioThreshold, setAudioThresholdState] = useState(5); // 5% default
   const [selectedDevices, setSelectedDevicesState] = useState<string[]>([]);
   const [devices, setDevices] = useState<AlgoDevice[]>([]);
+  const [poeDevices, setPoeDevices] = useState<PoEDevice[]>([]);
   const [audioDetected, setAudioDetected] = useState(false);
   const [speakersEnabled, setSpeakersEnabled] = useState(false);
 
@@ -1135,6 +1140,67 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     await Promise.allSettled(allSpeakerPromises);
   }, [selectedDevices, devices]);
 
+  // PoE Device Controls
+  const controlPoEDevices = useCallback(async (enable: boolean) => {
+    // Get PoE devices in auto mode
+    const autoPoEDevices = poeDevices.filter(d => d.mode === "auto");
+
+    if (autoPoEDevices.length === 0) return;
+
+    // Get active paging devices (8301) from selected devices
+    const activePagingDeviceIds = selectedDevices.filter(deviceId => {
+      const device = devices.find(d => d.id === deviceId);
+      return device && device.type === "8301";
+    });
+
+    // Filter PoE devices:
+    // - Only control devices that are linked to at least one active paging device
+    // - If device has no linkedPagingDeviceIds, DON'T auto-control (user manages it manually or it's always on)
+    const eligiblePoEDevices = autoPoEDevices.filter(poeDevice => {
+      // If no paging devices are linked, DON'T auto-control this device
+      if (!poeDevice.linkedPagingDeviceIds || poeDevice.linkedPagingDeviceIds.length === 0) {
+        return false;
+      }
+
+      // If paging devices are linked, check if any of them are active
+      const hasActivePagingDevice = poeDevice.linkedPagingDeviceIds.some(
+        linkedId => activePagingDeviceIds.includes(linkedId)
+      );
+
+      return hasActivePagingDevice;
+    });
+
+    if (eligiblePoEDevices.length === 0) {
+      debugLog(`[PoE Control] No eligible PoE devices to ${enable ? 'enable' : 'disable'} (no linked paging devices active)`);
+      return;
+    }
+
+    debugLog(`[PoE Control] ${enable ? 'Enabling' : 'Disabling'} ${eligiblePoEDevices.length} PoE devices (${activePagingDeviceIds.length} paging devices active)`);
+
+    const promises = eligiblePoEDevices.map(async (device) => {
+      try {
+        const response = await fetch("/api/poe/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            deviceId: device.id,
+            enabled: enable,
+          }),
+        });
+
+        if (!response.ok) {
+          console.error(`Failed to ${enable ? 'enable' : 'disable'} PoE device ${device.name}: HTTP ${response.status}`);
+        } else {
+          debugLog(`[PoE Control] Successfully ${enable ? 'enabled' : 'disabled'} ${device.name}`);
+        }
+      } catch (error) {
+        console.error(`Failed to control PoE device ${device.name}:`, error);
+      }
+    });
+
+    await Promise.allSettled(promises);
+  }, [poeDevices, selectedDevices, devices]);
+
   // Emergency Controls
   const emergencyKillAll = useCallback(async () => {
     debugLog('[AudioMonitoring] EMERGENCY: Killing all speakers');
@@ -1392,6 +1458,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             // Start recording the audio
             await startRecording();
 
+            // Enable PoE devices (lights, etc.) in auto mode
+            await controlPoEDevices(true);
+
             // NEW FLOW: Enable paging transmitter (mode 1) - INSTANT audio!
             // Speakers are already in mode 2 (listening), so they'll receive immediately
             const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
@@ -1459,6 +1528,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 // Stop recording and upload
                 const recordingUrl = await stopRecordingAndUpload();
 
+                // Disable PoE devices (lights, etc.) in auto mode
+                await controlPoEDevices(false);
+
                 // NEW FLOW: Disable paging transmitter (mode 0) - NO MORE AUDIO!
                 // Speakers stay in mode 2 (listening), ready for next audio
                 const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
@@ -1499,7 +1571,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -1740,6 +1812,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setAudioThreshold,
         devices,
         setDevices,
+        poeDevices,
+        setPoeDevices,
         logs,
         clearLogs,
         exportLogs,

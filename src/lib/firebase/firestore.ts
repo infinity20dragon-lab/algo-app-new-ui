@@ -13,7 +13,7 @@ import {
   type DocumentData,
 } from "firebase/firestore";
 import { db } from "./config";
-import type { AlgoDevice, Zone, AudioFile, DistributionLog, ZoneRouting } from "@/lib/algo/types";
+import type { AlgoDevice, Zone, AudioFile, DistributionLog, ZoneRouting, PoESwitch, PoEDevice } from "@/lib/algo/types";
 
 // ============ Devices ============
 
@@ -195,6 +195,98 @@ export async function addDistributionLog(log: Omit<DistributionLog, "id" | "crea
     createdAt: Timestamp.now(),
   });
   return docRef.id;
+}
+
+// ============ PoE Switches ============
+
+const poeSwitchesCollection = collection(db, "poeSwitches");
+
+export async function getPoESwitches(): Promise<PoESwitch[]> {
+  const q = query(poeSwitchesCollection, orderBy("createdAt", "desc"));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...convertTimestamps(doc.data()),
+  })) as PoESwitch[];
+}
+
+export async function getPoESwitch(id: string): Promise<PoESwitch | null> {
+  const docRef = doc(db, "poeSwitches", id);
+  const snapshot = await getDoc(docRef);
+  if (!snapshot.exists()) return null;
+  return { id: snapshot.id, ...convertTimestamps(snapshot.data()) } as PoESwitch;
+}
+
+export async function addPoESwitch(poeSwitch: Omit<PoESwitch, "id" | "createdAt" | "updatedAt">): Promise<string> {
+  const now = Timestamp.now();
+  const docRef = await addDoc(poeSwitchesCollection, {
+    ...poeSwitch,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return docRef.id;
+}
+
+export async function updatePoESwitch(id: string, data: Partial<PoESwitch>): Promise<void> {
+  const docRef = doc(db, "poeSwitches", id);
+  const cleanData: Record<string, unknown> = { updatedAt: Timestamp.now() };
+  for (const [key, value] of Object.entries(data)) {
+    if (value !== undefined) {
+      cleanData[key] = value;
+    }
+  }
+  await updateDoc(docRef, cleanData);
+}
+
+export async function deletePoESwitch(id: string): Promise<void> {
+  const docRef = doc(db, "poeSwitches", id);
+  await deleteDoc(docRef);
+}
+
+// ============ PoE Devices ============
+
+const poeDevicesCollection = collection(db, "poeDevices");
+
+export async function getPoEDevices(): Promise<PoEDevice[]> {
+  const q = query(poeDevicesCollection, orderBy("createdAt", "desc"));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...convertTimestamps(doc.data()),
+  })) as PoEDevice[];
+}
+
+export async function getPoEDevice(id: string): Promise<PoEDevice | null> {
+  const docRef = doc(db, "poeDevices", id);
+  const snapshot = await getDoc(docRef);
+  if (!snapshot.exists()) return null;
+  return { id: snapshot.id, ...convertTimestamps(snapshot.data()) } as PoEDevice;
+}
+
+export async function addPoEDevice(poeDevice: Omit<PoEDevice, "id" | "createdAt" | "updatedAt">): Promise<string> {
+  const now = Timestamp.now();
+  const docRef = await addDoc(poeDevicesCollection, {
+    ...poeDevice,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return docRef.id;
+}
+
+export async function updatePoEDevice(id: string, data: Partial<PoEDevice>): Promise<void> {
+  const docRef = doc(db, "poeDevices", id);
+  const cleanData: Record<string, unknown> = { updatedAt: Timestamp.now() };
+  for (const [key, value] of Object.entries(data)) {
+    if (value !== undefined) {
+      cleanData[key] = value;
+    }
+  }
+  await updateDoc(docRef, cleanData);
+}
+
+export async function deletePoEDevice(id: string): Promise<void> {
+  const docRef = doc(db, "poeDevices", id);
+  await deleteDoc(docRef);
 }
 
 // ============ Helpers ============

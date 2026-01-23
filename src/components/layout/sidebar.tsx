@@ -14,6 +14,7 @@ import {
   Map,
   Activity,
   Network,
+  Lightbulb,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useState } from "react";
@@ -34,6 +35,7 @@ const navItems: NavItem[] = [
   { title: "Audio Input", href: "/live", icon: Mic, section: "Audio" },
   { title: "Multi-Input Routing", href: "/input-routing", icon: Network, section: "Audio" },
   { title: "Output & Speakers", href: "/devices", icon: Speaker, section: "Audio" },
+  { title: "PoE Devices", href: "/poe-devices", icon: Lightbulb, section: "Audio" },
   { title: "Settings", href: "/settings", icon: Settings, section: "System" },
 ];
 

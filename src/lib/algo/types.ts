@@ -161,3 +161,35 @@ export interface InputChannel {
   isActive: boolean; // Is this channel currently receiving audio
   audioLevel: number; // Current audio level (0-100)
 }
+
+// PoE-Controlled Device Types
+export type PoEDeviceMode = "always_on" | "auto" | "always_off";
+export type PoESwitchType = "netgear_gs308ep" | "other";
+
+export interface PoESwitch {
+  id: string;
+  name: string;
+  type: PoESwitchType;
+  ipAddress: string;
+  password: string;
+  isOnline: boolean;
+  lastSeen: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface PoEDevice {
+  id: string;
+  name: string;
+  switchId: string; // Which PoE switch controls this device
+  portNumber: number; // Physical port number (1-8)
+  mode: PoEDeviceMode; // always_on, auto, always_off
+  zone: string | null; // Zone assignment (like speakers)
+  linkedPagingDeviceIds?: string[]; // IDs of paging devices (8301) that control this PoE device
+  inputAssignment?: InputChannelType | null; // Which input channel triggers this (medical/fire/allCall)
+  isEnabled: boolean; // Current power state
+  isOnline: boolean; // Is the switch reachable
+  lastToggled: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
