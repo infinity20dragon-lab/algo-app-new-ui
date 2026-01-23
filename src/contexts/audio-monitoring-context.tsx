@@ -1142,10 +1142,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // PoE Device Controls
   const controlPoEDevices = useCallback(async (enable: boolean) => {
+    debugLog(`[PoE Control] Total PoE devices: ${poeDevices.length}`);
+
     // Get PoE devices in auto mode
     const autoPoEDevices = poeDevices.filter(d => d.mode === "auto");
 
-    if (autoPoEDevices.length === 0) return;
+    debugLog(`[PoE Control] Auto mode PoE devices: ${autoPoEDevices.length}`);
+
+    if (autoPoEDevices.length === 0) {
+      debugLog('[PoE Control] No PoE devices in auto mode');
+      return;
+    }
 
     // Get active paging devices (8301) from selected devices
     const activePagingDeviceIds = selectedDevices.filter(deviceId => {
@@ -1153,12 +1160,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       return device && device.type === "8301";
     });
 
+    debugLog(`[PoE Control] Selected devices: ${selectedDevices.length}, Active paging devices (8301): ${activePagingDeviceIds.length}`, activePagingDeviceIds);
+
     // Filter PoE devices:
     // - Only control devices that are linked to at least one active paging device
     // - If device has no linkedPagingDeviceIds, DON'T auto-control (user manages it manually or it's always on)
     const eligiblePoEDevices = autoPoEDevices.filter(poeDevice => {
       // If no paging devices are linked, DON'T auto-control this device
       if (!poeDevice.linkedPagingDeviceIds || poeDevice.linkedPagingDeviceIds.length === 0) {
+        debugLog(`[PoE Control] Device "${poeDevice.name}" has no linked paging devices - skipping`);
         return false;
       }
 
@@ -1166,6 +1176,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const hasActivePagingDevice = poeDevice.linkedPagingDeviceIds.some(
         linkedId => activePagingDeviceIds.includes(linkedId)
       );
+
+      if (!hasActivePagingDevice) {
+        debugLog(`[PoE Control] Device "${poeDevice.name}" linked paging devices not active - skipping. Linked: ${poeDevice.linkedPagingDeviceIds.join(',')}, Active: ${activePagingDeviceIds.join(',')}`);
+      } else {
+        debugLog(`[PoE Control] Device "${poeDevice.name}" is eligible (linked paging device is active)`);
+      }
 
       return hasActivePagingDevice;
     });
