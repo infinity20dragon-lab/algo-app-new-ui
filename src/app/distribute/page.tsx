@@ -42,10 +42,13 @@ export default function DistributePage() {
   const [showResults, setShowResults] = useState(false);
 
   const loadData = useCallback(async () => {
+    if (!user) return;
+
     try {
+      const userEmail = user.email || "";
       const [devicesData, audioData] = await Promise.all([
-        getDevices(),
-        getAudioFiles(),
+        getDevices(userEmail),
+        getAudioFiles(userEmail),
       ]);
       setDevices(devicesData);
       setAudioFiles(audioData);
@@ -54,11 +57,13 @@ export default function DistributePage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [user]);
 
   useEffect(() => {
-    loadData();
-  }, [loadData]);
+    if (user) {
+      loadData();
+    }
+  }, [user, loadData]);
 
   const toggleDevice = (deviceId: string) => {
     setSelectedDevices((prev) =>
@@ -158,7 +163,7 @@ export default function DistributePage() {
         audioFileId: selectedAudio,
         audioFileName: audioFile.name,
         targetDevices: selectedDevices,
-        targetZones: [...new Set(devices.filter((d) => selectedDevices.includes(d.id)).map((d) => d.zone).filter(Boolean))],
+        targetZones: [...new Set(devices.filter((d) => selectedDevices.includes(d.id)).map((d) => d.zone).filter((zone): zone is string => zone !== null))],
         triggeredBy: user?.uid || "unknown",
         status: successCount === selectedDevices.length ? "success" : successCount > 0 ? "partial" : "failed",
         results: distributionResults,
@@ -208,7 +213,7 @@ export default function DistributePage() {
 
   // Get unique zones - memoized to prevent recalculation on every render
   const zones = useMemo(() =>
-    [...new Set(devices.map((d) => d.zone).filter(Boolean))],
+    [...new Set(devices.map((d) => d.zone).filter((zone): zone is string => zone !== null))],
     [devices]
   );
 

@@ -625,6 +625,7 @@ export default function LiveBroadcastPage() {
         duration,
         fileSize: recordedBlob.size,
         uploadedBy: user?.uid || "unknown",
+        ownerEmail: user?.email || "unknown",
       });
 
       setRecordedBlob(null);

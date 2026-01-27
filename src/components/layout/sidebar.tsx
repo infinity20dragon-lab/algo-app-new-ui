@@ -15,9 +15,10 @@ import {
   Activity,
   Network,
   Lightbulb,
+  Gamepad2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
 import { useAuth } from "@/contexts/auth-context";
 
@@ -26,9 +27,10 @@ interface NavItem {
   href: string;
   icon: React.ElementType;
   section?: string;
+  adminOnly?: boolean;
 }
 
-const navItems: NavItem[] = [
+const baseNavItems: NavItem[] = [
   { title: "Dashboard", href: "/", icon: LayoutDashboard, section: "Overview" },
   { title: "Station Zones", href: "/zones", icon: Map, section: "Overview" },
   { title: "Call Routing", href: "/distribute", icon: Activity, section: "Overview" },
@@ -36,7 +38,9 @@ const navItems: NavItem[] = [
   { title: "Multi-Input Routing", href: "/input-routing", icon: Network, section: "Audio" },
   { title: "Output & Speakers", href: "/devices", icon: Speaker, section: "Audio" },
   { title: "PoE Devices", href: "/poe-devices", icon: Lightbulb, section: "Audio" },
+  { title: "Activity Log", href: "/activity", icon: Activity, section: "System" },
   { title: "Settings", href: "/settings", icon: Settings, section: "System" },
+  { title: "Control Center", href: "/admin/control", icon: Gamepad2, section: "Admin", adminOnly: true },
 ];
 
 interface SidebarProps {
@@ -48,6 +52,13 @@ export function Sidebar({ onLogout }: SidebarProps) {
   const [isMobileOpen, setIsMobileOpen] = useState(false);
   const { isCapturing, audioDetected, speakersEnabled } = useAudioMonitoring();
   const { user } = useAuth();
+
+  const isAdmin = (user as any)?.role === "admin";
+
+  // Filter nav items based on user role
+  const navItems = useMemo(() => {
+    return baseNavItems.filter(item => !item.adminOnly || isAdmin);
+  }, [isAdmin]);
 
   // Group items by section
   const sections = navItems.reduce((acc, item) => {

@@ -9,6 +9,7 @@ export interface AlgoDevice {
   ipAddress: string;
   authMethod: AlgoAuthMethod;
   apiPassword: string;
+  ownerEmail: string; // User who owns this device
   zone: string | null; // Zone ID this device is assigned to, or null if unassigned
   volume: number; // Default/initial volume
   maxVolume?: number; // Maximum volume this speaker can reach (0-100, default 100)
@@ -106,6 +107,7 @@ export interface Zone {
   name: string;
   color: string;
   deviceIds: string[];
+  ownerEmail: string; // User who owns this zone
   slug?: string;
   defaultVolume?: number;
   createdAt: Date;
@@ -131,6 +133,7 @@ export interface AudioFile {
   duration: number;
   fileSize: number;
   uploadedBy: string;
+  ownerEmail: string; // User who owns this audio file
   createdAt: Date;
 }
 
@@ -172,6 +175,7 @@ export interface PoESwitch {
   type: PoESwitchType;
   ipAddress: string;
   password: string;
+  ownerEmail: string; // User who owns this switch
   isOnline: boolean;
   lastSeen: Date | null;
   createdAt: Date;
@@ -184,6 +188,7 @@ export interface PoEDevice {
   switchId: string; // Which PoE switch controls this device
   portNumber: number; // Physical port number (1-8)
   mode: PoEDeviceMode; // always_on, auto, always_off
+  ownerEmail: string; // User who owns this device
   zone: string | null; // Zone assignment (like speakers)
   linkedPagingDeviceIds?: string[]; // IDs of paging devices (8301) that control this PoE device
   inputAssignment?: InputChannelType | null; // Which input channel triggers this (medical/fire/allCall)

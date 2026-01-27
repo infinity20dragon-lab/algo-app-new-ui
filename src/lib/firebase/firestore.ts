@@ -8,6 +8,7 @@ import {
   updateDoc,
   deleteDoc,
   query,
+  where,
   orderBy,
   Timestamp,
   type DocumentData,
@@ -19,8 +20,14 @@ import type { AlgoDevice, Zone, AudioFile, DistributionLog, ZoneRouting, PoESwit
 
 const devicesCollection = collection(db, "devices");
 
-export async function getDevices(): Promise<AlgoDevice[]> {
-  const q = query(devicesCollection, orderBy("createdAt", "desc"));
+export async function getDevices(ownerEmail?: string): Promise<AlgoDevice[]> {
+  let q = query(devicesCollection, orderBy("createdAt", "desc"));
+
+  // Filter by owner if provided
+  if (ownerEmail) {
+    q = query(devicesCollection, where("ownerEmail", "==", ownerEmail), orderBy("createdAt", "desc"));
+  }
+
   const snapshot = await getDocs(q);
   return snapshot.docs.map((doc) => ({
     id: doc.id,
@@ -66,8 +73,14 @@ export async function deleteDevice(id: string): Promise<void> {
 
 const zonesCollection = collection(db, "zones");
 
-export async function getZones(): Promise<Zone[]> {
-  const q = query(zonesCollection, orderBy("createdAt", "desc"));
+export async function getZones(ownerEmail?: string): Promise<Zone[]> {
+  let q = query(zonesCollection, orderBy("createdAt", "desc"));
+
+  // Filter by owner if provided
+  if (ownerEmail) {
+    q = query(zonesCollection, where("ownerEmail", "==", ownerEmail), orderBy("createdAt", "desc"));
+  }
+
   const snapshot = await getDocs(q);
   return snapshot.docs.map((doc) => ({
     id: doc.id,
@@ -147,8 +160,14 @@ export async function setZoneRouting(zoneId: string, routing: Omit<ZoneRouting, 
 
 const audioFilesCollection = collection(db, "audioFiles");
 
-export async function getAudioFiles(): Promise<AudioFile[]> {
-  const q = query(audioFilesCollection, orderBy("createdAt", "desc"));
+export async function getAudioFiles(ownerEmail?: string): Promise<AudioFile[]> {
+  let q = query(audioFilesCollection, orderBy("createdAt", "desc"));
+
+  // Filter by owner if provided
+  if (ownerEmail) {
+    q = query(audioFilesCollection, where("ownerEmail", "==", ownerEmail), orderBy("createdAt", "desc"));
+  }
+
   const snapshot = await getDocs(q);
   return snapshot.docs.map((doc) => ({
     id: doc.id,
@@ -201,8 +220,14 @@ export async function addDistributionLog(log: Omit<DistributionLog, "id" | "crea
 
 const poeSwitchesCollection = collection(db, "poeSwitches");
 
-export async function getPoESwitches(): Promise<PoESwitch[]> {
-  const q = query(poeSwitchesCollection, orderBy("createdAt", "desc"));
+export async function getPoESwitches(ownerEmail?: string): Promise<PoESwitch[]> {
+  let q = query(poeSwitchesCollection, orderBy("createdAt", "desc"));
+
+  // Filter by owner if provided
+  if (ownerEmail) {
+    q = query(poeSwitchesCollection, where("ownerEmail", "==", ownerEmail), orderBy("createdAt", "desc"));
+  }
+
   const snapshot = await getDocs(q);
   return snapshot.docs.map((doc) => ({
     id: doc.id,
@@ -247,8 +272,14 @@ export async function deletePoESwitch(id: string): Promise<void> {
 
 const poeDevicesCollection = collection(db, "poeDevices");
 
-export async function getPoEDevices(): Promise<PoEDevice[]> {
-  const q = query(poeDevicesCollection, orderBy("createdAt", "desc"));
+export async function getPoEDevices(ownerEmail?: string): Promise<PoEDevice[]> {
+  let q = query(poeDevicesCollection, orderBy("createdAt", "desc"));
+
+  // Filter by owner if provided
+  if (ownerEmail) {
+    q = query(poeDevicesCollection, where("ownerEmail", "==", ownerEmail), orderBy("createdAt", "desc"));
+  }
+
   const snapshot = await getDocs(q);
   return snapshot.docs.map((doc) => ({
     id: doc.id,

@@ -38,5 +38,18 @@ service cloud.firestore {
       // Allow write access to authenticated users (for creating new logs)
       allow read, write: if isAuthenticated();
     }
+
+    // Users collection - CRITICAL for login!
+    match /users/{userId} {
+      // Allow users to read/write their own profile
+      // Allow admins to read all user profiles
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // PoE Devices collection
+    match /poeDevices/{deviceId} {
+      allow read, write: if isAuthenticated();
+    }
   }
 }

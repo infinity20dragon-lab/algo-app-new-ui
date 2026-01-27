@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useAuth } from "@/contexts/auth-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -9,6 +10,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Radio } from "lucide-react";
 
 export function LoginForm() {
+  const router = useRouter();
   const { signIn } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -21,10 +23,15 @@ export function LoginForm() {
     setLoading(true);
 
     try {
+      console.log("[Login] Starting sign in...");
       await signIn(email, password);
-    } catch {
-      setError("Invalid email or password");
-    } finally {
+      console.log("[Login] Sign in successful, redirecting...");
+      // Redirect to dashboard on successful login
+      router.push("/");
+      router.refresh();
+    } catch (err: any) {
+      console.error("Login error:", err);
+      setError(err.message || "Invalid email or password");
       setLoading(false);
     }
   };

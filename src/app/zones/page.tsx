@@ -20,6 +20,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { getDevices, getZones, addZone, updateZone, deleteZone as deleteZoneFromDB, getAllZoneRouting, setZoneRouting, updateDevice } from "@/lib/firebase/firestore";
+import { useAuth } from "@/contexts/auth-context";
 import type { AlgoDevice, Zone, ZoneRouting } from "@/lib/algo/types";
 import { ZoneModal } from "@/components/zones/zone-modal";
 import { AssignDeviceModal } from "@/components/zones/assign-device-modal";
@@ -27,6 +28,7 @@ import { AssignDeviceModal } from "@/components/zones/assign-device-modal";
 export default function ZonesPage() {
   const [devices, setDevices] = useState<AlgoDevice[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
+  const { user } = useAuth();
   const [zoneRouting, setZoneRoutingState] = useState<Record<string, ZoneRouting>>({});
   const [selectedZone, setSelectedZone] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -105,6 +107,7 @@ export default function ZonesPage() {
           name: data.zone.name,
           color: data.zone.color,
           deviceIds: [],
+          ownerEmail: user?.email || "unknown",
         });
       }
 
@@ -209,7 +212,6 @@ export default function ZonesPage() {
       };
 
       await setZoneRouting(selectedZone, {
-        zoneId: selectedZone,
         ...currentRouting,
         [type]: value,
       });
@@ -297,7 +299,7 @@ export default function ZonesPage() {
                 {/* Interactive Floor Plan */}
                 <div className="grid grid-cols-3 gap-3 aspect-[16/9]">
                   {zones.map((zone, index) => {
-                    const zoneRouting = zoneRouting[zone.id];
+                    const routing = zoneRouting[zone.id];
                     return (
                       <button
                         key={zone.id}
@@ -512,6 +514,7 @@ export default function ZonesPage() {
             : { fire: true, medical: true, allCall: true }
         }
         onSave={handleSaveZone}
+        ownerEmail={user?.email || "unknown"}
         onDelete={editingZone ? handleDeleteZone : undefined}
       />
 

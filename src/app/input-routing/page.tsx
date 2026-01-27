@@ -11,11 +11,12 @@ import { Select } from "@/components/ui/select";
 import { Label } from "@/components/ui/label";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
 import { useAuth } from "@/contexts/auth-context";
+import { useRealtimeSync } from "@/contexts/realtime-sync-context";
 import { updateDevice } from "@/lib/firebase/firestore";
 import { storage } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import type { AlgoDevice, InputChannelType } from "@/lib/algo/types";
-import { Play, Square, Radio, Mic, Volume2, AlertCircle, CheckCircle2, Film } from "lucide-react";
+import { Play, Square, Radio, Mic, Volume2, AlertCircle, CheckCircle2, Film, AlertTriangle } from "lucide-react";
 import { getAlwaysKeepPagingOn } from "@/lib/settings";
 
 interface InputChannel {
@@ -31,8 +32,9 @@ interface InputChannel {
 }
 
 export default function InputRoutingPage() {
-  const { devices, isCapturing, globalVolume, useGlobalVolume } = useAudioMonitoring();
+  const { devices, isCapturing, volume, useGlobalVolume } = useAudioMonitoring();
   const { user } = useAuth();
+  const { sessionState, syncSessionState } = useRealtimeSync();
 
   // Multi-input channels state
   const [channels, setChannels] = useState<InputChannel[]>([
@@ -64,8 +66,8 @@ export default function InputRoutingPage() {
   const [audioInputDevices, setAudioInputDevices] = useState<MediaDeviceInfo[]>([]);
 
   // Animation frame for monitoring
-  const animationFrameRef = useRef<number>();
-  const audioContextRef = useRef<AudioContext>();
+  const animationFrameRef = useRef<number | undefined>(undefined);
+  const audioContextRef = useRef<AudioContext | undefined>(undefined);
 
   // Recording refs (per channel)
   const mediaRecordersRef = useRef<Map<InputChannelType, MediaRecorder>>(new Map());
@@ -85,6 +87,13 @@ export default function InputRoutingPage() {
     }
     loadAudioDevices();
   }, []);
+
+  // Sync multi-input monitoring state to Firebase
+  useEffect(() => {
+    syncSessionState({
+      multiInputMonitoring: isMonitoring,
+    });
+  }, [isMonitoring, syncSessionState]);
 
   // Add log entry
   const addLog = useCallback((entry: {
@@ -351,7 +360,7 @@ export default function InputRoutingPage() {
     });
 
     // Ramp volume
-    const targetVolume = useGlobalVolume ? globalVolume : null;
+    const targetVolume = useGlobalVolume ? volume : null;
     for (const speaker of speakers) {
       const vol = targetVolume !== null ? targetVolume : (speaker.maxVolume || 100);
       await fetch("/api/algo/speakers/volume", {
@@ -369,7 +378,7 @@ export default function InputRoutingPage() {
     }
 
     console.log(`[InputRouting] ✅ Activated ${speakers.length} speakers for ${channelType}`);
-  }, [devices, getSpeakersForInput, useGlobalVolume, globalVolume, addLog]);
+  }, [devices, getSpeakersForInput, useGlobalVolume, volume, addLog]);
 
   // Deactivate speakers for a specific channel
   const deactivateSpeakersForChannel = useCallback(async (channelType: InputChannelType) => {
@@ -672,6 +681,20 @@ export default function InputRoutingPage() {
   return (
     <AppLayout>
       <div className="p-6 space-y-6">
+        {/* Warning if audio input is active */}
+        {sessionState?.audioInputMonitoring && (
+          <Card className="border-orange-500 bg-orange-50 dark:bg-orange-950">
+            <CardContent className="pt-6">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="h-5 w-5 text-orange-600" />
+                <span className="text-orange-700 dark:text-orange-300 font-semibold">
+                  Audio Input monitoring is currently active. Multi-Input Routing is disabled.
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold">Multi-Input Routing</h1>
@@ -687,7 +710,20 @@ export default function InputRoutingPage() {
               Stop Monitoring
             </Button>
           ) : (
-            <Button onClick={startMonitoring} variant="default" size="lg">
+            <Button
+              onClick={() => {
+                // Check if audio input monitoring is active
+                if (sessionState?.audioInputMonitoring) {
+                  alert('Cannot start multi-input monitoring: Audio Input monitoring is currently active. Please stop audio input monitoring first.');
+                  return;
+                }
+                startMonitoring();
+              }}
+              variant="default"
+              size="lg"
+              disabled={sessionState?.audioInputMonitoring}
+              title={sessionState?.audioInputMonitoring ? 'Audio Input monitoring is active' : ''}
+            >
               <Play className="mr-2 h-4 w-4" />
               Start Monitoring
             </Button>

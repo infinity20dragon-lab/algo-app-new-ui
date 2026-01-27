@@ -8,9 +8,16 @@ import {
   type User,
 } from "firebase/auth";
 import { auth } from "@/lib/firebase/config";
+import { ensureUserProfile, type UserProfile } from "@/lib/firebase/users";
+
+// Extended user with role
+export interface AuthUser extends User {
+  role?: "user" | "admin";
+  displayName: string | null;
+}
 
 interface AuthContextType {
-  user: User | null;
+  user: AuthUser | null;
   loading: boolean;
   signIn: (email: string, password: string) => Promise<void>;
   signOut: () => Promise<void>;
@@ -19,13 +26,44 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setUser(user);
-      setLoading(false);
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        console.log("[Auth] User authenticated, setting user immediately");
+
+        // Set user immediately with defaults (fast!)
+        const extendedUser: AuthUser = {
+          ...firebaseUser,
+          role: "user", // Default role
+          displayName: firebaseUser.email?.split("@")[0] || "User",
+        };
+
+        setUser(extendedUser);
+        setLoading(false);
+
+        // Try to load profile in background (won't block UI)
+        try {
+          console.log("[Auth] Loading user profile in background...");
+          const profile = await ensureUserProfile(firebaseUser.uid, firebaseUser.email || "");
+
+          console.log("[Auth] Profile loaded, updating user");
+          // Update with profile data
+          setUser({
+            ...firebaseUser,
+            role: profile.role,
+            displayName: profile.displayName,
+          });
+        } catch (error) {
+          console.error("[Auth] Background profile load failed (using defaults):", error);
+          // Keep the default user we already set
+        }
+      } else {
+        setUser(null);
+        setLoading(false);
+      }
     });
 
     return () => unsubscribe();

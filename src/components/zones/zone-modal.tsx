@@ -27,6 +27,7 @@ interface ZoneModalProps {
     routing: { fire: boolean; medical: boolean; allCall: boolean };
   }) => Promise<void>;
   onDelete?: () => Promise<void>;
+  ownerEmail: string;
 }
 
 const colorOptions = [
@@ -48,6 +49,7 @@ export function ZoneModal({
   routing = { fire: true, medical: true, allCall: true },
   onSave,
   onDelete,
+  ownerEmail,
 }: ZoneModalProps) {
   const [name, setName] = useState("");
   const [color, setColor] = useState(colorOptions[0].value);
@@ -97,6 +99,7 @@ export function ZoneModal({
           name: name.trim(),
           color,
           deviceIds: zone?.deviceIds || [],
+          ownerEmail,
         },
         routing: { fire, medical, allCall },
       });

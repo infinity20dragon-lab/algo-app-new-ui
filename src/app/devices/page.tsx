@@ -13,8 +13,10 @@ import { Plus, Pencil, Trash2, Play, RefreshCw, X, Volume2, Link2, Search, Activ
 import { getDevices, addDevice, updateDevice, deleteDevice } from "@/lib/firebase/firestore";
 import type { AlgoDevice, AlgoDeviceType, AlgoAuthMethod } from "@/lib/algo/types";
 import { formatDate, isValidIpAddress } from "@/lib/utils";
+import { useAuth } from "@/contexts/auth-context";
 
 export default function DevicesPage() {
+  const { user } = useAuth();
   const [devices, setDevices] = useState<AlgoDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
@@ -42,8 +44,10 @@ export default function DevicesPage() {
   const [networkRange, setNetworkRange] = useState("");
 
   useEffect(() => {
-    loadDevices();
-  }, []);
+    if (user?.email) {
+      loadDevices();
+    }
+  }, [user?.email]); // Only re-run if email changes (more stable)
 
   // Periodic health check every 60 seconds
   useEffect(() => {
@@ -61,8 +65,11 @@ export default function DevicesPage() {
   }, [devices.length]);
 
   const loadDevices = async () => {
+    if (!user) return;
+
     try {
-      const data = await getDevices();
+      const userEmail = user.email || "";
+      const data = await getDevices(userEmail);
       setDevices(data);
     } catch (error) {
       console.error("Failed to load devices:", error);
@@ -99,7 +106,7 @@ export default function DevicesPage() {
       ipAddress: device.ipAddress,
       authMethod: device.authMethod,
       apiPassword: device.apiPassword,
-      zone: device.zone,
+      zone: device.zone || "",
       volume: device.volume,
       maxVolume: device.maxVolume ?? 100, // Default to 100 if not set
       linkedSpeakerIds: device.linkedSpeakerIds || [],
@@ -128,6 +135,7 @@ export default function DevicesPage() {
       } else {
         await addDevice({
           ...formData,
+          ownerEmail: user?.email || "",
           isOnline: false,
           lastSeen: null,
         });
@@ -260,6 +268,7 @@ export default function DevicesPage() {
           ipAddress: discovered.ipAddress,
           authMethod: "basic",
           apiPassword: "algo",
+          ownerEmail: user?.email || "",
           zone: "",
           volume: 50,
           linkedSpeakerIds: [],

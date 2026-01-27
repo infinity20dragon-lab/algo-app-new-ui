@@ -67,6 +67,10 @@ export async function POST(request: Request) {
 
     // Queue the toggle to prevent concurrent requests to the same device
     console.log(`[PoE Queue] Queuing ${enabled ? 'ON' : 'OFF'} for device "${poeDevice.name}"`);
+
+    // Capture deviceId in a const for use in the callback
+    const capturedDeviceId = deviceId;
+
     await queueToggle(deviceId, async () => {
       console.log(`[PoE Queue] Executing ${enabled ? 'ON' : 'OFF'} for device "${poeDevice.name}"`);
 
@@ -80,7 +84,7 @@ export async function POST(request: Request) {
       console.log(`[PoE Queue] Completed ${enabled ? 'ON' : 'OFF'} for device "${poeDevice.name}"`);
 
       // Update device state in Firestore
-      await updatePoEDevice(deviceId, {
+      await updatePoEDevice(capturedDeviceId, {
         isEnabled: enabled,
         lastToggled: new Date(),
         isOnline: true,
@@ -105,7 +109,7 @@ export async function POST(request: Request) {
 
     // Mark switch as offline if it's a timeout/connection error
     const errorMessage = error instanceof Error ? error.message : "Failed to toggle PoE device";
-    if (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT") || errorMessage.includes("ECONNREFUSED")) {
+    if (deviceId && (errorMessage.includes("timeout") || errorMessage.includes("ETIMEDOUT") || errorMessage.includes("ECONNREFUSED"))) {
       try {
         const poeDevice = await getPoEDevice(deviceId);
         if (poeDevice) {

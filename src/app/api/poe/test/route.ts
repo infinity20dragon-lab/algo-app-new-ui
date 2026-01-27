@@ -2,9 +2,12 @@ import { NextResponse } from "next/server";
 import { createPoEController } from "@/lib/poe/controller";
 
 export async function POST(request: Request) {
+  let switchId: string | undefined;
+
   try {
     const body = await request.json();
-    const { ipAddress, password, type = "netgear_gs308ep", switchId } = body;
+    const { ipAddress, password, type = "netgear_gs308ep", switchId: extractedSwitchId } = body;
+    switchId = extractedSwitchId;
 
     if (!ipAddress) {
       return NextResponse.json(
@@ -28,12 +31,12 @@ export async function POST(request: Request) {
 
     const isOnline = await controller.testConnection();
 
-    // Update switch status if switchId provided
-    if (switchId && isOnline) {
+    // Update switch status if switchId provided (both online and offline)
+    if (switchId) {
       const { updatePoESwitch } = await import("@/lib/firebase/firestore");
       await updatePoESwitch(switchId, {
-        isOnline: true,
-        lastSeen: new Date(),
+        isOnline: isOnline,
+        lastSeen: isOnline ? new Date() : null,
       });
     }
 
@@ -46,6 +49,20 @@ export async function POST(request: Request) {
 
   } catch (error) {
     console.error("PoE test error:", error);
+
+    // Mark switch as offline if test failed
+    if (switchId) {
+      try {
+        const { updatePoESwitch } = await import("@/lib/firebase/firestore");
+        await updatePoESwitch(switchId, {
+          isOnline: false,
+          lastSeen: null,
+        });
+      } catch (updateError) {
+        console.error("Failed to update switch offline status:", updateError);
+      }
+    }
+
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Failed to test PoE switch" },
       { status: 500 }

@@ -3,8 +3,9 @@
 import { createContext, useContext, useState, useRef, useCallback, useEffect } from "react";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
 import type { AlgoDevice, PoEDevice } from "@/lib/algo/types";
-import { storage } from "@/lib/firebase/config";
+import { storage, realtimeDb } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
+import { ref as dbRef, set, push } from "firebase/database";
 import { useAuth } from "@/contexts/auth-context";
 import { getIdleVolumeString, getAlwaysKeepPagingOn } from "@/lib/settings";
 
@@ -17,6 +18,38 @@ const debugLog = (...args: any[]) => {
   if (DEBUG_MODE) {
     console.log(...args);
   }
+};
+
+// Helper function to get current time in PST (Pacific Standard Time)
+// Returns both ISO string and formatted date for organizing logs
+const getPSTTime = () => {
+  const now = new Date();
+
+  // Get time in PST using Intl.DateTimeFormat
+  const pstFormatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+
+  const parts = pstFormatter.formatToParts(now);
+  const partsObj: any = {};
+  parts.forEach(part => {
+    partsObj[part.type] = part.value;
+  });
+
+  // Create ISO-like timestamp in PST
+  const timestamp = `${partsObj.year}-${partsObj.month}-${partsObj.day}T${partsObj.hour}:${partsObj.minute}:${partsObj.second}-08:00`;
+
+  // Format date as YYYY-MM-DD for organizing logs by day
+  const dateKey = `${partsObj.year}-${partsObj.month}-${partsObj.day}`;
+
+  return { timestamp, dateKey };
 };
 
 // Web Worker for MP3 encoding
@@ -287,16 +320,26 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // Helper to add log entry
   const addLog = useCallback((entry: Omit<AudioLogEntry, "timestamp">) => {
-    // Always log to console for debugging
+    // Get PST timestamp
+    const { timestamp, dateKey } = getPSTTime();
+
+    const userEmail = user?.email || 'Unknown';
+    const isAdmin = (user as any)?.role === 'admin';
+
     const logEntry: AudioLogEntry = {
       ...entry,
-      timestamp: new Date().toISOString(),
+      timestamp,
+      // Add user email prefix to message for attribution
+      message: `[${userEmail}] ${entry.message}`,
     };
+
+    // Always log to console for debugging
     debugLog(`[AudioLog] ${logEntry.message}`, logEntry);
 
-    // Only add to UI logs if logging is enabled
-    if (!loggingEnabled) return;
+    // Only add to logs if logging is enabled AND user is NOT admin
+    if (!loggingEnabled || isAdmin) return;
 
+    // Add to local state for backward compatibility
     setLogs(prev => {
       const newLogs = [...prev, logEntry];
       // Keep only last 500 entries to prevent memory issues
@@ -305,7 +348,28 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
       return newLogs;
     });
-  }, [loggingEnabled]);
+
+    // Write to Firebase Realtime Database (only for non-admin users)
+    if (user && !isAdmin) {
+      const logRef = dbRef(realtimeDb, `logs/${user.uid}/${dateKey}`);
+      const newLogRef = push(logRef);
+
+      set(newLogRef, {
+        timestamp,
+        type: logEntry.type,
+        message: logEntry.message, // Already has [email] prefix
+        userId: user.uid,
+        userEmail: userEmail,
+        audioLevel: logEntry.audioLevel ?? null,
+        audioThreshold: logEntry.audioThreshold ?? null,
+        speakersEnabled: logEntry.speakersEnabled ?? null,
+        volume: logEntry.volume ?? null,
+        recordingUrl: logEntry.recordingUrl ?? null,
+      }).catch(error => {
+        console.error('[AudioLog] Failed to write log to Firebase:', error);
+      });
+    }
+  }, [loggingEnabled, user]);
 
   // Get best supported audio mimeType
   const getBestAudioMimeType = useCallback(() => {
@@ -507,10 +571,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         wasMonitoring,
       });
 
-      if (savedDevices) {
-        const deviceIds = JSON.parse(savedDevices);
-        debugLog('[AudioMonitoring] Restoring selected devices:', deviceIds);
-        setSelectedDevicesState(deviceIds);
+      if (savedDevices && savedDevices !== 'undefined') {
+        try {
+          const deviceIds = JSON.parse(savedDevices);
+          debugLog('[AudioMonitoring] Restoring selected devices:', deviceIds);
+          setSelectedDevicesState(deviceIds);
+        } catch (error) {
+          console.error('[AudioMonitoring] Failed to parse saved devices:', error);
+          setSelectedDevicesState([]);
+        }
       }
       if (savedInput) {
         debugLog('[AudioMonitoring] Restoring input device:', savedInput);
@@ -712,7 +781,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const setDevicesVolume = useCallback(async (volumePercent: number) => {
     const linkedSpeakerIds = new Set<string>();
 
-    for (const deviceId of selectedDevices) {
+    // Safety check: ensure selectedDevices is iterable
+    const safeSelectedDevices = selectedDevices || [];
+
+    for (const deviceId of safeSelectedDevices) {
       const device = devices.find(d => d.id === deviceId);
       if (!device) continue;
 
@@ -1193,6 +1265,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
     debugLog(`[PoE Control] ${enable ? 'Enabling' : 'Disabling'} ${eligiblePoEDevices.length} PoE devices (${activePagingDeviceIds.length} paging devices active)`);
 
+    // Log PoE control action
+    addLog({
+      type: enable ? "speakers_enabled" : "speakers_disabled",
+      message: `PoE: ${enable ? 'ON' : 'OFF'} - ${eligiblePoEDevices.map(d => d.name).join(', ')}`,
+    });
+
     const promises = eligiblePoEDevices.map(async (device) => {
       try {
         const response = await fetch("/api/poe/toggle", {
@@ -1206,16 +1284,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
         if (!response.ok) {
           console.error(`Failed to ${enable ? 'enable' : 'disable'} PoE device ${device.name}: HTTP ${response.status}`);
+          addLog({
+            type: enable ? "speakers_enabled" : "speakers_disabled",
+            message: `⚠️ PoE ${device.name} failed: HTTP ${response.status}`,
+          });
         } else {
           debugLog(`[PoE Control] Successfully ${enable ? 'enabled' : 'disabled'} ${device.name}`);
         }
       } catch (error) {
         console.error(`Failed to control PoE device ${device.name}:`, error);
+        addLog({
+          type: enable ? "speakers_enabled" : "speakers_disabled",
+          message: `⚠️ PoE ${device.name} error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        });
       }
     });
 
     await Promise.allSettled(promises);
-  }, [poeDevices, selectedDevices, devices]);
+  }, [poeDevices, selectedDevices, devices, addLog]);
 
   // Emergency Controls
   const emergencyKillAll = useCallback(async () => {
@@ -1320,8 +1406,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const checkSpeakerConnectivity = useCallback(async () => {
     const linkedSpeakerIds = new Set<string>();
 
+    // Safety check: ensure selectedDevices is iterable
+    const safeSelectedDevices = selectedDevices || [];
+
     // Get all linked speakers from selected paging devices
-    for (const deviceId of selectedDevices) {
+    for (const deviceId of safeSelectedDevices) {
       const device = devices.find(d => d.id === deviceId);
       if (!device) continue;
       if (device.type === "8301" && device.linkedSpeakerIds) {

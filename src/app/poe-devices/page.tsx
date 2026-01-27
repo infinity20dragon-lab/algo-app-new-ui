@@ -13,8 +13,10 @@ import { getPoESwitches, getPoEDevices, addPoESwitch, updatePoESwitch, deletePoE
 import type { PoESwitch, PoEDevice, PoEDeviceMode, PoESwitchType, AlgoDevice } from "@/lib/algo/types";
 import { formatDate, isValidIpAddress } from "@/lib/utils";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
+import { useAuth } from "@/contexts/auth-context";
 
 export default function PoEDevicesPage() {
+  const { user } = useAuth();
   const { setPoeDevices } = useAudioMonitoring();
   const [switches, setSwitches] = useState<PoESwitch[]>([]);
   const [devices, setDevices] = useState<PoEDevice[]>([]);
@@ -47,8 +49,10 @@ export default function PoEDevicesPage() {
   const [syncingSwitch, setSyncingSwitch] = useState<string | null>(null);
 
   useEffect(() => {
-    loadData();
-  }, []);
+    if (user?.email) {
+      loadData();
+    }
+  }, [user?.email]); // Only re-run if email changes (more stable)
 
   // Update audio monitoring context when devices change
   useEffect(() => {
@@ -56,11 +60,14 @@ export default function PoEDevicesPage() {
   }, [devices, setPoeDevices]);
 
   const loadData = async () => {
+    if (!user) return;
+
     try {
+      const userEmail = user.email || "";
       const [switchesData, devicesData, algoDevicesData] = await Promise.all([
-        getPoESwitches(),
-        getPoEDevices(),
-        getDevices(),
+        getPoESwitches(userEmail),
+        getPoEDevices(userEmail),
+        getDevices(userEmail),
       ]);
       setSwitches(switchesData);
       setDevices(devicesData);
@@ -154,6 +161,7 @@ export default function PoEDevicesPage() {
       } else {
         await addPoESwitch({
           ...switchFormData,
+          ownerEmail: user?.email || "",
           isOnline: false,
           lastSeen: null,
         });
@@ -193,6 +201,7 @@ export default function PoEDevicesPage() {
       } else {
         await addPoEDevice({
           ...deviceFormData,
+          ownerEmail: user?.email || "",
           zone: deviceFormData.zone || null,
           isEnabled: false,
           isOnline: false,

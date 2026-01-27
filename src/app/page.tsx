@@ -21,24 +21,32 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
-import { getDevices, getAudioFiles } from "@/lib/firebase/firestore";
-import type { AlgoDevice, AudioFile } from "@/lib/algo/types";
+import { useAuth } from "@/contexts/auth-context";
+import { getDevices, getAudioFiles, getZones } from "@/lib/firebase/firestore";
+import type { AlgoDevice, AudioFile, Zone } from "@/lib/algo/types";
 
 export default function DashboardPage() {
+  const { user } = useAuth();
   const { isCapturing, speakersEnabled, audioDetected, logs } = useAudioMonitoring();
   const [devices, setDevices] = useState<AlgoDevice[]>([]);
   const [audioFiles, setAudioFiles] = useState<AudioFile[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!user?.email) return;
+
     const loadData = async () => {
       try {
-        const [devicesData, audioData] = await Promise.all([
-          getDevices(),
-          getAudioFiles(),
+        const userEmail = user.email || "";
+        const [devicesData, audioData, zonesData] = await Promise.all([
+          getDevices(userEmail),
+          getAudioFiles(userEmail),
+          getZones(userEmail),
         ]);
         setDevices(devicesData);
         setAudioFiles(audioData);
+        setZones(zonesData);
       } catch (error) {
         console.error("Failed to load data:", error);
       } finally {
@@ -46,7 +54,7 @@ export default function DashboardPage() {
       }
     };
     loadData();
-  }, []);
+  }, [user?.email]); // Only re-run if email changes (more stable)
 
   // Get recent logs (last 5)
   const recentLogs = logs.slice(-5).reverse();
@@ -118,7 +126,9 @@ export default function DashboardPage() {
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm text-[var(--text-muted)]">Active Zones</p>
-                  <p className="text-3xl font-bold text-[var(--text-primary)] mt-1">5</p>
+                  <p className="text-3xl font-bold text-[var(--text-primary)] mt-1">
+                    {loading ? "-" : zones.length}
+                  </p>
                   <p className="text-xs text-[var(--text-muted)] mt-1">Configured</p>
                 </div>
                 <div className="p-3 rounded-xl bg-[var(--accent-purple)]/15">
@@ -225,28 +235,49 @@ export default function DashboardPage() {
             </CardHeader>
             <CardContent>
               {/* Simplified Floor Plan */}
-              <div className="grid grid-cols-3 gap-3 aspect-[2/1]">
-                <div className="rounded-xl p-4 flex flex-col items-center justify-center text-center" style={{ backgroundColor: 'rgba(99, 102, 241, 0.2)', border: '1px solid rgba(99, 102, 241, 0.4)' }}>
-                  <span className="text-xs font-semibold text-[var(--zone-dorm)]">DORM</span>
-                  <span className="text-[10px] text-[var(--text-muted)] mt-1">2 speakers</span>
+              {zones.length === 0 ? (
+                <div className="flex flex-col items-center justify-center py-8 text-center">
+                  <Map className="h-8 w-8 text-[var(--text-muted)] mb-3" />
+                  <p className="text-[var(--text-muted)]">No zones configured</p>
+                  <p className="text-sm text-[var(--text-muted)]">
+                    <Link href="/zones" className="text-[var(--accent-blue)] hover:underline">
+                      Create zones
+                    </Link>
+                    {" "}to organize your devices
+                  </p>
                 </div>
-                <div className="rounded-xl p-4 flex flex-col items-center justify-center text-center" style={{ backgroundColor: 'rgba(34, 197, 94, 0.2)', border: '1px solid rgba(34, 197, 94, 0.4)' }}>
-                  <span className="text-xs font-semibold text-[var(--zone-common)]">COMMON</span>
-                  <span className="text-[10px] text-[var(--text-muted)] mt-1">3 speakers</span>
+              ) : (
+                <div className="grid grid-cols-3 gap-3 min-h-[200px]">
+                  {zones.slice(0, 6).map((zone) => {
+                    const devicesInZone = devices.filter(d => d.zone === zone.id);
+                    // Convert hex color to rgba with opacity
+                    const hexToRgba = (hex: string, opacity: number) => {
+                      const r = parseInt(hex.slice(1, 3), 16);
+                      const g = parseInt(hex.slice(3, 5), 16);
+                      const b = parseInt(hex.slice(5, 7), 16);
+                      return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+                    };
+
+                    return (
+                      <div
+                        key={zone.id}
+                        className="rounded-xl p-4 flex flex-col items-center justify-center text-center"
+                        style={{
+                          backgroundColor: hexToRgba(zone.color, 0.2),
+                          border: `1px solid ${hexToRgba(zone.color, 0.4)}`,
+                        }}
+                      >
+                        <span className="text-xs font-semibold" style={{ color: zone.color }}>
+                          {zone.name.toUpperCase()}
+                        </span>
+                        <span className="text-[10px] text-[var(--text-muted)] mt-1">
+                          {devicesInZone.length} speaker{devicesInZone.length !== 1 ? 's' : ''}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
-                <div className="rounded-xl p-4 flex flex-col items-center justify-center text-center row-span-2" style={{ backgroundColor: 'rgba(245, 158, 11, 0.2)', border: '1px solid rgba(245, 158, 11, 0.4)' }}>
-                  <span className="text-xs font-semibold text-[var(--zone-apparatus)]">APPARATUS</span>
-                  <span className="text-[10px] text-[var(--text-muted)] mt-1">4 speakers</span>
-                </div>
-                <div className="rounded-xl p-4 flex flex-col items-center justify-center text-center" style={{ backgroundColor: 'rgba(236, 72, 153, 0.2)', border: '1px solid rgba(236, 72, 153, 0.4)' }}>
-                  <span className="text-xs font-semibold text-[var(--zone-office)]">OFFICE</span>
-                  <span className="text-[10px] text-[var(--text-muted)] mt-1">1 speaker</span>
-                </div>
-                <div className="rounded-xl p-4 flex flex-col items-center justify-center text-center" style={{ backgroundColor: 'rgba(20, 184, 166, 0.2)', border: '1px solid rgba(20, 184, 166, 0.4)' }}>
-                  <span className="text-xs font-semibold text-[var(--zone-kitchen)]">KITCHEN</span>
-                  <span className="text-[10px] text-[var(--text-muted)] mt-1">1 speaker</span>
-                </div>
-              </div>
+              )}
             </CardContent>
           </Card>
         </div>

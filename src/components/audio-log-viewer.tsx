@@ -1,6 +1,7 @@
 "use client";
 
 import { useAudioMonitoring, type AudioLogEntry } from "@/contexts/audio-monitoring-context";
+import { useRealtimeSync } from "@/contexts/realtime-sync-context";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -9,6 +10,7 @@ import { useState } from "react";
 
 export function AudioLogViewer() {
   const { logs, clearLogs, exportLogs, loggingEnabled, recordingEnabled } = useAudioMonitoring();
+  const { viewingAsUserId } = useRealtimeSync();
   const [copied, setCopied] = useState(false);
 
   const handleExport = () => {
@@ -118,6 +120,14 @@ export function AudioLogViewer() {
         </div>
       </CardHeader>
       <CardContent>
+        {viewingAsUserId && (
+          <div className="mb-4 p-3 rounded-lg bg-[var(--accent-blue)]/10 border border-[var(--accent-blue)]/30">
+            <p className="text-sm text-[var(--accent-blue)]">
+              📝 Note: Logs are local to each instance. You're viewing your own admin logs, not the user's logs.
+              Activity logs are generated on the device where monitoring occurs.
+            </p>
+          </div>
+        )}
         {logs.length === 0 ? (
           <div className="py-12 text-center">
             <Activity className="mx-auto h-8 w-8 text-[var(--text-muted)] mb-3" />
