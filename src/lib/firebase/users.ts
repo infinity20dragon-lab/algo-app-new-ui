@@ -62,8 +62,20 @@ export async function ensureUserProfile(
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       console.log(`[Firebase] Attempt ${attempt}/${retries} to ensure user profile for:`, uid);
+      console.log('[Firebase] Firestore instance check:', {
+        type: db.type,
+        projectId: db.app.options.projectId,
+      });
+
       const docRef = doc(db, "users", uid);
+      console.log('[Firebase] Document reference created:', {
+        path: docRef.path,
+        id: docRef.id,
+      });
+
+      console.log('[Firebase] Starting getDoc call...');
       const snapshot = await getDoc(docRef);
+      console.log('[Firebase] getDoc call completed successfully');
 
       if (snapshot.exists()) {
         console.log('[Firebase] User profile found, updating last login');
@@ -103,10 +115,21 @@ export async function ensureUserProfile(
         return newProfile;
       }
     } catch (error: any) {
-      console.error(`[Firebase] Attempt ${attempt} failed:`, {
+      console.error(`[Firebase] Attempt ${attempt} failed with detailed error:`, {
         code: error.code,
         message: error.message,
+        name: error.name,
+        stack: error.stack?.split('\n').slice(0, 3).join('\n'),
+        errorType: typeof error,
+        fullError: JSON.stringify(error, Object.getOwnPropertyNames(error)),
       });
+
+      // Check if we're online
+      if (typeof navigator !== 'undefined') {
+        console.log('[Firebase] Network status:', {
+          online: navigator.onLine,
+        });
+      }
 
       if (attempt === retries) {
         console.error('[Firebase] All retry attempts exhausted, throwing error');
