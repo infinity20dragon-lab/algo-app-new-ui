@@ -85,7 +85,6 @@ if (typeof window !== 'undefined') {
     type: db.type,
     appName: db.app.name,
     projectId: db.app.options.projectId,
-    databaseId: db._databaseId?.database || '(default)',
   });
 
   console.log('[Firebase App] Initialization details:', {
