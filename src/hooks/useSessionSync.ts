@@ -34,6 +34,7 @@ export function useSessionSync() {
     recordingEnabled,
     playbackEnabled,
     playbackDelay,
+    playbackDisableDelay,
     audioLevel,
     audioDetected,
     speakersEnabled,
@@ -57,6 +58,7 @@ export function useSessionSync() {
     setRecordingEnabled,
     setPlaybackEnabled,
     setPlaybackDelay,
+    setPlaybackDisableDelay,
   } = useAudioMonitoring();
 
   const isApplyingRemoteUpdate = useRef(false);
@@ -92,6 +94,7 @@ export function useSessionSync() {
     if (recordingEnabled !== undefined) stateToSync.recordingEnabled = recordingEnabled;
     if (playbackEnabled !== undefined) stateToSync.playbackEnabled = playbackEnabled;
     if (playbackDelay !== undefined) stateToSync.playbackDelay = playbackDelay;
+    if (playbackDisableDelay !== undefined) stateToSync.playbackDisableDelay = playbackDisableDelay;
     if (audioLevel !== undefined) stateToSync.audioLevel = audioLevel;
     if (audioDetected !== undefined) stateToSync.audioDetected = audioDetected;
     if (speakersEnabled !== undefined) stateToSync.speakersEnabled = speakersEnabled;
@@ -117,6 +120,7 @@ export function useSessionSync() {
     recordingEnabled,
     playbackEnabled,
     playbackDelay,
+    playbackDisableDelay,
     audioLevel,
     audioDetected,
     speakersEnabled,
@@ -231,6 +235,10 @@ export function useSessionSync() {
 
     if (sessionState.playbackDelay !== undefined && sessionState.playbackDelay !== playbackDelay) {
       setPlaybackDelay(sessionState.playbackDelay);
+    }
+
+    if (sessionState.playbackDisableDelay !== undefined && sessionState.playbackDisableDelay !== playbackDisableDelay) {
+      setPlaybackDisableDelay(sessionState.playbackDisableDelay);
     }
 
     // Reset flag after applying updates - increased to 200ms to avoid race conditions

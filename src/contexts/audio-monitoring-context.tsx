@@ -148,6 +148,8 @@ interface AudioMonitoringContextType {
   setPlaybackEnabled: (enabled: boolean) => void;
   playbackDelay: number;
   setPlaybackDelay: (delay: number) => void;
+  playbackDisableDelay: number;
+  setPlaybackDisableDelay: (delay: number) => void;
 
   // Emergency Controls
   emergencyKillAll: () => Promise<void>;
@@ -263,6 +265,7 @@ const STORAGE_KEYS = {
   RECORDING_ENABLED: 'algo_live_recording_enabled',
   PLAYBACK_ENABLED: 'algo_live_playback_enabled',
   PLAYBACK_DELAY: 'algo_live_playback_delay',
+  PLAYBACK_DISABLE_DELAY: 'algo_live_playback_disable_delay',
   LAST_CONSOLE_CLEAR: 'algo_live_last_console_clear',
 };
 
@@ -285,6 +288,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [recordingEnabled, setRecordingEnabledState] = useState(false); // disabled by default to save storage
   const [playbackEnabled, setPlaybackEnabledState] = useState(false); // disabled by default
   const [playbackDelay, setPlaybackDelayState] = useState(500); // 500ms default (wait after paging ready before playback)
+  const [playbackDisableDelay, setPlaybackDisableDelayState] = useState(5000); // 5s default (wait after playback finishes before shutdown)
 
   // Volume mode
   const [useGlobalVolume, setUseGlobalVolumeState] = useState(false);
@@ -964,6 +968,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setPlaybackDelayState(parseInt(savedPlaybackDelay));
       }
 
+      const savedPlaybackDisableDelay = localStorage.getItem(STORAGE_KEYS.PLAYBACK_DISABLE_DELAY);
+      if (savedPlaybackDisableDelay !== null) {
+        setPlaybackDisableDelayState(parseInt(savedPlaybackDisableDelay));
+      }
+
       // Mark as restored
       setTimeout(() => {
         hasRestoredStateRef.current = true;
@@ -1097,6 +1106,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Saving playback delay:', playbackDelay);
     localStorage.setItem(STORAGE_KEYS.PLAYBACK_DELAY, playbackDelay.toString());
   }, [playbackDelay]);
+
+  // Persist playback disable delay to localStorage
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving playback disable delay:', playbackDisableDelay);
+    localStorage.setItem(STORAGE_KEYS.PLAYBACK_DISABLE_DELAY, playbackDisableDelay.toString());
+  }, [playbackDisableDelay]);
 
   // Daily console clear for long-running sessions (clears at midnight PST)
   useEffect(() => {
@@ -2241,11 +2257,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // We only mute the volume so speakers are ready for the next audio burst
       if (audioDetected) {
         if (!audioDetectionTimeoutRef.current) {
+          // 🎯 SMART DELAY: Use playback disable delay when playback is enabled (ensures audio fully captured)
+          // Otherwise use regular disable delay
+          const effectiveDelay = playbackEnabled ? playbackDisableDelay : disableDelay;
+
           addLog({
             type: "audio_silent",
             audioLevel,
             audioThreshold,
-            message: `Audio below threshold: ${audioLevel.toFixed(1)}% - starting ${disableDelay/1000}s mute countdown`,
+            message: `Audio below threshold: ${audioLevel.toFixed(1)}% - starting ${effectiveDelay/1000}s ${playbackEnabled ? 'playback' : 'mute'} countdown`,
           });
 
           audioDetectionTimeoutRef.current = setTimeout(() => {
@@ -2288,7 +2308,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   await checkPlaybackFinished();
                   debugLog('[AudioMonitoring] Playback finished - now shutting down paging and speakers');
 
-                  // NOW that playback is done, stop it and shutdown everything
+                  // NOW that playback is done, stop it
                   stopPlayback();
                 } else {
                   // Original flow: Stop playback immediately (if it was running)
@@ -2373,11 +2393,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               })();
             }
             audioDetectionTimeoutRef.current = null;
-          }, disableDelay);
+          }, effectiveDelay); // Use smart delay (playback delay if enabled, otherwise regular delay)
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, playbackDelay, startPlayback, stopPlayback, rampEnabled, waitForPagingReady, recordingEnabled]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, waitForPagingReady, recordingEnabled]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -2594,6 +2614,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Playback delay set to:', `${delay}ms`);
   }, []);
 
+  const setPlaybackDisableDelay = useCallback((delay: number) => {
+    setPlaybackDisableDelayState(delay);
+    debugLog('[AudioMonitoring] Playback disable delay set to:', `${delay}ms`);
+  }, []);
+
   const clearLogs = useCallback(() => {
     setLogs([]);
     debugLog('[AudioLog] Logs cleared');
@@ -2667,6 +2692,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setPlaybackEnabled,
         playbackDelay,
         setPlaybackDelay,
+        playbackDisableDelay,
+        setPlaybackDisableDelay,
         emergencyKillAll,
         emergencyEnableAll,
         controlSingleSpeaker,

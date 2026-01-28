@@ -90,6 +90,8 @@ export default function LiveBroadcastPage() {
     setPlaybackEnabled,
     playbackDelay,
     setPlaybackDelay,
+    playbackDisableDelay,
+    setPlaybackDisableDelay,
     devices: contextDevices,
     setDevices: setContextDevices,
     setPoeDevices,
@@ -123,6 +125,7 @@ export default function LiveBroadcastPage() {
   const displayedSustainDuration = displayState?.sustainDuration ?? sustainDuration;
   const displayedDisableDelay = displayState?.disableDelay ?? disableDelay;
   const displayedPlaybackDelay = displayState?.playbackDelay ?? playbackDelay;
+  const displayedPlaybackDisableDelay = displayState?.playbackDisableDelay ?? playbackDisableDelay;
   const displayedSelectedDevices = displayState?.selectedDevices ?? (selectedDevices || []);
   const displayedLoggingEnabled = displayState?.loggingEnabled ?? loggingEnabled;
   const displayedRecordingEnabled = displayState?.recordingEnabled ?? recordingEnabled;
@@ -734,7 +737,7 @@ export default function LiveBroadcastPage() {
                     onChange={(e) => setDisableDelay(parseInt(e.target.value))}
                   />
                   <p className="text-xs text-[var(--text-muted)]">
-                    Wait before disabling speakers after silence
+                    Wait before disabling speakers after silence {displayedPlaybackEnabled && '(not used when playback enabled)'}
                   </p>
                 </div>
 
@@ -758,7 +761,33 @@ export default function LiveBroadcastPage() {
                     <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-green)]/10 border border-[var(--accent-green)]/30">
                       <span className="text-xs">✅</span>
                       <p className="text-xs text-[var(--text-secondary)]">
-                        <strong>Smart Shutdown:</strong> With live playback enabled, paging will stay ON until playback completes (disable delay can be 0!)
+                        <strong>Smart Shutdown:</strong> After starting playback, paging stays ON until playback completes, then automatically shuts down.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Playback Disable Delay - Only show when playback is enabled */}
+                {displayedPlaybackEnabled && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Playback Disable Delay</Label>
+                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedPlaybackDisableDelay / 1000).toFixed(1)}s</span>
+                    </div>
+                    <Slider
+                      min={0}
+                      max={10000}
+                      step={100}
+                      value={displayedPlaybackDisableDelay}
+                      onChange={(e) => setPlaybackDisableDelay(parseInt(e.target.value))}
+                    />
+                    <p className="text-xs text-[var(--text-muted)]">
+                      Wait after silence detected before stopping recording (replaces Disable Delay when playback enabled)
+                    </p>
+                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-blue)]/10 border border-[var(--accent-blue)]/30">
+                      <span className="text-xs">💡</span>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        <strong>Smart Timing:</strong> This delay ensures complete audio capture for playback. Longer = more complete recordings, but slower shutdown.
                       </p>
                     </div>
                   </div>
