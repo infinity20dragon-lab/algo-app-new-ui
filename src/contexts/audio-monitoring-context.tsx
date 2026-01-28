@@ -728,10 +728,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Get the mimeType from MediaRecorder
       const mimeType = mediaRecorder?.mimeType || 'audio/webm';
 
-      // Create blob from "settled" chunks only (skip last 5 chunks to avoid incomplete frames)
+      // Create blob from "settled" chunks only (skip last 15 chunks to avoid incomplete frames)
       // This prevents "no supported source" errors from incomplete audio data
       const totalChunks = recordedChunksRef.current.length;
-      const chunksToSkip = isRecording ? 5 : 0; // Skip last 5 chunks if still recording
+      const chunksToSkip = isRecording ? 15 : 0; // Skip last 15 chunks if still recording (~1-2s behind live)
       const settledChunks = recordedChunksRef.current.slice(0, Math.max(0, totalChunks - chunksToSkip));
 
       if (settledChunks.length === 0) {
