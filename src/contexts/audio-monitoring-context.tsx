@@ -2324,6 +2324,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   // Only toggle paging if not always on
                   debugLog('[AudioMonitoring] AUDIO ENDED - Setting paging to mode 0 (disabled)');
                   await setPagingMulticast(0);
+
+                  // 🚨 CRITICAL: Wait for device to confirm mode 0 before proceeding!
+                  // This prevents race conditions when rapid calls happen (e.g., 1-2 second calls in quick succession)
+                  // Without this, a new call might try to set mode 1 while device is still transitioning to mode 0
+                  await waitForPagingOff();
+
                   pagingWasEnabledRef.current = false; // Mark paging as disabled
                 } else {
                   debugLog('[AudioMonitoring] AUDIO ENDED - Keeping paging at mode 1 (always on)');
