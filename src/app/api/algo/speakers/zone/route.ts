@@ -4,7 +4,7 @@ import type { AlgoAuthMethod } from "@/lib/algo/types";
 interface PagingZoneRequest {
   ipAddress: string;
   password: string;
-  authMethod: AlgoAuthMethod;
+  authMethod?: AlgoAuthMethod; // Optional, defaults to basic
   zone: number; // 1-50
 }
 
