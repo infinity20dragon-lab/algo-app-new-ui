@@ -728,8 +728,19 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Get the mimeType from MediaRecorder
       const mimeType = mediaRecorder?.mimeType || 'audio/webm';
 
-      // Create blob from ALL chunks (full recording so far)
-      const audioBlob = new Blob(recordedChunksRef.current, { type: mimeType });
+      // Create blob from "settled" chunks only (skip last 5 chunks to avoid incomplete frames)
+      // This prevents "no supported source" errors from incomplete audio data
+      const totalChunks = recordedChunksRef.current.length;
+      const chunksToSkip = isRecording ? 5 : 0; // Skip last 5 chunks if still recording
+      const settledChunks = recordedChunksRef.current.slice(0, Math.max(0, totalChunks - chunksToSkip));
+
+      if (settledChunks.length === 0) {
+        debugLog('[Playback] No settled chunks available yet, waiting...');
+        setTimeout(() => continuePlayback(), 200);
+        return;
+      }
+
+      const audioBlob = new Blob(settledChunks, { type: mimeType });
 
       // Check if blob has actual data (not empty from discarded recording)
       if (audioBlob.size === 0) {
@@ -1707,6 +1718,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         try {
           // Check current zone first to avoid redundant calls
           try {
+            const checkAbort = new AbortController();
+            const checkTimeout = setTimeout(() => checkAbort.abort(), 3000); // 3s timeout
+
             const checkResponse = await fetch("/api/algo/settings/get", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -1716,7 +1730,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 authMethod: paging.authMethod,
                 setting: "mcast.tx.fixed",
               }),
+              signal: checkAbort.signal,
             });
+
+            clearTimeout(checkTimeout);
 
             if (checkResponse.ok) {
               const checkData = await checkResponse.json();
@@ -1730,10 +1747,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               debugLog(`[AudioMonitoring] ${paging.name} is zone ${currentZone}, changing to ${zone}...`);
             }
           } catch (checkError) {
-            console.warn(`[AudioMonitoring] Failed to check ${paging.name} zone:`, checkError);
+            console.warn(`[AudioMonitoring] Failed to check ${paging.name} zone (timeout or error), proceeding with zone change...`);
           }
 
           // Change the zone
+          const zoneAbort = new AbortController();
+          const zoneTimeout = setTimeout(() => zoneAbort.abort(), 5000); // 5s timeout
+
           const response = await fetch("/api/algo/speakers/zone", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1743,7 +1763,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               authMethod: paging.authMethod,
               zone,
             }),
+            signal: zoneAbort.signal,
           });
+
+          clearTimeout(zoneTimeout);
 
           if (response.ok) {
             debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to zone ${zone}`);
@@ -1881,6 +1904,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
     while (Date.now() - startTime < maxWaitMs) {
       try {
+        const pollAbort = new AbortController();
+        const pollTimeout = setTimeout(() => pollAbort.abort(), 2000); // 2s timeout per poll
+
         const response = await fetch("/api/algo/settings/get", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1890,7 +1916,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             authMethod: paging.authMethod,
             setting: "mcast.tx.fixed",
           }),
+          signal: pollAbort.signal,
         });
+
+        clearTimeout(pollTimeout);
 
         if (response.ok) {
           const data = await response.json();
@@ -1905,7 +1934,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           debugLog(`[AudioMonitoring] ⏳ Zone = ${currentZone}, waiting for ${targetZone}... (${Date.now() - startTime}ms)`);
         }
       } catch (error) {
-        debugLog(`[AudioMonitoring] Polling error: ${error}`);
+        debugLog(`[AudioMonitoring] Polling error (timeout or fetch failed): ${error}`);
       }
 
       await new Promise(resolve => setTimeout(resolve, pollInterval));
