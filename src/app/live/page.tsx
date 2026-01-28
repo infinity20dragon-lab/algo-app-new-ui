@@ -271,9 +271,12 @@ export default function LiveBroadcastPage() {
     }
   };
 
-  // Determine if currently in day or night mode
-  const currentHour = new Date().getHours();
-  const isDaytime = currentHour >= dayStartHour && currentHour < dayEndHour;
+  // Determine if currently in day or night mode (supports half-hour intervals)
+  const now = new Date();
+  const currentHour = now.getHours();
+  const currentMinute = now.getMinutes();
+  const currentTime = currentHour + (currentMinute >= 30 ? 0.5 : 0);
+  const isDaytime = currentTime >= displayedDayStartHour && currentTime < displayedDayEndHour;
 
   if (loading) {
     return (
@@ -795,22 +798,30 @@ export default function LiveBroadcastPage() {
                             <span className="text-[var(--text-muted)]">Day:</span>
                             <Select
                               value={displayedDayStartHour.toString()}
-                              onChange={(e) => setDayStartHour(parseInt(e.target.value))}
-                              className="w-20"
+                              onChange={(e) => setDayStartHour(parseFloat(e.target.value))}
+                              className="w-24"
                             >
-                              {Array.from({ length: 24 }, (_, i) => (
-                                <option key={i} value={i}>{i.toString().padStart(2, '0')}:00</option>
-                              ))}
+                              {Array.from({ length: 48 }, (_, i) => {
+                                const time = i / 2; // 0, 0.5, 1, 1.5, ...
+                                const hour = Math.floor(time);
+                                const minute = (time % 1) * 60;
+                                const label = `${hour.toString().padStart(2, '0')}:${minute === 0 ? '00' : '30'}`;
+                                return <option key={i} value={time}>{label}</option>;
+                              })}
                             </Select>
                             <span className="text-[var(--text-muted)]">to</span>
                             <Select
                               value={displayedDayEndHour.toString()}
-                              onChange={(e) => setDayEndHour(parseInt(e.target.value))}
-                              className="w-20"
+                              onChange={(e) => setDayEndHour(parseFloat(e.target.value))}
+                              className="w-24"
                             >
-                              {Array.from({ length: 24 }, (_, i) => (
-                                <option key={i} value={i}>{i.toString().padStart(2, '0')}:00</option>
-                              ))}
+                              {Array.from({ length: 48 }, (_, i) => {
+                                const time = i / 2; // 0, 0.5, 1, 1.5, ...
+                                const hour = Math.floor(time);
+                                const minute = (time % 1) * 60;
+                                const label = `${hour.toString().padStart(2, '0')}:${minute === 0 ? '00' : '30'}`;
+                                return <option key={i} value={time}>{label}</option>;
+                              })}
                             </Select>
                           </div>
                           <div className="space-y-2">
@@ -881,7 +892,7 @@ export default function LiveBroadcastPage() {
                     <Label className="!text-[var(--text-primary)]">Live Playback</Label>
                     <p className="text-xs text-[var(--text-muted)]">
                       {displayedPlaybackEnabled
-                        ? "Play recorded audio through system (BlackHole → 4i4)"
+                        ? "Stream audio to paging system in real-time"
                         : "Disabled - only record (no playback)"}
                     </p>
                   </div>

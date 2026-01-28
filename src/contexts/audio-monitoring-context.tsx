@@ -309,6 +309,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const sustainedAudioStartRef = useRef<number | null>(null);
   const sustainCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const speakersEnabledTimeRef = useRef<number | null>(null);
+  const pagingWasEnabledRef = useRef<boolean>(false); // Track if we enabled paging during this session
 
   // Recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -317,6 +318,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // Playback
   const playbackAudioRef = useRef<HTMLAudioElement | null>(null);
+  const isPlayingLiveRef = useRef<boolean>(false); // Track if live playback is active
+  const playbackPositionRef = useRef<number>(0); // Track playback position in seconds
 
   const {
     isCapturing,
@@ -444,7 +447,21 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const mediaRecorder = new MediaRecorder(monitoringStream, options);
 
       recordedChunksRef.current = [];
-      recordingStartTimeRef.current = new Date().toISOString();
+
+      // Generate PST timestamp with AM/PM format
+      const now = new Date();
+      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const year = pstTime.getFullYear();
+      const month = String(pstTime.getMonth() + 1).padStart(2, '0');
+      const day = String(pstTime.getDate()).padStart(2, '0');
+      let hours = pstTime.getHours();
+      const minutes = String(pstTime.getMinutes()).padStart(2, '0');
+      const seconds = String(pstTime.getSeconds()).padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12; // Convert to 12-hour format
+      const hoursStr = String(hours).padStart(2, '0');
+
+      recordingStartTimeRef.current = `${year}-${month}-${day}-${hoursStr}-${minutes}-${seconds}-${ampm}`;
 
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
@@ -497,8 +514,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
             console.log(`[Recording] Saving ${audioBlob.size} bytes as ${fileExtension} (${actualMimeType})`);
 
-            // Generate filename with timestamp
-            const timestamp = recordingStartTimeRef.current!.replace(/[:.]/g, '-');
+            // Generate filename with PST timestamp (already formatted: YYYY-MM-DD-HH-MM-SS-AM/PM)
+            const timestamp = recordingStartTimeRef.current!;
             const filename = `recording-${timestamp}.${fileExtension}`;
             const filePath = `audio-recordings/${user.uid}/${filename}`;
 
@@ -534,7 +551,89 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     });
   }, [user]);
 
-  // Start playback from recorded chunks
+  // Continue playing (for live streaming effect)
+  const continuePlayback = useCallback(async () => {
+    try {
+      // Check if we should continue playing
+      if (!isPlayingLiveRef.current || !playbackEnabled) {
+        debugLog('[Playback] Live playback stopped or disabled');
+        return;
+      }
+
+      // Check if there are chunks to play
+      if (recordedChunksRef.current.length === 0) {
+        console.warn('[Playback] No chunks available for playback');
+        setTimeout(() => continuePlayback(), 100);
+        return;
+      }
+
+      const mediaRecorder = mediaRecorderRef.current;
+      const isRecording = mediaRecorder?.state === 'recording';
+
+      if (!isRecording && !playbackAudioRef.current) {
+        // Recording stopped and no audio playing, we're done
+        debugLog('[Playback] Recording stopped, live stream complete');
+        isPlayingLiveRef.current = false;
+        return;
+      }
+
+      // Get the mimeType from MediaRecorder
+      const mimeType = mediaRecorder?.mimeType || 'audio/webm';
+
+      // Create blob from ALL chunks (full recording so far)
+      const audioBlob = new Blob(recordedChunksRef.current, { type: mimeType });
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      debugLog(`[Playback] LIVE STREAM: Playing from ${playbackPositionRef.current.toFixed(2)}s (total: ${(audioBlob.size / 1024).toFixed(1)}KB)`);
+
+      // Create audio element
+      const audio = new Audio(audioUrl);
+      playbackAudioRef.current = audio;
+
+      // Set playback position to where we left off
+      audio.currentTime = playbackPositionRef.current;
+
+      audio.ontimeupdate = () => {
+        // Track current playback position
+        playbackPositionRef.current = audio.currentTime;
+      };
+
+      audio.onended = () => {
+        const finalPosition = audio.currentTime || audio.duration || 0;
+        playbackPositionRef.current = finalPosition;
+
+        debugLog(`[Playback] Reached end at ${finalPosition.toFixed(2)}s, continuing live stream...`);
+        URL.revokeObjectURL(audioUrl);
+        playbackAudioRef.current = null;
+
+        // Continue playing if still in live mode
+        if (isPlayingLiveRef.current) {
+          setTimeout(() => continuePlayback(), 100);
+        }
+      };
+
+      audio.onerror = (error) => {
+        console.error('[Playback] Playback error:', error);
+        URL.revokeObjectURL(audioUrl);
+        playbackAudioRef.current = null;
+
+        // Try to continue despite error
+        if (isPlayingLiveRef.current) {
+          setTimeout(() => continuePlayback(), 500);
+        }
+      };
+
+      await audio.play();
+    } catch (error) {
+      console.error('[Playback] Failed to continue playback:', error);
+      // Try to recover
+      if (isPlayingLiveRef.current) {
+        setTimeout(() => continuePlayback(), 500);
+      }
+    }
+  }, [playbackEnabled]);
+
+  // Start live playback from recorded chunks
   const startPlayback = useCallback(async () => {
     try {
       if (!playbackEnabled) {
@@ -553,54 +652,43 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         playbackAudioRef.current = null;
       }
 
-      // Get the mimeType from MediaRecorder
-      const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
+      // Enable live playback mode
+      isPlayingLiveRef.current = true;
+      playbackPositionRef.current = 0; // Start from beginning
 
-      // Create blob from chunks collected so far
-      const audioBlob = new Blob(recordedChunksRef.current, { type: mimeType });
-      const audioUrl = URL.createObjectURL(audioBlob);
-
-      console.log(`[Playback] Starting playback of ${audioBlob.size} bytes (${mimeType})`);
-
-      // Create audio element and play
-      const audio = new Audio(audioUrl);
-      playbackAudioRef.current = audio;
-
-      audio.onended = () => {
-        console.log('[Playback] Playback finished');
-        URL.revokeObjectURL(audioUrl);
-        playbackAudioRef.current = null;
-      };
-
-      audio.onerror = (error) => {
-        console.error('[Playback] Playback error:', error);
-        URL.revokeObjectURL(audioUrl);
-        playbackAudioRef.current = null;
-      };
-
-      await audio.play();
+      console.log(`[Playback] 🔴 Starting LIVE STREAM playback`);
 
       addLog({
         type: "audio_detected",
-        message: `Started playback of recorded audio (${(audioBlob.size / 1024).toFixed(1)} KB)`,
+        message: `Started live playback streaming (${recordedChunksRef.current.length} initial chunks)`,
       });
+
+      // Start the live playback loop
+      await continuePlayback();
     } catch (error) {
       console.error('[Playback] Failed to start playback:', error);
+      isPlayingLiveRef.current = false;
     }
-  }, [playbackEnabled, addLog]);
+  }, [playbackEnabled, addLog, continuePlayback]);
 
   // Stop playback
   const stopPlayback = useCallback(() => {
+    console.log('[Playback] 🛑 Stopping live stream playback');
+
+    // Disable live playback mode first
+    isPlayingLiveRef.current = false;
+    playbackPositionRef.current = 0;
+
+    // Stop current audio
     if (playbackAudioRef.current) {
-      console.log('[Playback] Stopping playback');
       playbackAudioRef.current.pause();
       playbackAudioRef.current = null;
-
-      addLog({
-        type: "audio_silent",
-        message: "Stopped playback",
-      });
     }
+
+    addLog({
+      type: "audio_silent",
+      message: "Stopped live playback stream",
+    });
   }, [addLog]);
 
   // Update gain when volume changes
@@ -959,11 +1047,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog(`[AudioMonitoring] setDevicesVolume(${volumePercent}%) - completed`);
   }, [selectedDevices, devices, useGlobalVolume]);
 
-  // Helper function to determine if it's currently daytime
+  // Helper function to determine if it's currently daytime (supports half-hour intervals)
   const isDaytime = useCallback(() => {
     const now = new Date();
     const currentHour = now.getHours();
-    return currentHour >= dayStartHour && currentHour < dayEndHour;
+    const currentMinute = now.getMinutes();
+    // Convert to decimal hours (e.g., 6:30 = 6.5, 14:30 = 14.5)
+    const currentTime = currentHour + (currentMinute >= 30 ? 0.5 : 0);
+    return currentTime >= dayStartHour && currentTime < dayEndHour;
   }, [dayStartHour, dayEndHour]);
 
   // Get the effective ramp duration based on settings
@@ -1132,7 +1223,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Calculate current day/night status directly to avoid function dependency
       const now = new Date();
       const currentHour = now.getHours();
-      const currentIsDaytime = currentHour >= dayStartHour && currentHour < dayEndHour;
+      const currentMinute = now.getMinutes();
+      // Convert to decimal hours for comparison with half-hour intervals
+      const currentTime = currentHour + (currentMinute >= 30 ? 0.5 : 0);
+      const currentIsDaytime = currentTime >= dayStartHour && currentTime < dayEndHour;
 
       // Initialize on first run
       if (previousDayModeRef.current === null) {
@@ -1170,6 +1264,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   }, [dayNightMode, dayStartHour, dayEndHour]);
 
   // Set paging device multicast mode (0=disabled, 1=transmitter, 2=receiver)
+  // Smart: Checks current mode first to avoid redundant API calls
   const setPagingMulticast = useCallback(async (mode: 0 | 1 | 2) => {
     const pagingDevices = devices.filter(d => d.type === "8301");
 
@@ -1178,11 +1273,40 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       return;
     }
 
-    debugLog(`[AudioMonitoring] Setting ${pagingDevices.length} paging device(s) to multicast mode ${mode}`);
+    debugLog(`[AudioMonitoring] Checking ${pagingDevices.length} paging device(s) before setting mode ${mode}...`);
 
     await Promise.allSettled(
       pagingDevices.map(async (paging) => {
         try {
+          // First, check current mode
+          const checkResponse = await fetch("/api/algo/settings/get", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ipAddress: paging.ipAddress,
+              password: paging.apiPassword,
+              authMethod: paging.authMethod,
+              setting: "mcast.mode",
+            }),
+          });
+
+          if (checkResponse.ok) {
+            const checkData = await checkResponse.json();
+            const currentMode = checkData.value;
+
+            if (currentMode === mode.toString()) {
+              debugLog(`[AudioMonitoring] ⏭️  ${paging.name} already at mode ${mode}, skipping`);
+              addLog({
+                type: "speakers_enabled",
+                message: `Paging ${paging.name} already at mode ${mode}, skipped redundant call`,
+              });
+              return; // Already at target mode, skip
+            }
+
+            debugLog(`[AudioMonitoring] ${paging.name} is mode ${currentMode}, changing to ${mode}...`);
+          }
+
+          // Current mode is different, proceed with change
           await fetch("/api/algo/speakers/mcast", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1196,11 +1320,68 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             }),
           });
           debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to mode ${mode}`);
+          addLog({
+            type: "speakers_enabled",
+            message: `Paging ${paging.name} mode ${mode} activated`,
+          });
         } catch (error) {
           console.error(`Failed to set ${paging.name} multicast mode:`, error);
         }
       })
     );
+  }, [devices, addLog]);
+
+  // Wait for paging device to be ready by polling until mcast.mode = 1
+  const waitForPagingReady = useCallback(async (): Promise<void> => {
+    const pagingDevices = devices.filter(d => d.type === "8301");
+
+    if (pagingDevices.length === 0) {
+      console.warn('[AudioMonitoring] No paging devices to poll');
+      return;
+    }
+
+    const paging = pagingDevices[0]; // Use first paging device
+    const startTime = Date.now();
+    const maxWaitMs = 5000; // Maximum 5 seconds
+    const pollInterval = 200; // Check every 200ms
+
+    debugLog(`[AudioMonitoring] 🔄 Polling ${paging.name} until mcast.mode = 1...`);
+
+    while (Date.now() - startTime < maxWaitMs) {
+      try {
+        // Poll the mcast.mode setting
+        const response = await fetch("/api/algo/settings/get", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ipAddress: paging.ipAddress,
+            password: paging.apiPassword,
+            authMethod: paging.authMethod,
+            setting: "mcast.mode",
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const currentMode = data.value;
+
+          if (currentMode === "1") {
+            const elapsed = Date.now() - startTime;
+            debugLog(`[AudioMonitoring] ✅ Paging device ready! Mode = 1 after ${elapsed}ms`);
+            return; // Device is ready!
+          }
+
+          debugLog(`[AudioMonitoring] ⏳ Mode = ${currentMode}, waiting... (${Date.now() - startTime}ms)`);
+        }
+      } catch (error) {
+        debugLog(`[AudioMonitoring] Polling error: ${error}`);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
+
+    // Timeout - proceed anyway
+    console.warn(`[AudioMonitoring] ⚠️ Timeout waiting for paging device, proceeding anyway after ${maxWaitMs}ms`);
   }, [devices]);
 
   // Set all speakers multicast mode (0=disabled, 1=transmitter, 2=receiver)
@@ -1661,15 +1842,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               // Only toggle paging if not always on
               debugLog('[AudioMonitoring] AUDIO DETECTED - Setting paging to mode 1 (transmitter)');
               await setPagingMulticast(1);
+              pagingWasEnabledRef.current = true; // Track that we enabled paging
             } else {
               debugLog('[AudioMonitoring] AUDIO DETECTED - Paging already at mode 1 (always on)');
+              pagingWasEnabledRef.current = true; // Track that paging is enabled (always-on mode)
             }
 
-            // NEW: Start playback AFTER paging device is ready
-            // This ensures device is listening before audio plays
+            // NEW: Wait for paging device to be ready (poll until mcast.mode = 1)
+            // This ensures device is actually ready before audio plays
+            await waitForPagingReady();
+
+            // NEW: Start playback AFTER paging device is confirmed ready
             if (playbackEnabled) {
-              // Small delay to let device fully initialize
-              await new Promise(resolve => setTimeout(resolve, 200));
               await startPlayback();
             }
 
@@ -1742,8 +1926,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   // Only toggle paging if not always on
                   debugLog('[AudioMonitoring] AUDIO ENDED - Setting paging to mode 0 (disabled)');
                   await setPagingMulticast(0);
+                  pagingWasEnabledRef.current = false; // Mark paging as disabled
                 } else {
                   debugLog('[AudioMonitoring] AUDIO ENDED - Keeping paging at mode 1 (always on)');
+                  // Keep pagingWasEnabledRef.current = true since it's still enabled
                 }
 
                 // Ramp down or keep at operating volume
@@ -1775,10 +1961,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, startPlayback, stopPlayback, rampEnabled]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, startPlayback, stopPlayback, rampEnabled, waitForPagingReady]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
+
+    // Reset paging state tracker
+    pagingWasEnabledRef.current = false;
+
     addLog({
       type: "audio_detected",
       audioThreshold,
@@ -1817,9 +2007,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         if (alwaysKeepPagingOn) {
           debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 1 (ALWAYS ON - transmitter)');
           await setPagingMulticast(1);
+          pagingWasEnabledRef.current = true; // Track that paging is enabled
         } else {
           debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 0 (disabled - will toggle on audio)');
           await setPagingMulticast(0);
+          // pagingWasEnabledRef stays false - will be set to true when audio is detected
         }
 
         // Step 3: Set all speakers to mode 2 (receiver - ready to listen)
@@ -1886,8 +2078,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Step 1: Set speakers to idle volume
       await setDevicesVolume(0);
 
-      // Step 2: Set paging device to mode 0 (disabled)
-      await setPagingMulticast(0);
+      // Step 2: Set paging device to mode 0 (ONLY if it was enabled during this session)
+      if (pagingWasEnabledRef.current) {
+        debugLog('[AudioMonitoring] Paging was enabled during session - disabling now');
+        await setPagingMulticast(0);
+        pagingWasEnabledRef.current = false;
+      } else {
+        debugLog('[AudioMonitoring] Paging was never enabled - skipping redundant disable');
+      }
 
       // Step 3: Set all speakers to mode 0 (disabled)
       await setSpeakersMulticast(0);
@@ -1897,6 +2095,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
 
     // Clean up playback
+    isPlayingLiveRef.current = false;
+    playbackPositionRef.current = 0;
     if (playbackAudioRef.current) {
       playbackAudioRef.current.pause();
       playbackAudioRef.current = null;

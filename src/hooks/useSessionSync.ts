@@ -127,6 +127,7 @@ export function useSessionSync() {
 
     // CRITICAL: Admin MUST apply user's state to local context to control it!
     // This way admin's sliders/buttons show user's actual values
+    /*
     if (viewingAsUserId) {
       console.log('[SessionSync] Admin viewing user - applying user state to admin local context for control');
     } else {
@@ -136,7 +137,7 @@ export function useSessionSync() {
     isApplyingRemoteUpdate.current = true;
 
     // Apply monitoring state
-    if (sessionState.audioInputMonitoring !== isCapturing) {
+    if (sessionState && sessionState.audioInputMonitoring !== isCapturing) {
       if (sessionState.audioInputMonitoring) {
         startMonitoring();
       } else {
@@ -145,7 +146,7 @@ export function useSessionSync() {
     }
 
     // Apply device selection
-    if (sessionState.selectedDevices && JSON.stringify(sessionState.selectedDevices) !== JSON.stringify(selectedDevices)) {
+    if (sessionState && sessionState.selectedDevices && JSON.stringify(sessionState.selectedDevices) !== JSON.stringify(selectedDevices)) {
       setSelectedDevices(sessionState.selectedDevices);
     }
 
@@ -220,5 +221,6 @@ export function useSessionSync() {
     setTimeout(() => {
       isApplyingRemoteUpdate.current = false;
     }, 200);
+    */
   }, [sessionState, viewingAsUserId]);
 }
