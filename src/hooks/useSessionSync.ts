@@ -69,7 +69,7 @@ export function useSessionSync() {
 
     // CRITICAL: Always sync, even when admin is viewing or user is being controlled!
     // syncSessionState handles routing to the correct session
-    console.log('[SessionSync] Syncing state to Firebase', { viewingAsUserId, isBeingControlled });
+    // Note: Removed noisy log - sync happens frequently and is expected behavior
 
     // Filter out undefined values to prevent Firebase errors
     const stateToSync: any = {

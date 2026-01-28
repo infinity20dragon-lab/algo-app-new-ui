@@ -339,6 +339,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const playbackAnalyserRef = useRef<AnalyserNode | null>(null);
   const playbackAnimationFrameRef = useRef<number | null>(null);
 
+  // MediaSource playback infrastructure
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const mediaSourceUrlRef = useRef<string | null>(null);
+  const pendingChunksQueueRef = useRef<Blob[]>([]); // Queue chunks while SourceBuffer updating
+  const isAppendingRef = useRef<boolean>(false);
+  const hasInitSegmentRef = useRef<boolean>(false);
+  const mediaSourceReadyRef = useRef<boolean>(false);
+
   const {
     isCapturing,
     audioLevel,
@@ -492,6 +501,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           recordedChunksRef.current.push(event.data);
+
+          // NEW: Append chunk to MediaSource if live playback is active
+          if (playbackEnabled && isPlayingLiveRef.current && mediaSourceReadyRef.current) {
+            appendChunkToSourceBuffer(event.data);
+          }
         }
       };
 
@@ -680,134 +694,187 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[Playback] Stopped audio level tracking');
   }, []);
 
-  // Continue playing (for live streaming effect)
-  const continuePlayback = useCallback(async () => {
+  // Clean up MediaSource
+  const cleanupMediaSource = useCallback(() => {
+    debugLog('[MediaSource] Cleaning up');
+
+    // Stop appending
+    isAppendingRef.current = false;
+    pendingChunksQueueRef.current = [];
+
+    // End stream
     try {
-      // Check if we should continue playing
-      if (!isPlayingLiveRef.current || !playbackEnabled) {
-        debugLog('[Playback] Live playback stopped or disabled');
-        return;
-      }
+      const mediaSource = mediaSourceRef.current;
+      const sourceBuffer = sourceBufferRef.current;
 
-      // 🚨 CRITICAL: Check if recording is stopped FIRST (before chunk check)
-      // This prevents infinite loop when recording ends with no chunks left
-      const mediaRecorder = mediaRecorderRef.current;
-      const isRecording = mediaRecorder?.state === 'recording';
-
-      if (!isRecording && !playbackAudioRef.current && recordedChunksRef.current.length === 0) {
-        // Recording stopped, no audio playing, and no chunks left - we're done!
-        debugLog('[Playback] Recording stopped with no chunks remaining, live stream complete');
-        isPlayingLiveRef.current = false;
-        return;
-      }
-
-      // Check if there are chunks to play
-      if (recordedChunksRef.current.length === 0) {
-        // Only warn once to avoid console spam
-        if (!noChunksWarningShownRef.current) {
-          console.warn('[Playback] No chunks available for playback - waiting...');
-          noChunksWarningShownRef.current = true;
+      if (sourceBuffer && mediaSource && mediaSource.readyState === 'open') {
+        if (!sourceBuffer.updating) {
+          mediaSource.endOfStream();
         }
-        setTimeout(() => continuePlayback(), 100);
+      }
+    } catch (error) {
+      debugLog('[MediaSource] Error during endOfStream:', error);
+    }
+
+    // Revoke object URL
+    if (mediaSourceUrlRef.current) {
+      URL.revokeObjectURL(mediaSourceUrlRef.current);
+      mediaSourceUrlRef.current = null;
+    }
+
+    // Clear refs
+    sourceBufferRef.current = null;
+    mediaSourceRef.current = null;
+    hasInitSegmentRef.current = false;
+    mediaSourceReadyRef.current = false;
+
+    debugLog('[MediaSource] Cleanup complete');
+  }, []);
+
+  // Append chunk to SourceBuffer
+  const appendChunkToSourceBuffer = useCallback(async (chunk: Blob): Promise<void> => {
+    const processNextChunk = () => {
+      if (pendingChunksQueueRef.current.length === 0) return;
+      const nextChunk = pendingChunksQueueRef.current.shift();
+      if (nextChunk) {
+        appendChunkToSourceBuffer(nextChunk);
+      }
+    };
+
+    try {
+      const sourceBuffer = sourceBufferRef.current;
+      const mediaSource = mediaSourceRef.current;
+
+      if (!sourceBuffer || !mediaSource || mediaSource.readyState !== 'open') {
+        // Queue chunk for later
+        pendingChunksQueueRef.current.push(chunk);
         return;
       }
 
-      // Reset warning flag when chunks are available
-      if (noChunksWarningShownRef.current) {
-        debugLog('[Playback] Chunks now available, resuming...');
-        noChunksWarningShownRef.current = false;
-      }
-
-      // Additional check: if recording stopped and no audio playing, we're done
-      if (!isRecording && !playbackAudioRef.current) {
-        debugLog('[Playback] Recording stopped, live stream complete');
-        isPlayingLiveRef.current = false;
+      // If SourceBuffer is updating, queue the chunk
+      if (isAppendingRef.current || sourceBuffer.updating) {
+        pendingChunksQueueRef.current.push(chunk);
         return;
       }
 
-      // Get the mimeType from MediaRecorder
-      const mimeType = mediaRecorder?.mimeType || 'audio/webm';
+      isAppendingRef.current = true;
 
-      // Create blob from "settled" chunks only (skip last 15 chunks to avoid incomplete frames)
-      // This prevents "no supported source" errors from incomplete audio data
-      const totalChunks = recordedChunksRef.current.length;
-      const chunksToSkip = isRecording ? 15 : 0; // Skip last 15 chunks if still recording (~1-2s behind live)
-      const settledChunks = recordedChunksRef.current.slice(0, Math.max(0, totalChunks - chunksToSkip));
+      // Convert Blob to ArrayBuffer
+      const arrayBuffer = await chunk.arrayBuffer();
 
-      if (settledChunks.length === 0) {
-        debugLog('[Playback] No settled chunks available yet, waiting...');
-        setTimeout(() => continuePlayback(), 200);
-        return;
+      // Track init segment
+      if (!hasInitSegmentRef.current) {
+        debugLog('[MediaSource] First chunk (initialization segment)');
+        hasInitSegmentRef.current = true;
       }
 
-      const audioBlob = new Blob(settledChunks, { type: mimeType });
+      // Append to SourceBuffer
+      sourceBuffer.appendBuffer(arrayBuffer);
 
-      // Check if blob has actual data (not empty from discarded recording)
-      if (audioBlob.size === 0) {
-        debugLog('[Playback] Blob is empty (likely from discarded recording), waiting for new chunks...');
-        setTimeout(() => continuePlayback(), 100);
-        return;
+      // Wait for append to complete
+      await new Promise<void>((resolve, reject) => {
+        const onUpdateEnd = () => {
+          sourceBuffer.removeEventListener('updateend', onUpdateEnd);
+          sourceBuffer.removeEventListener('error', onError);
+          isAppendingRef.current = false;
+          resolve();
+
+          // Process next queued chunk
+          processNextChunk();
+        };
+
+        const onError = (e: Event) => {
+          sourceBuffer.removeEventListener('updateend', onUpdateEnd);
+          sourceBuffer.removeEventListener('error', onError);
+          isAppendingRef.current = false;
+          console.error('[MediaSource] SourceBuffer append error:', e);
+          reject(new Error('SourceBuffer append error'));
+        };
+
+        sourceBuffer.addEventListener('updateend', onUpdateEnd);
+        sourceBuffer.addEventListener('error', onError);
+      });
+    } catch (error) {
+      console.error('[MediaSource] Failed to append chunk:', error);
+      isAppendingRef.current = false;
+    }
+  }, []);
+
+  // Initialize MediaSource for streaming playback
+  const initializeMediaSource = useCallback(async (): Promise<HTMLAudioElement | null> => {
+    try {
+      if (!playbackEnabled) return null;
+
+      // Check MediaSource support
+      if (!window.MediaSource) {
+        console.error('[MediaSource] API not supported');
+        return null;
       }
 
-      const audioUrl = URL.createObjectURL(audioBlob);
+      // Check codec support
+      const mimeType = 'audio/webm; codecs="opus"';
+      if (!MediaSource.isTypeSupported(mimeType)) {
+        console.error('[MediaSource] Codec not supported:', mimeType);
+        return null;
+      }
 
-      debugLog(`[Playback] LIVE STREAM: Playing from ${playbackPositionRef.current.toFixed(2)}s (total: ${(audioBlob.size / 1024).toFixed(1)}KB)`);
+      debugLog('[MediaSource] Creating MediaSource instance');
+      const mediaSource = new MediaSource();
+      mediaSourceRef.current = mediaSource;
 
-      // Create audio element
-      const audio = new Audio(audioUrl);
+      // Create object URL and audio element
+      const url = URL.createObjectURL(mediaSource);
+      mediaSourceUrlRef.current = url;
+
+      const audio = new Audio();
+      audio.src = url;
       playbackAudioRef.current = audio;
 
-      // Setup AudioContext and Analyser (only once on first audio element)
+      // Setup audio level monitoring
       if (!playbackAudioContextRef.current) {
         setupPlaybackAudioContext();
       }
-
-      // Connect THIS audio element to the analyser (every time)
       connectAudioElementToAnalyser(audio);
 
-      // Set playback position to where we left off
-      audio.currentTime = playbackPositionRef.current;
+      // Wait for MediaSource to open
+      await new Promise<void>((resolve, reject) => {
+        const timeoutId = setTimeout(() => reject(new Error('MediaSource open timeout')), 5000);
 
-      audio.ontimeupdate = () => {
-        // Track current playback position
-        playbackPositionRef.current = audio.currentTime;
-      };
+        mediaSource.addEventListener('sourceopen', () => {
+          clearTimeout(timeoutId);
+          try {
+            debugLog('[MediaSource] Opened, creating SourceBuffer');
 
-      audio.onended = () => {
-        const finalPosition = audio.currentTime || audio.duration || 0;
-        playbackPositionRef.current = finalPosition;
+            const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+            sourceBufferRef.current = sourceBuffer;
 
-        debugLog(`[Playback] Reached end at ${finalPosition.toFixed(2)}s, continuing live stream...`);
-        URL.revokeObjectURL(audioUrl);
-        playbackAudioRef.current = null;
+            // CRITICAL: Use 'sequence' mode for automatic gapless playback
+            sourceBuffer.mode = 'sequence';
 
-        // Continue playing if still in live mode
-        if (isPlayingLiveRef.current) {
-          setTimeout(() => continuePlayback(), 100);
-        }
-      };
+            debugLog('[MediaSource] SourceBuffer ready in sequence mode');
+            mediaSourceReadyRef.current = true;
+            resolve();
+          } catch (error) {
+            clearTimeout(timeoutId);
+            reject(error);
+          }
+        });
 
-      audio.onerror = (error) => {
-        console.error('[Playback] Playback error:', error);
-        URL.revokeObjectURL(audioUrl);
-        playbackAudioRef.current = null;
+        mediaSource.addEventListener('error', () => {
+          clearTimeout(timeoutId);
+          reject(new Error('MediaSource error'));
+        });
+      });
 
-        // Try to continue despite error
-        if (isPlayingLiveRef.current) {
-          setTimeout(() => continuePlayback(), 500);
-        }
-      };
-
-      await audio.play();
+      return audio;
     } catch (error) {
-      console.error('[Playback] Failed to continue playback:', error);
-      // Try to recover
-      if (isPlayingLiveRef.current) {
-        setTimeout(() => continuePlayback(), 500);
-      }
+      console.error('[MediaSource] Initialization failed:', error);
+      cleanupMediaSource();
+      return null;
     }
-  }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser]);
+  }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser, cleanupMediaSource]);
 
+  // Continue playing (for live streaming effect)
   // Start live playback from recorded chunks
   const startPlayback = useCallback(async () => {
     try {
@@ -817,34 +884,47 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
 
       if (recordedChunksRef.current.length === 0) {
-        console.warn('[Playback] No recorded chunks available yet - recording may not have started');
+        console.warn('[Playback] No recorded chunks available yet');
         return;
       }
 
-      // Stop any existing playback
-      if (playbackAudioRef.current) {
-        playbackAudioRef.current.pause();
-        playbackAudioRef.current = null;
+      console.log('[Playback] 🔴 Starting MediaSource LIVE STREAM playback');
+
+      // Initialize MediaSource
+      const audio = await initializeMediaSource();
+      if (!audio) {
+        console.error('[Playback] Failed to initialize MediaSource');
+        return;
       }
 
-      // Enable live playback mode
+      // Mark as playing
       isPlayingLiveRef.current = true;
-      playbackPositionRef.current = 0; // Start from beginning
 
-      console.log(`[Playback] 🔴 Starting LIVE STREAM playback`);
+      // Append all existing chunks (recorded before playback started)
+      debugLog(`[Playback] Appending ${recordedChunksRef.current.length} existing chunks from buffer`);
+      for (const chunk of recordedChunksRef.current) {
+        await appendChunkToSourceBuffer(chunk);
+      }
 
-      addLog({
-        type: "audio_detected",
-        message: `Started live playback streaming (${recordedChunksRef.current.length} initial chunks)`,
-      });
+      // Start audio playback
+      try {
+        await audio.play();
+        console.log('[Playback] ✓ MediaSource playback started successfully');
 
-      // Start the live playback loop
-      await continuePlayback();
+        addLog({
+          type: "audio_detected",
+          message: `Started MediaSource streaming (${recordedChunksRef.current.length} chunks from beginning)`,
+        });
+      } catch (playError) {
+        console.error('[Playback] Audio.play() failed:', playError);
+      }
+
     } catch (error) {
       console.error('[Playback] Failed to start playback:', error);
       isPlayingLiveRef.current = false;
+      cleanupMediaSource();
     }
-  }, [playbackEnabled, addLog, continuePlayback]);
+  }, [playbackEnabled, addLog, initializeMediaSource, appendChunkToSourceBuffer, cleanupMediaSource]);
 
   // Stop playback
   const stopPlayback = useCallback(() => {
@@ -861,8 +941,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Stop current audio
     if (playbackAudioRef.current) {
       playbackAudioRef.current.pause();
+      playbackAudioRef.current.src = ''; // Clear MediaSource URL
       playbackAudioRef.current = null;
     }
+
+    // Clean up MediaSource
+    cleanupMediaSource();
 
     // Clean up AudioContext
     if (playbackAudioContextRef.current) {
@@ -876,7 +960,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       type: "audio_silent",
       message: "Stopped live playback stream",
     });
-  }, [addLog, stopPlaybackLevelTracking]);
+  }, [addLog, stopPlaybackLevelTracking, cleanupMediaSource]);
 
   // Update gain when volume changes
   useEffect(() => {
@@ -2860,10 +2944,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       playbackAudioRef.current = null;
     }
 
+    // Clean up MediaSource if active
+    cleanupMediaSource();
+
     // Reset continuous recording flag
     continuousRecordingRef.current = false;
     validRecordingStartIndexRef.current = 0;
-  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
+  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog, cleanupMediaSource]);
 
   const setVolume = useCallback((vol: number) => {
     setVolumeState(vol);
