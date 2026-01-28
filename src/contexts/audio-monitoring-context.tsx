@@ -2141,18 +2141,27 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             // This ensures device is actually ready before audio plays
             await waitForPagingReady();
 
-            // NEW: Start playback AFTER paging device is confirmed ready
+            // CRITICAL: Start volume ramp BEFORE playback!
+            // This ensures speakers are audible when audio starts playing
+            if (rampEnabled) {
+              debugLog('[AudioMonitoring] Ramp ENABLED - Starting volume ramp');
+              startVolumeRamp();
+
+              // Wait for volume to reach audible level before starting playback
+              // Ramp takes 5-6 seconds, wait for ~1 second to reach ~20% volume
+              if (playbackEnabled) {
+                debugLog('[AudioMonitoring] Waiting 1s for volume to ramp up before starting playback...');
+                await new Promise(resolve => setTimeout(resolve, 1000));
+              }
+            } else {
+              debugLog('[AudioMonitoring] Ramp DISABLED - Speakers already at operating volume, no ramp needed');
+            }
+
+            // NEW: Start playback AFTER volume has ramped up (or immediately if ramp disabled)
             if (playbackEnabled) {
               await startPlayback();
             }
 
-            // Then ramp the volume (only if ramp enabled)
-            if (rampEnabled) {
-              debugLog('[AudioMonitoring] Ramp ENABLED - Starting volume ramp');
-              startVolumeRamp();
-            } else {
-              debugLog('[AudioMonitoring] Ramp DISABLED - Speakers already at operating volume, no ramp needed');
-            }
             controllingSpakersRef.current = false;
           })();
         }
