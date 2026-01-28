@@ -347,6 +347,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const isAppendingRef = useRef<boolean>(false);
   const hasInitSegmentRef = useRef<boolean>(false);
   const mediaSourceReadyRef = useRef<boolean>(false);
+  const streamingRecorderRef = useRef<MediaRecorder | null>(null); // Separate recorder for MediaSource streaming
 
   const {
     isCapturing,
@@ -890,43 +891,28 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       console.log('[Playback] 🔴 Starting MediaSource LIVE STREAM playback');
 
-      // CRITICAL FIX: Restart MediaRecorder to get fresh initialization segments for MediaSource
-      // Historical chunks are kept for recording, but MediaSource needs clean segments
-      const mediaRecorder = mediaRecorderRef.current;
-      if (mediaRecorder && mediaRecorder.state === 'recording') {
-        debugLog('[Playback] Restarting MediaRecorder to generate fresh initialization segment for MediaSource');
+      // Create a SEPARATE MediaRecorder just for MediaSource streaming
+      // This ensures we get proper initialization segments without disrupting the main recording
+      if (monitoringStream) {
+        debugLog('[Playback] Creating dedicated MediaRecorder for MediaSource streaming');
 
-        // Stop current recorder (keep chunks for upload)
-        mediaRecorder.stop();
+        const mimeType = getBestAudioMimeType();
+        const streamingRecorder = new MediaRecorder(monitoringStream, {
+          mimeType,
+          audioBitsPerSecond: 128000,
+        });
 
-        // Wait a bit for stop to complete
-        await new Promise(resolve => setTimeout(resolve, 100));
+        streamingRecorderRef.current = streamingRecorder;
 
-        // Restart with same stream
-        if (monitoringStream) {
-          const mimeType = getBestAudioMimeType();
-          const newRecorder = new MediaRecorder(monitoringStream, {
-            mimeType,
-            audioBitsPerSecond: 128000,
-          });
+        // Setup ondataavailable to feed ONLY MediaSource (not the main recording)
+        streamingRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0 && mediaSourceReadyRef.current) {
+            appendChunkToSourceBuffer(event.data);
+          }
+        };
 
-          mediaRecorderRef.current = newRecorder;
-
-          // Setup ondataavailable to feed MediaSource
-          newRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0) {
-              recordedChunksRef.current.push(event.data);
-
-              // Append to MediaSource if playback is active
-              if (playbackEnabled && isPlayingLiveRef.current && mediaSourceReadyRef.current) {
-                appendChunkToSourceBuffer(event.data);
-              }
-            }
-          };
-
-          newRecorder.start(100); // 100ms chunks
-          debugLog('[Playback] MediaRecorder restarted with fresh initialization segment');
-        }
+        streamingRecorder.start(100); // 100ms chunks
+        debugLog('[Playback] Streaming MediaRecorder started (parallel to main recording)');
       }
 
       // Initialize MediaSource
@@ -939,12 +925,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Mark as playing
       isPlayingLiveRef.current = true;
 
-      debugLog(`[Playback] MediaSource ready - new chunks will stream as they arrive (${recordedChunksRef.current.length} total chunks recorded)`);
+      debugLog(`[Playback] MediaSource ready - streaming from dedicated recorder (${recordedChunksRef.current.length} chunks in main recording)`);
 
       // Start audio playback (first chunk will arrive within 100ms)
       try {
         await audio.play();
-        console.log('[Playback] ✓ MediaSource playback started - waiting for new chunks from fresh MediaRecorder');
+        console.log('[Playback] ✓ MediaSource playback started - streaming live audio');
 
         addLog({
           type: "audio_detected",
@@ -972,6 +958,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
     // Stop audio level tracking
     stopPlaybackLevelTracking();
+
+    // Stop streaming MediaRecorder
+    if (streamingRecorderRef.current && streamingRecorderRef.current.state !== 'inactive') {
+      streamingRecorderRef.current.stop();
+      streamingRecorderRef.current = null;
+      debugLog('[Playback] Stopped streaming MediaRecorder');
+    }
 
     // Stop current audio
     if (playbackAudioRef.current) {
@@ -2719,16 +2712,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               speakersEnabledTimeRef.current = null;
 
               (async () => {
-                // Stop recording and upload (happens at audio end + disable delay)
-                const recordingUrl = await stopRecordingAndUpload();
+                let recordingUrl: string | null = null;
 
-                // Reset continuous recording flag for next call
-                continuousRecordingRef.current = false;
-                validRecordingStartIndexRef.current = 0;
+                if (playbackEnabled && isPlayingLiveRef.current) {
+                  // NEW FLOW: When live playback is active, DON'T stop recording yet!
+                  // MediaSource needs continuous chunks from the MediaRecorder
+                  debugLog('[AudioMonitoring] Live playback active - keeping MediaRecorder running for streaming...');
+                } else {
+                  // Stop recording and upload (happens at audio end + disable delay)
+                  recordingUrl = await stopRecordingAndUpload();
+
+                  // Reset continuous recording flag for next call
+                  continuousRecordingRef.current = false;
+                  validRecordingStartIndexRef.current = 0;
+                }
 
                 if (playbackEnabled) {
-                  // NEW FLOW: When live playback is enabled, wait for playback to finish before shutdown
-                  debugLog('[AudioMonitoring] Live playback enabled - recording stopped, but keeping paging ON until playback finishes...');
+                  // Wait for playback to finish before shutdown
+                  debugLog('[AudioMonitoring] Live playback enabled - waiting for playback to finish before shutdown...');
 
                   // Wait for playback to complete with timeout safety mechanism
                   const checkPlaybackFinished = async () => {
@@ -2747,10 +2748,20 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   };
 
                   await checkPlaybackFinished();
-                  debugLog('[AudioMonitoring] Playback finished - now shutting down paging and speakers');
+                  debugLog('[AudioMonitoring] Playback finished - stopping playback and recording');
 
                   // NOW that playback is done, stop it
                   stopPlayback();
+
+                  // Stop and upload recording (if not already done)
+                  if (!recordingUrl && mediaRecorderRef.current) {
+                    debugLog('[AudioMonitoring] Stopping MediaRecorder and uploading recording after playback');
+                    recordingUrl = await stopRecordingAndUpload();
+
+                    // Reset continuous recording flag for next call
+                    continuousRecordingRef.current = false;
+                    validRecordingStartIndexRef.current = 0;
+                  }
                 } else {
                   // Original flow: Stop playback immediately (if it was running)
                   stopPlayback();
