@@ -411,14 +411,22 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   // Start recording audio
   const startRecording = useCallback(async () => {
     try {
-      if (!recordingEnabled) {
-        debugLog('[Recording] Recording is disabled, skipping');
+      // Recording is required if EITHER recording OR playback is enabled
+      if (!recordingEnabled && !playbackEnabled) {
+        debugLog('[Recording] Recording and playback both disabled, skipping');
         return;
       }
 
       if (!user) {
         console.warn('[Recording] No user authenticated, skipping recording');
         return;
+      }
+
+      // Log why we're recording
+      if (playbackEnabled && !recordingEnabled) {
+        debugLog('[Recording] Recording for playback only (not saving to Firebase)');
+      } else if (recordingEnabled) {
+        debugLog('[Recording] Recording to save to Firebase');
       }
 
       // REUSE the monitoring stream instead of creating a new one
@@ -481,7 +489,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     } catch (error) {
       console.error('[Recording] Failed to start recording:', error);
     }
-  }, [recordingEnabled, user, monitoringStream, getBestAudioMimeType]);
+  }, [recordingEnabled, playbackEnabled, user, monitoringStream, getBestAudioMimeType]);
 
   // Stop recording and upload to Firebase (unless playback is enabled - then it's temporary only)
   const stopRecordingAndUpload = useCallback(async (): Promise<string | null> => {
@@ -507,9 +515,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               return;
             }
 
-            // Check if playback is enabled - if so, skip Firebase upload (temporary recording only)
-            if (playbackEnabled) {
-              console.log(`[Recording] Playback enabled - skipping Firebase upload (${audioBlob.size} bytes recorded for playback only)`);
+            // Check if recording is enabled - if NOT, this was temporary for playback only
+            if (!recordingEnabled) {
+              console.log(`[Recording] Recording disabled - skipping Firebase upload (${audioBlob.size} bytes recorded for playback only)`);
 
               // Clean up temporary recording
               recordedChunksRef.current = [];
@@ -568,7 +576,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         resolve(null);
       }
     });
-  }, [user, playbackEnabled]);
+  }, [user, recordingEnabled]);
 
   // Setup AudioContext and Analyser (only once)
   const setupPlaybackAudioContext = useCallback(() => {
@@ -2134,7 +2142,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 // Log with recording URL if available
                 const recordingStatus = recordingUrl
                   ? ' 🎙️ Recording saved'
-                  : (playbackEnabled ? ' 🎵 Playback only (not saved)' : '');
+                  : (!recordingEnabled ? ' 🎵 Playback only (not saved)' : '');
 
                 addLog({
                   type: "volume_change",

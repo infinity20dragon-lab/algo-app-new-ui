@@ -733,6 +733,14 @@ export default function LiveBroadcastPage() {
                   <p className="text-xs text-[var(--text-muted)]">
                     Wait before disabling speakers after silence
                   </p>
+                  {displayedPlaybackEnabled && displayedDisableDelay < 4000 && (
+                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-blue)]/10 border border-[var(--accent-blue)]/30">
+                      <span className="text-xs">💡</span>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        <strong>Tip:</strong> With live playback enabled, we recommend 4-6 seconds to ensure full audio playback before shutdown.
+                      </p>
+                    </div>
+                  )}
                 </div>
               </CardContent>
             </Card>
@@ -902,9 +910,11 @@ export default function LiveBroadcastPage() {
 
                 <div className="flex items-center justify-between p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
                   <div>
-                    <Label className="!text-[var(--text-primary)]">Audio Recording</Label>
+                    <Label className="!text-[var(--text-primary)]">Save Recording</Label>
                     <p className="text-xs text-[var(--text-muted)]">
-                      {displayedRecordingEnabled ? "Record and upload audio clips (MP3)" : "Disabled to save storage"}
+                      {displayedRecordingEnabled
+                        ? "Save audio clips to Firebase Storage"
+                        : "Temporary only - recordings not saved"}
                     </p>
                   </div>
                   <Switch checked={displayedRecordingEnabled} onCheckedChange={setRecordingEnabled} />
@@ -915,8 +925,8 @@ export default function LiveBroadcastPage() {
                     <Label className="!text-[var(--text-primary)]">Live Playback</Label>
                     <p className="text-xs text-[var(--text-muted)]">
                       {displayedPlaybackEnabled
-                        ? "Stream audio to paging system in real-time"
-                        : "Disabled - only record (no playback)"}
+                        ? "Play recorded audio through system in real-time"
+                        : "Disabled - no live playback"}
                     </p>
                   </div>
                   <Switch
