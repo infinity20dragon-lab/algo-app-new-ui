@@ -1627,7 +1627,89 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             console.warn(`[AudioMonitoring] Proceeding with mode change anyway...`);
           }
 
-          // Proceed with mode change
+          // Proceed with mode change (with retry logic for stuck devices)
+          let retryCount = 0;
+          const maxRetries = 3;
+          let success = false;
+          let lastError: any = null;
+
+          while (retryCount < maxRetries && !success) {
+            try {
+              if (retryCount > 0) {
+                console.warn(`[AudioMonitoring] Retry ${retryCount}/${maxRetries} for ${paging.name} mode change...`);
+                // Wait 500ms between retries
+                await new Promise(resolve => setTimeout(resolve, 500));
+              }
+
+              const response = await fetch("/api/algo/speakers/mcast", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  speakers: [{
+                    ipAddress: paging.ipAddress,
+                    password: paging.apiPassword,
+                    authMethod: paging.authMethod,
+                  }],
+                  mode,
+                }),
+              });
+
+              if (response.ok) {
+                success = true;
+                debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to mode ${mode}${retryCount > 0 ? ` (after ${retryCount} retries)` : ''}`);
+                addLog({
+                  type: "speakers_enabled",
+                  message: `Paging ${paging.name} mode ${mode} activated${retryCount > 0 ? ` (after ${retryCount} retries)` : ''}`,
+                });
+              } else {
+                lastError = `HTTP ${response.status}`;
+                console.error(`[AudioMonitoring] Failed to set ${paging.name} mode: HTTP ${response.status}`);
+                retryCount++;
+              }
+            } catch (error) {
+              lastError = error;
+              console.error(`[AudioMonitoring] Error setting ${paging.name} mode:`, error);
+              retryCount++;
+            }
+          }
+
+          // If all retries failed, log warning
+          if (!success) {
+            console.error(`[AudioMonitoring] 🚨 FAILED to set ${paging.name} to mode ${mode} after ${maxRetries} attempts!`);
+            addLog({
+              type: "speakers_disabled",
+              message: `⚠️ WARNING: Failed to change ${paging.name} mode - device may be stuck! Error: ${lastError}`,
+            });
+          }
+        } catch (error) {
+          console.error(`Failed to set ${paging.name} multicast mode:`, error);
+        }
+      })
+    );
+  }, [devices, selectedDevices, addLog]);
+
+  // Wait for paging device to be ready by polling until mcast.mode = 1
+  const waitForPagingReady = useCallback(async (): Promise<boolean> => {
+    // CRITICAL: Only poll SELECTED paging devices, not all paging devices!
+    const pagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
+    );
+
+    if (pagingDevices.length === 0) {
+      console.warn('[AudioMonitoring] No selected paging devices to poll');
+      return false;
+    }
+
+    const paging = pagingDevices[0]; // Use first paging device
+    const maxAttempts = 2; // Try polling twice (with one retry if stuck)
+    let attemptNum = 0;
+
+    while (attemptNum < maxAttempts) {
+      if (attemptNum > 0) {
+        console.warn(`[AudioMonitoring] 🔄 Retry attempt ${attemptNum}/${maxAttempts - 1} - Re-sending mode change command...`);
+
+        // Try to force the mode change again
+        try {
           await fetch("/api/algo/speakers/mcast", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1637,76 +1719,74 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 password: paging.apiPassword,
                 authMethod: paging.authMethod,
               }],
-              mode,
+              mode: 1,
             }),
           });
-          debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to mode ${mode}`);
-          addLog({
-            type: "speakers_enabled",
-            message: `Paging ${paging.name} mode ${mode} activated`,
-          });
+          debugLog('[AudioMonitoring] Re-sent mode change command');
         } catch (error) {
-          console.error(`Failed to set ${paging.name} multicast mode:`, error);
+          console.error('[AudioMonitoring] Failed to re-send mode change:', error);
         }
-      })
-    );
-  }, [devices, selectedDevices, addLog]);
 
-  // Wait for paging device to be ready by polling until mcast.mode = 1
-  const waitForPagingReady = useCallback(async (): Promise<void> => {
-    // CRITICAL: Only poll SELECTED paging devices, not all paging devices!
-    const pagingDevices = devices.filter(d =>
-      d.type === "8301" && selectedDevices.includes(d.id)
-    );
-
-    if (pagingDevices.length === 0) {
-      console.warn('[AudioMonitoring] No selected paging devices to poll');
-      return;
-    }
-
-    const paging = pagingDevices[0]; // Use first paging device
-    const startTime = Date.now();
-    const maxWaitMs = 5000; // Maximum 5 seconds
-    const pollInterval = 200; // Check every 200ms
-
-    debugLog(`[AudioMonitoring] 🔄 Polling ${paging.name} until mcast.mode = 1...`);
-
-    while (Date.now() - startTime < maxWaitMs) {
-      try {
-        // Poll the mcast.mode setting
-        const response = await fetch("/api/algo/settings/get", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ipAddress: paging.ipAddress,
-            password: paging.apiPassword,
-            authMethod: paging.authMethod,
-            setting: "mcast.mode",
-          }),
-        });
-
-        if (response.ok) {
-          const data = await response.json();
-          const currentMode = data.value;
-
-          if (currentMode === "1") {
-            const elapsed = Date.now() - startTime;
-            debugLog(`[AudioMonitoring] ✅ Paging device ready! Mode = 1 after ${elapsed}ms`);
-            return; // Device is ready!
-          }
-
-          debugLog(`[AudioMonitoring] ⏳ Mode = ${currentMode}, waiting... (${Date.now() - startTime}ms)`);
-        }
-      } catch (error) {
-        debugLog(`[AudioMonitoring] Polling error: ${error}`);
+        // Wait 1 second before polling again
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
-      await new Promise(resolve => setTimeout(resolve, pollInterval));
+      const startTime = Date.now();
+      const maxWaitMs = 5000; // Maximum 5 seconds per attempt
+      const pollInterval = 200; // Check every 200ms
+
+      debugLog(`[AudioMonitoring] 🔄 Polling ${paging.name} until mcast.mode = 1... (attempt ${attemptNum + 1}/${maxAttempts})`);
+
+      while (Date.now() - startTime < maxWaitMs) {
+        try {
+          // Poll the mcast.mode setting
+          const response = await fetch("/api/algo/settings/get", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ipAddress: paging.ipAddress,
+              password: paging.apiPassword,
+              authMethod: paging.authMethod,
+              setting: "mcast.mode",
+            }),
+          });
+
+          if (response.ok) {
+            const data = await response.json();
+            const currentMode = data.value;
+
+            if (currentMode === "1") {
+              const elapsed = Date.now() - startTime;
+              debugLog(`[AudioMonitoring] ✅ Paging device ready! Mode = 1 after ${elapsed}ms${attemptNum > 0 ? ` (retry ${attemptNum} succeeded)` : ''}`);
+              return true; // Device is ready!
+            }
+
+            debugLog(`[AudioMonitoring] ⏳ Mode = ${currentMode}, waiting... (${Date.now() - startTime}ms)`);
+          }
+        } catch (error) {
+          debugLog(`[AudioMonitoring] Polling error: ${error}`);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      }
+
+      // Timeout for this attempt
+      attemptNum++;
+      if (attemptNum >= maxAttempts) {
+        // All attempts failed - device is stuck!
+        console.error(`[AudioMonitoring] 🚨 PAGING DEVICE STUCK! Failed to reach mode 1 after ${maxAttempts} attempts (${maxWaitMs * maxAttempts / 1000}s total)`);
+        addLog({
+          type: "speakers_disabled",
+          message: `⚠️ CRITICAL: Paging device ${paging.name} not responding after ${maxAttempts} attempts - device needs reboot!`,
+        });
+        return false;
+      }
+
+      console.warn(`[AudioMonitoring] ⚠️ Attempt ${attemptNum} timed out after ${maxWaitMs}ms, device may be stuck...`);
     }
 
-    // Timeout - proceed anyway
-    console.warn(`[AudioMonitoring] ⚠️ Timeout waiting for paging device, proceeding anyway after ${maxWaitMs}ms`);
-  }, [devices, selectedDevices]);
+    return false;
+  }, [devices, selectedDevices, addLog]);
 
   // Wait for paging device to turn OFF by polling until mcast.mode = 0
   const waitForPagingOff = useCallback(async (): Promise<void> => {
@@ -1760,9 +1840,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       await new Promise(resolve => setTimeout(resolve, pollInterval));
     }
 
-    // Timeout - proceed anyway
-    console.warn(`[AudioMonitoring] ⚠️ Timeout waiting for paging device to turn OFF, proceeding anyway after ${maxWaitMs}ms`);
-  }, [devices, selectedDevices]);
+    // Timeout - device might be stuck!
+    console.error(`[AudioMonitoring] 🚨 PAGING DEVICE STUCK! Failed to reach mode 0 after ${maxWaitMs}ms`);
+    addLog({
+      type: "speakers_disabled",
+      message: `⚠️ WARNING: Paging device ${paging.name} stuck ON - may need reboot!`,
+    });
+  }, [devices, selectedDevices, addLog]);
 
   // Set all speakers multicast mode (0=disabled, 1=transmitter, 2=receiver)
   const setSpeakersMulticast = useCallback(async (mode: 0 | 1 | 2) => {
@@ -2275,7 +2359,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
             // NEW: Wait for paging device to be ready (poll until mcast.mode = 1)
             // This ensures device is actually ready before audio plays
-            await waitForPagingReady();
+            const pagingReady = await waitForPagingReady();
+            if (!pagingReady) {
+              console.warn('[AudioMonitoring] ⚠️ Paging device not ready, but continuing with audio capture...');
+              addLog({
+                type: "speakers_disabled",
+                message: "⚠️ Paging device stuck - audio will be recorded but may not transmit to paging system",
+              });
+            }
 
             // CRITICAL: Start volume ramp BEFORE playback!
             // This ensures speakers are audible when audio starts playing
