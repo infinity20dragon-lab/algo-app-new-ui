@@ -146,6 +146,8 @@ interface AudioMonitoringContextType {
   // Playback
   playbackEnabled: boolean;
   setPlaybackEnabled: (enabled: boolean) => void;
+  playbackDelay: number;
+  setPlaybackDelay: (delay: number) => void;
 
   // Emergency Controls
   emergencyKillAll: () => Promise<void>;
@@ -260,6 +262,7 @@ const STORAGE_KEYS = {
   LOGGING_ENABLED: 'algo_live_logging_enabled',
   RECORDING_ENABLED: 'algo_live_recording_enabled',
   PLAYBACK_ENABLED: 'algo_live_playback_enabled',
+  PLAYBACK_DELAY: 'algo_live_playback_delay',
   LAST_CONSOLE_CLEAR: 'algo_live_last_console_clear',
 };
 
@@ -281,6 +284,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [loggingEnabled, setLoggingEnabledState] = useState(true); // enabled by default
   const [recordingEnabled, setRecordingEnabledState] = useState(false); // disabled by default to save storage
   const [playbackEnabled, setPlaybackEnabledState] = useState(false); // disabled by default
+  const [playbackDelay, setPlaybackDelayState] = useState(500); // 500ms default (wait after paging ready before playback)
 
   // Volume mode
   const [useGlobalVolume, setUseGlobalVolumeState] = useState(false);
@@ -933,6 +937,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       if (savedPlaybackEnabled !== null) {
         setPlaybackEnabledState(savedPlaybackEnabled === 'true');
       }
+      const savedPlaybackDelay = localStorage.getItem(STORAGE_KEYS.PLAYBACK_DELAY);
+      if (savedPlaybackDelay !== null) {
+        setPlaybackDelayState(parseInt(savedPlaybackDelay));
+      }
 
       // Mark as restored
       setTimeout(() => {
@@ -1061,6 +1069,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Saving playback enabled:', playbackEnabled);
     localStorage.setItem(STORAGE_KEYS.PLAYBACK_ENABLED, playbackEnabled.toString());
   }, [playbackEnabled]);
+
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving playback delay:', playbackDelay);
+    localStorage.setItem(STORAGE_KEYS.PLAYBACK_DELAY, playbackDelay.toString());
+  }, [playbackDelay]);
 
   // Daily console clear for long-running sessions (clears at midnight PST)
   useEffect(() => {
@@ -2146,18 +2160,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             if (rampEnabled) {
               debugLog('[AudioMonitoring] Ramp ENABLED - Starting volume ramp');
               startVolumeRamp();
-
-              // Wait for volume to reach audible level before starting playback
-              // Ramp takes 5-6 seconds, wait for ~1 second to reach ~20% volume
-              if (playbackEnabled) {
-                debugLog('[AudioMonitoring] Waiting 1s for volume to ramp up before starting playback...');
-                await new Promise(resolve => setTimeout(resolve, 1000));
-              }
             } else {
               debugLog('[AudioMonitoring] Ramp DISABLED - Speakers already at operating volume, no ramp needed');
             }
 
-            // NEW: Start playback AFTER volume has ramped up (or immediately if ramp disabled)
+            // NEW: Wait for playback delay (configurable) before starting playback
+            // This gives paging device time to fully initialize and volume to ramp up
+            if (playbackEnabled && playbackDelay > 0) {
+              debugLog(`[AudioMonitoring] Waiting ${playbackDelay}ms (playback delay) before starting playback...`);
+              await new Promise(resolve => setTimeout(resolve, playbackDelay));
+            }
+
+            // NEW: Start playback AFTER delay
             if (playbackEnabled) {
               await startPlayback();
             }
@@ -2208,11 +2222,29 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               speakersEnabledTimeRef.current = null;
 
               (async () => {
-                // Stop playback first
-                stopPlayback();
-
-                // Stop recording and upload
+                // Stop recording and upload (happens at audio end + disable delay)
                 const recordingUrl = await stopRecordingAndUpload();
+
+                if (playbackEnabled) {
+                  // NEW FLOW: When live playback is enabled, wait for playback to finish before shutdown
+                  debugLog('[AudioMonitoring] Live playback enabled - recording stopped, but keeping paging ON until playback finishes...');
+
+                  // Wait for playback to complete
+                  const checkPlaybackFinished = async () => {
+                    while (isPlayingLiveRef.current) {
+                      await new Promise(resolve => setTimeout(resolve, 100)); // Check every 100ms
+                    }
+                  };
+
+                  await checkPlaybackFinished();
+                  debugLog('[AudioMonitoring] Playback finished - now shutting down paging and speakers');
+
+                  // NOW that playback is done, stop it and shutdown everything
+                  stopPlayback();
+                } else {
+                  // Original flow: Stop playback immediately (if it was running)
+                  stopPlayback();
+                }
 
                 // Disable PoE devices (lights, etc.) in auto mode
                 await controlPoEDevices(false);
@@ -2245,13 +2277,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   ? ' 🎙️ Recording saved'
                   : (!recordingEnabled ? ' 🎵 Playback only (not saved)' : '');
 
+                const shutdownMessage = playbackEnabled
+                  ? `Paging OFF after playback completed (duration: ${duration}s)${recordingStatus}`
+                  : rampEnabled
+                    ? `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingStatus}`
+                    : `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - Speakers stay at operating volume${recordingStatus}`;
+
                 addLog({
                   type: "volume_change",
                   speakersEnabled: true, // Speakers STAY in mode 2 (ready)
                   volume: rampEnabled ? 0 : targetVolume,
-                  message: rampEnabled
-                    ? `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingStatus}`
-                    : `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - Speakers stay at operating volume${recordingStatus}`,
+                  message: shutdownMessage,
                   recordingUrl: recordingUrl || undefined,
                 });
 
@@ -2263,7 +2299,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, startPlayback, stopPlayback, rampEnabled, waitForPagingReady]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, playbackDelay, startPlayback, stopPlayback, rampEnabled, waitForPagingReady, recordingEnabled]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -2475,6 +2511,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Playback mode:', enabled ? 'ENABLED' : 'DISABLED');
   }, []);
 
+  const setPlaybackDelay = useCallback((delay: number) => {
+    setPlaybackDelayState(delay);
+    debugLog('[AudioMonitoring] Playback delay set to:', `${delay}ms`);
+  }, []);
+
   const clearLogs = useCallback(() => {
     setLogs([]);
     debugLog('[AudioLog] Logs cleared');
@@ -2546,6 +2587,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setRecordingEnabled,
         playbackEnabled,
         setPlaybackEnabled,
+        playbackDelay,
+        setPlaybackDelay,
         emergencyKillAll,
         emergencyEnableAll,
         controlSingleSpeaker,

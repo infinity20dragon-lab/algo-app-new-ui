@@ -88,6 +88,8 @@ export default function LiveBroadcastPage() {
     setRecordingEnabled,
     playbackEnabled,
     setPlaybackEnabled,
+    playbackDelay,
+    setPlaybackDelay,
     devices: contextDevices,
     setDevices: setContextDevices,
     setPoeDevices,
@@ -120,6 +122,7 @@ export default function LiveBroadcastPage() {
   const displayedNightRampDuration = displayState?.nightRampDuration ?? nightRampDuration;
   const displayedSustainDuration = displayState?.sustainDuration ?? sustainDuration;
   const displayedDisableDelay = displayState?.disableDelay ?? disableDelay;
+  const displayedPlaybackDelay = displayState?.playbackDelay ?? playbackDelay;
   const displayedSelectedDevices = displayState?.selectedDevices ?? (selectedDevices || []);
   const displayedLoggingEnabled = displayState?.loggingEnabled ?? loggingEnabled;
   const displayedRecordingEnabled = displayState?.recordingEnabled ?? recordingEnabled;
@@ -733,15 +736,33 @@ export default function LiveBroadcastPage() {
                   <p className="text-xs text-[var(--text-muted)]">
                     Wait before disabling speakers after silence
                   </p>
-                  {displayedPlaybackEnabled && displayedDisableDelay < 4000 && (
-                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-blue)]/10 border border-[var(--accent-blue)]/30">
-                      <span className="text-xs">💡</span>
+                </div>
+
+                {/* Playback Delay - Only show when playback is enabled */}
+                {displayedPlaybackEnabled && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Playback Delay</Label>
+                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedPlaybackDelay / 1000).toFixed(1)}s</span>
+                    </div>
+                    <Slider
+                      min={0}
+                      max={3000}
+                      step={100}
+                      value={displayedPlaybackDelay}
+                      onChange={(e) => setPlaybackDelay(parseInt(e.target.value))}
+                    />
+                    <p className="text-xs text-[var(--text-muted)]">
+                      Wait after paging device is ready before starting playback
+                    </p>
+                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-green)]/10 border border-[var(--accent-green)]/30">
+                      <span className="text-xs">✅</span>
                       <p className="text-xs text-[var(--text-secondary)]">
-                        <strong>Tip:</strong> With live playback enabled, we recommend 4-6 seconds to ensure full audio playback before shutdown.
+                        <strong>Smart Shutdown:</strong> With live playback enabled, paging will stay ON until playback completes (disable delay can be 0!)
                       </p>
                     </div>
-                  )}
-                </div>
+                  </div>
+                )}
               </CardContent>
             </Card>
 

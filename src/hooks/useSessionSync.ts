@@ -32,6 +32,8 @@ export function useSessionSync() {
     nightRampDuration,
     loggingEnabled,
     recordingEnabled,
+    playbackEnabled,
+    playbackDelay,
     audioLevel,
     audioDetected,
     speakersEnabled,
@@ -53,6 +55,8 @@ export function useSessionSync() {
     setNightRampDuration,
     setLoggingEnabled,
     setRecordingEnabled,
+    setPlaybackEnabled,
+    setPlaybackDelay,
   } = useAudioMonitoring();
 
   const isApplyingRemoteUpdate = useRef(false);
@@ -86,6 +90,8 @@ export function useSessionSync() {
     if (nightRampDuration !== undefined) stateToSync.nightRampDuration = nightRampDuration;
     if (loggingEnabled !== undefined) stateToSync.loggingEnabled = loggingEnabled;
     if (recordingEnabled !== undefined) stateToSync.recordingEnabled = recordingEnabled;
+    if (playbackEnabled !== undefined) stateToSync.playbackEnabled = playbackEnabled;
+    if (playbackDelay !== undefined) stateToSync.playbackDelay = playbackDelay;
     if (audioLevel !== undefined) stateToSync.audioLevel = audioLevel;
     if (audioDetected !== undefined) stateToSync.audioDetected = audioDetected;
     if (speakersEnabled !== undefined) stateToSync.speakersEnabled = speakersEnabled;
@@ -109,6 +115,8 @@ export function useSessionSync() {
     nightRampDuration,
     loggingEnabled,
     recordingEnabled,
+    playbackEnabled,
+    playbackDelay,
     audioLevel,
     audioDetected,
     speakersEnabled,
@@ -215,6 +223,14 @@ export function useSessionSync() {
 
     if (sessionState.recordingEnabled !== undefined && sessionState.recordingEnabled !== recordingEnabled) {
       setRecordingEnabled(sessionState.recordingEnabled);
+    }
+
+    if (sessionState.playbackEnabled !== undefined && sessionState.playbackEnabled !== playbackEnabled) {
+      setPlaybackEnabled(sessionState.playbackEnabled);
+    }
+
+    if (sessionState.playbackDelay !== undefined && sessionState.playbackDelay !== playbackDelay) {
+      setPlaybackDelay(sessionState.playbackDelay);
     }
 
     // Reset flag after applying updates - increased to 200ms to avoid race conditions
