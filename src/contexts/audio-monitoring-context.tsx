@@ -1688,6 +1688,79 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     );
   }, [devices, selectedDevices, addLog]);
 
+  // NEW: Set paging device zone (1-50) - avoids stuck device issues!
+  // Zone switching is more reliable than mode toggling (0/1)
+  const setPagingZone = useCallback(async (zone: number) => {
+    const pagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
+    );
+
+    if (pagingDevices.length === 0) {
+      debugLog('[AudioMonitoring] No selected paging devices found');
+      return;
+    }
+
+    debugLog(`[AudioMonitoring] Setting ${pagingDevices.length} paging device(s) to zone ${zone}...`);
+
+    await Promise.allSettled(
+      pagingDevices.map(async (paging) => {
+        try {
+          // Check current zone first to avoid redundant calls
+          try {
+            const checkResponse = await fetch("/api/algo/settings/get", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                ipAddress: paging.ipAddress,
+                password: paging.apiPassword,
+                authMethod: paging.authMethod,
+                setting: "mcast.tx.fixed",
+              }),
+            });
+
+            if (checkResponse.ok) {
+              const checkData = await checkResponse.json();
+              const currentZone = checkData.value;
+
+              if (currentZone === zone.toString()) {
+                debugLog(`[AudioMonitoring] ⏭️  ${paging.name} already at zone ${zone}, skipping`);
+                return;
+              }
+
+              debugLog(`[AudioMonitoring] ${paging.name} is zone ${currentZone}, changing to ${zone}...`);
+            }
+          } catch (checkError) {
+            console.warn(`[AudioMonitoring] Failed to check ${paging.name} zone:`, checkError);
+          }
+
+          // Change the zone
+          const response = await fetch("/api/algo/speakers/zone", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ipAddress: paging.ipAddress,
+              password: paging.apiPassword,
+              authMethod: paging.authMethod,
+              zone,
+            }),
+          });
+
+          if (response.ok) {
+            debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to zone ${zone}`);
+            addLog({
+              type: "speakers_enabled",
+              message: `Paging ${paging.name} zone ${zone} activated`,
+            });
+          } else {
+            console.error(`[AudioMonitoring] Failed to set ${paging.name} zone: HTTP ${response.status}`);
+          }
+        } catch (error) {
+          console.error(`Failed to set ${paging.name} zone:`, error);
+        }
+      })
+    );
+  }, [devices, selectedDevices, addLog]);
+
   // Wait for paging device to be ready by polling until mcast.mode = 1
   const waitForPagingReady = useCallback(async (): Promise<boolean> => {
     // CRITICAL: Only poll SELECTED paging devices, not all paging devices!
@@ -1787,6 +1860,61 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
     return false;
   }, [devices, selectedDevices, addLog]);
+
+  // NEW: Wait for paging zone to change by polling mcast.tx.fixed
+  const waitForPagingZoneReady = useCallback(async (targetZone: number): Promise<boolean> => {
+    const pagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
+    );
+
+    if (pagingDevices.length === 0) {
+      console.warn('[AudioMonitoring] No selected paging devices to poll');
+      return false;
+    }
+
+    const paging = pagingDevices[0]; // Use first paging device
+    const startTime = Date.now();
+    const maxWaitMs = 3000; // Maximum 3 seconds (zones switch faster than mode changes)
+    const pollInterval = 100; // Check every 100ms (faster polling for zones)
+
+    debugLog(`[AudioMonitoring] 🔄 Polling ${paging.name} until zone = ${targetZone}...`);
+
+    while (Date.now() - startTime < maxWaitMs) {
+      try {
+        const response = await fetch("/api/algo/settings/get", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ipAddress: paging.ipAddress,
+            password: paging.apiPassword,
+            authMethod: paging.authMethod,
+            setting: "mcast.tx.fixed",
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const currentZone = parseInt(data.value);
+
+          if (currentZone === targetZone) {
+            const elapsed = Date.now() - startTime;
+            debugLog(`[AudioMonitoring] ✅ Paging zone ready! Zone = ${targetZone} after ${elapsed}ms`);
+            return true;
+          }
+
+          debugLog(`[AudioMonitoring] ⏳ Zone = ${currentZone}, waiting for ${targetZone}... (${Date.now() - startTime}ms)`);
+        }
+      } catch (error) {
+        debugLog(`[AudioMonitoring] Polling error: ${error}`);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
+
+    // Timeout - zone didn't change
+    console.warn(`[AudioMonitoring] ⚠️ Zone change timeout after ${maxWaitMs}ms (wanted zone ${targetZone})`);
+    return false;
+  }, [devices, selectedDevices]);
 
   // Wait for paging device to turn OFF by polling until mcast.mode = 0
   const waitForPagingOff = useCallback(async (): Promise<void> => {
@@ -2314,7 +2442,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               audioLevel,
               speakersEnabled: true,
               volume: targetVolume,
-              message: `Speakers at operating volume ${targetVolume}% (paging mode 1 → speakers receive audio)`,
+              message: `Speakers at operating volume ${targetVolume}% (paging Zone 1 → speakers receive audio)`,
             });
           } else {
             addLog({
@@ -2322,7 +2450,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               audioLevel,
               speakersEnabled: true,
               volume: targetVolume,
-              message: `Volume ramping to ${targetVolume}% (paging mode 1 → speakers receive audio)`,
+              message: `Volume ramping to ${targetVolume}% (paging Zone 1 → speakers receive audio)`,
             });
           }
 
@@ -2344,27 +2472,19 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             // Enable PoE devices (lights, etc.) in auto mode
             await controlPoEDevices(true);
 
-            // NEW FLOW: Enable paging transmitter (mode 1) - INSTANT audio!
-            // Speakers are already in mode 2 (listening), so they'll receive immediately
-            const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
-            if (!alwaysKeepPagingOn) {
-              // Only toggle paging if not always on
-              debugLog('[AudioMonitoring] AUDIO DETECTED - Setting paging to mode 1 (transmitter)');
-              await setPagingMulticast(1);
-              pagingWasEnabledRef.current = true; // Track that we enabled paging
-            } else {
-              debugLog('[AudioMonitoring] AUDIO DETECTED - Paging already at mode 1 (always on)');
-              pagingWasEnabledRef.current = true; // Track that paging is enabled (always-on mode)
-            }
+            // NEW APPROACH: Switch paging to Zone 1 (speakers listening)
+            // Paging is already in mode 1 (transmitter), just switch channel
+            debugLog('[AudioMonitoring] AUDIO DETECTED - Switching paging to Zone 1 (active)');
+            await setPagingZone(1);
+            pagingWasEnabledRef.current = true; // Track that paging is active
 
-            // NEW: Wait for paging device to be ready (poll until mcast.mode = 1)
-            // This ensures device is actually ready before audio plays
-            const pagingReady = await waitForPagingReady();
-            if (!pagingReady) {
-              console.warn('[AudioMonitoring] ⚠️ Paging device not ready, but continuing with audio capture...');
+            // Wait for zone change to confirm (poll until zone = 1)
+            const zoneReady = await waitForPagingZoneReady(1);
+            if (!zoneReady) {
+              console.warn('[AudioMonitoring] ⚠️ Zone 1 not confirmed, but continuing with audio capture...');
               addLog({
                 type: "speakers_disabled",
-                message: "⚠️ Paging device stuck - audio will be recorded but may not transmit to paging system",
+                message: "⚠️ Paging zone change delayed - audio may have slight delay to paging system",
               });
             }
 
@@ -2510,24 +2630,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   return; // Exit shutdown immediately - paging stays ON
                 }
 
-                // NEW FLOW: Disable paging transmitter (mode 0) - NO MORE AUDIO!
-                // Speakers stay in mode 2 (listening), ready for next audio
-                const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
-                if (!alwaysKeepPagingOn) {
-                  // Only toggle paging if not always on
-                  debugLog('[AudioMonitoring] AUDIO ENDED - Setting paging to mode 0 (disabled)');
-                  await setPagingMulticast(0);
+                // NEW APPROACH: Switch paging back to Zone 2 (idle)
+                // Speakers stay in mode 2 (listening to Zone 1), ready for next audio
+                debugLog('[AudioMonitoring] AUDIO ENDED - Switching paging to Zone 2 (idle)');
+                await setPagingZone(2);
 
-                  // 🚨 CRITICAL: Wait for device to confirm mode 0 before proceeding!
-                  // This prevents race conditions when rapid calls happen (e.g., 1-2 second calls in quick succession)
-                  // Without this, a new call might try to set mode 1 while device is still transitioning to mode 0
-                  await waitForPagingOff();
+                // Wait for zone change to confirm
+                await waitForPagingZoneReady(2);
 
-                  pagingWasEnabledRef.current = false; // Mark paging as disabled
-                } else {
-                  debugLog('[AudioMonitoring] AUDIO ENDED - Keeping paging at mode 1 (always on)');
-                  // Keep pagingWasEnabledRef.current = true since it's still enabled
-                }
+                pagingWasEnabledRef.current = false; // Mark paging as idle
 
                 // Ramp down or keep at operating volume
                 const skipRampDown = shouldSkipRamping();
@@ -2547,10 +2658,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   : (!recordingEnabled ? ' 🎵 Playback only (not saved)' : '');
 
                 const shutdownMessage = playbackEnabled
-                  ? `Paging OFF after playback completed (duration: ${duration}s)${recordingStatus}`
+                  ? `Paging → Zone 2 (idle) after playback completed (duration: ${duration}s)${recordingStatus}`
                   : rampEnabled
-                    ? `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingStatus}`
-                    : `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - Speakers stay at operating volume${recordingStatus}`;
+                    ? `Paging → Zone 2 (idle) after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingStatus}`
+                    : `Paging → Zone 2 (idle) after ${disableDelay/1000}s silence (duration: ${duration}s) - Speakers stay at operating volume${recordingStatus}`;
 
                 addLog({
                   type: "volume_change",
@@ -2572,7 +2683,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, waitForPagingReady, recordingEnabled, shouldSkipRamping]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingZone, waitForPagingZoneReady, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, recordingEnabled, shouldSkipRamping]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -2615,25 +2726,26 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         // Wait briefly to ensure volume command is fully processed
         await new Promise(resolve => setTimeout(resolve, 200));
 
-        // Step 2: Set paging device mode (check settings)
-        const alwaysKeepPagingOn = getAlwaysKeepPagingOn();
-        if (alwaysKeepPagingOn) {
-          debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 1 (ALWAYS ON - transmitter)');
-          await setPagingMulticast(1);
-          pagingWasEnabledRef.current = true; // Track that paging is enabled
-        } else {
-          debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 0 (disabled - will toggle on audio)');
-          await setPagingMulticast(0);
+        // Step 2: NEW APPROACH - Use zones instead of mode toggling (avoids stuck device!)
+        // Set paging to mode 1 (always transmitting) and use zones to control
+        debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 1 (transmitter - always on)');
+        await setPagingMulticast(1);
 
-          // CRITICAL: Wait for paging device to actually turn OFF before proceeding
-          debugLog('[AudioMonitoring] Step 2.5: Waiting for paging device to confirm OFF (mode 0)...');
-          await waitForPagingOff();
+        // Step 2.5: Set paging to Zone 2 (idle - speakers only listen to Zone 1)
+        debugLog('[AudioMonitoring] Step 2.5: Setting paging to Zone 2 (idle state)');
+        await setPagingZone(2);
 
-          // pagingWasEnabledRef stays false - will be set to true when audio is detected
+        // Wait for zone change to confirm
+        debugLog('[AudioMonitoring] Step 2.6: Waiting for paging zone to confirm Zone 2...');
+        const zoneReady = await waitForPagingZoneReady(2);
+        if (!zoneReady) {
+          console.warn('[AudioMonitoring] ⚠️ Zone 2 not confirmed, but continuing...');
         }
 
-        // Step 3: Set all speakers to mode 2 (receiver - ready to listen)
-        debugLog('[AudioMonitoring] Step 3: Setting speakers to mode 2 (receiver)');
+        pagingWasEnabledRef.current = false; // Paging is in idle zone, not active
+
+        // Step 3: Set all speakers to mode 2 (receiver - listening to Zone 1)
+        debugLog('[AudioMonitoring] Step 3: Setting speakers to mode 2 (receiver - listening Zone 1)');
         await setSpeakersMulticast(2);
 
         setSpeakersEnabled(true); // Mark as ready
@@ -2647,19 +2759,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           type: "speakers_enabled",
           speakersEnabled: true,
           volume: skipRampForLog ? 100 : 0,
-          message: alwaysKeepPagingOn
-            ? `Monitoring ready: Paging=ALWAYS ON (Mode 1), Speakers=LISTENING, ${volumeMsg}`
-            : `Monitoring ready: Paging=OFF, Speakers=LISTENING, ${volumeMsg}`,
+          message: `Monitoring ready: Paging=Zone 2 (idle), Speakers=Zone 1 (listening), ${volumeMsg}`,
         });
 
-        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging mode ${alwaysKeepPagingOn ? 1 : 0}, Speakers mode 2, ${volumeMsg}`);
+        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging Zone 2 (idle), Speakers listening Zone 1, ${volumeMsg}`);
       } catch (error) {
         console.error('[AudioMonitoring] Error during speaker setup:', error);
         // Continue anyway - audio capture is already running
         setSpeakersEnabled(true);
       }
     })();
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, waitForPagingOff, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping]);
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, setPagingZone, waitForPagingZoneReady, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');
