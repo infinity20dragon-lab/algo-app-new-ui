@@ -1062,30 +1062,32 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     localStorage.setItem(STORAGE_KEYS.PLAYBACK_ENABLED, playbackEnabled.toString());
   }, [playbackEnabled]);
 
-  // Daily console clear for long-running sessions (clears at 3 AM)
+  // Daily console clear for long-running sessions (clears at midnight PST)
   useEffect(() => {
     const checkConsoleClear = () => {
       const now = new Date();
-      const currentHour = now.getHours();
-      const currentDate = now.toDateString();
+      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const currentHour = pstTime.getHours();
+      const currentMinute = pstTime.getMinutes();
+      const pstDateString = pstTime.toDateString();
 
       // Get last clear date
       const lastClear = localStorage.getItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR);
 
-      // Clear console at 3 AM if not already cleared today
-      if (currentHour === 3 && lastClear !== currentDate) {
+      // Clear console at midnight PST (00:00) if not already cleared today
+      if (currentHour === 0 && currentMinute === 0 && lastClear !== pstDateString) {
         console.log('🧹 [System] Performing daily console clear to free memory...');
         console.log(`📅 Last clear: ${lastClear || 'Never'}`);
         console.log(`📊 Clearing console for 24/7 operation maintenance`);
 
         // Save clear date before clearing (so we can see it in logs afterward)
-        localStorage.setItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR, currentDate);
+        localStorage.setItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR, pstDateString);
 
         // Small delay to ensure logs are visible
         setTimeout(() => {
           console.clear();
-          console.log('✅ [System] Console cleared at 3:00 AM - logs reset for new day');
-          console.log(`📅 Date: ${currentDate}`);
+          console.log('✅ [System] Console cleared at midnight PST - logs reset for new day');
+          console.log(`📅 Date: ${pstDateString}`);
         }, 1000);
       }
     };
@@ -1093,8 +1095,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Check immediately on mount
     checkConsoleClear();
 
-    // Check every hour
-    const interval = setInterval(checkConsoleClear, 60 * 60 * 1000);
+    // Check every minute (to catch midnight precisely)
+    const interval = setInterval(checkConsoleClear, 60 * 1000);
 
     return () => clearInterval(interval);
   }, []);

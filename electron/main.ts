@@ -25,6 +25,54 @@ log('isDev: ' + isDev);
 log('App path: ' + app.getAppPath());
 log('Resources path: ' + process.resourcesPath);
 
+// Daily terminal console clear for long-running 24/7 operation
+let lastTerminalClear: string | null = null;
+
+function setupDailyTerminalClear(): void {
+  const checkTerminalClear = () => {
+    try {
+      const now = new Date();
+      // Convert to PST
+      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const currentHour = pstTime.getHours();
+      const currentMinute = pstTime.getMinutes();
+      const currentDate = pstTime.toDateString();
+
+      // Clear terminal at midnight PST (00:00) if not already cleared today
+      if (currentHour === 0 && currentMinute === 0 && lastTerminalClear !== currentDate) {
+        console.log('🧹 [Electron] Performing daily terminal clear to free memory...');
+        console.log(`📅 Last clear: ${lastTerminalClear || 'Never'}`);
+        console.log(`📊 Clearing terminal for 24/7 operation maintenance`);
+
+        lastTerminalClear = currentDate;
+
+        // Clear terminal using ANSI escape codes
+        setTimeout(() => {
+          // Method 1: Standard console.clear (works in most Node.js environments)
+          console.clear();
+
+          // Method 2: ANSI escape code for terminals (fallback)
+          process.stdout.write('\x1Bc');
+
+          console.log('✅ [Electron] Terminal cleared at midnight PST - logs reset for new day');
+          console.log(`📅 Date: ${currentDate}`);
+          log(`Terminal cleared at midnight PST - ${currentDate}`);
+        }, 1000);
+      }
+    } catch (err) {
+      log('Error in terminal clear: ' + err);
+    }
+  };
+
+  // Check immediately on startup
+  checkTerminalClear();
+
+  // Check every minute (to catch midnight precisely)
+  setInterval(checkTerminalClear, 60 * 1000);
+
+  log('Daily terminal clear scheduler started (midnight PST)');
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -83,6 +131,9 @@ app.whenReady().then(async () => {
 
     createWindow();
     log('Window created');
+
+    // Setup daily terminal console clear at 3 AM PST
+    setupDailyTerminalClear();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
