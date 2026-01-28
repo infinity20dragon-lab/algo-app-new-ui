@@ -326,6 +326,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const playbackAudioRef = useRef<HTMLAudioElement | null>(null);
   const isPlayingLiveRef = useRef<boolean>(false); // Track if live playback is active
   const playbackPositionRef = useRef<number>(0); // Track playback position in seconds
+  const noChunksWarningShownRef = useRef<boolean>(false); // Track if we've shown "no chunks" warning
   const [playbackAudioLevel, setPlaybackAudioLevel] = useState<number>(0);
   const playbackAudioContextRef = useRef<AudioContext | null>(null);
   const playbackAnalyserRef = useRef<AnalyserNode | null>(null);
@@ -683,9 +684,19 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       // Check if there are chunks to play
       if (recordedChunksRef.current.length === 0) {
-        console.warn('[Playback] No chunks available for playback');
+        // Only warn once to avoid console spam
+        if (!noChunksWarningShownRef.current) {
+          console.warn('[Playback] No chunks available for playback - waiting...');
+          noChunksWarningShownRef.current = true;
+        }
         setTimeout(() => continuePlayback(), 100);
         return;
+      }
+
+      // Reset warning flag when chunks are available
+      if (noChunksWarningShownRef.current) {
+        debugLog('[Playback] Chunks now available, resuming...');
+        noChunksWarningShownRef.current = false;
       }
 
       const mediaRecorder = mediaRecorderRef.current;
@@ -771,7 +782,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
 
       if (recordedChunksRef.current.length === 0) {
-        console.warn('[Playback] No recorded chunks available yet');
+        console.warn('[Playback] No recorded chunks available yet - recording may not have started');
         return;
       }
 
@@ -807,6 +818,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Disable live playback mode first
     isPlayingLiveRef.current = false;
     playbackPositionRef.current = 0;
+    noChunksWarningShownRef.current = false; // Reset warning flag for next session
 
     // Stop audio level tracking
     stopPlaybackLevelTracking();
@@ -910,10 +922,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setDayNightModeState(savedDayNightMode === 'true');
       }
       if (savedDayStartHour) {
-        setDayStartHourState(parseInt(savedDayStartHour));
+        setDayStartHourState(parseFloat(savedDayStartHour));
       }
       if (savedDayEndHour) {
-        setDayEndHourState(parseInt(savedDayEndHour));
+        setDayEndHourState(parseFloat(savedDayEndHour));
       }
       if (savedNightRampDuration) {
         setNightRampDurationState(parseInt(savedNightRampDuration));

@@ -747,7 +747,7 @@ export default function LiveBroadcastPage() {
                     </div>
                     <Slider
                       min={0}
-                      max={3000}
+                      max={10000}
                       step={100}
                       value={displayedPlaybackDelay}
                       onChange={(e) => setPlaybackDelay(parseInt(e.target.value))}
