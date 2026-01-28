@@ -890,6 +890,45 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       console.log('[Playback] 🔴 Starting MediaSource LIVE STREAM playback');
 
+      // CRITICAL FIX: Restart MediaRecorder to get fresh initialization segments for MediaSource
+      // Historical chunks are kept for recording, but MediaSource needs clean segments
+      const mediaRecorder = mediaRecorderRef.current;
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        debugLog('[Playback] Restarting MediaRecorder to generate fresh initialization segment for MediaSource');
+
+        // Stop current recorder (keep chunks for upload)
+        mediaRecorder.stop();
+
+        // Wait a bit for stop to complete
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Restart with same stream
+        if (monitoringStream) {
+          const mimeType = getBestAudioMimeType();
+          const newRecorder = new MediaRecorder(monitoringStream, {
+            mimeType,
+            audioBitsPerSecond: 128000,
+          });
+
+          mediaRecorderRef.current = newRecorder;
+
+          // Setup ondataavailable to feed MediaSource
+          newRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+              recordedChunksRef.current.push(event.data);
+
+              // Append to MediaSource if playback is active
+              if (playbackEnabled && isPlayingLiveRef.current && mediaSourceReadyRef.current) {
+                appendChunkToSourceBuffer(event.data);
+              }
+            }
+          };
+
+          newRecorder.start(100); // 100ms chunks
+          debugLog('[Playback] MediaRecorder restarted with fresh initialization segment');
+        }
+      }
+
       // Initialize MediaSource
       const audio = await initializeMediaSource();
       if (!audio) {
@@ -900,20 +939,16 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Mark as playing
       isPlayingLiveRef.current = true;
 
-      // Append all existing chunks (recorded before playback started)
-      debugLog(`[Playback] Appending ${recordedChunksRef.current.length} existing chunks from buffer`);
-      for (const chunk of recordedChunksRef.current) {
-        await appendChunkToSourceBuffer(chunk);
-      }
+      debugLog(`[Playback] MediaSource ready - new chunks will stream as they arrive (${recordedChunksRef.current.length} total chunks recorded)`);
 
-      // Start audio playback
+      // Start audio playback (first chunk will arrive within 100ms)
       try {
         await audio.play();
-        console.log('[Playback] ✓ MediaSource playback started successfully');
+        console.log('[Playback] ✓ MediaSource playback started - waiting for new chunks from fresh MediaRecorder');
 
         addLog({
           type: "audio_detected",
-          message: `Started MediaSource streaming (${recordedChunksRef.current.length} chunks from beginning)`,
+          message: `Started MediaSource streaming (live, ${recordedChunksRef.current.length} chunks recorded)`,
         });
       } catch (playError) {
         console.error('[Playback] Audio.play() failed:', playError);
@@ -924,7 +959,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       isPlayingLiveRef.current = false;
       cleanupMediaSource();
     }
-  }, [playbackEnabled, addLog, initializeMediaSource, appendChunkToSourceBuffer, cleanupMediaSource]);
+  }, [playbackEnabled, addLog, initializeMediaSource, appendChunkToSourceBuffer, cleanupMediaSource, getBestAudioMimeType, monitoringStream]);
 
   // Stop playback
   const stopPlayback = useCallback(() => {
