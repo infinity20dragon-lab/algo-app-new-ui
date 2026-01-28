@@ -85,6 +85,8 @@ export default function LiveBroadcastPage() {
     setLoggingEnabled,
     recordingEnabled,
     setRecordingEnabled,
+    playbackEnabled,
+    setPlaybackEnabled,
     devices: contextDevices,
     setDevices: setContextDevices,
     setPoeDevices,
@@ -119,6 +121,7 @@ export default function LiveBroadcastPage() {
   const displayedSelectedDevices = displayState?.selectedDevices ?? (selectedDevices || []);
   const displayedLoggingEnabled = displayState?.loggingEnabled ?? loggingEnabled;
   const displayedRecordingEnabled = displayState?.recordingEnabled ?? recordingEnabled;
+  const displayedPlaybackEnabled = displayState?.playbackEnabled ?? playbackEnabled;
 
   // Safety check: ensure selectedDevices is always an array
   const safeSelectedDevices = displayedSelectedDevices || [];
@@ -871,6 +874,21 @@ export default function LiveBroadcastPage() {
                     </p>
                   </div>
                   <Switch checked={displayedRecordingEnabled} onCheckedChange={setRecordingEnabled} />
+                </div>
+
+                <div className="flex items-center justify-between p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
+                  <div>
+                    <Label className="!text-[var(--text-primary)]">Live Playback</Label>
+                    <p className="text-xs text-[var(--text-muted)]">
+                      {displayedPlaybackEnabled
+                        ? "Play recorded audio through system (BlackHole → 4i4)"
+                        : "Disabled - only record (no playback)"}
+                    </p>
+                  </div>
+                  <Switch
+                    checked={displayedPlaybackEnabled}
+                    onCheckedChange={setPlaybackEnabled}
+                  />
                 </div>
               </CardContent>
             </Card>

@@ -142,6 +142,10 @@ interface AudioMonitoringContextType {
   recordingEnabled: boolean;
   setRecordingEnabled: (enabled: boolean) => void;
 
+  // Playback
+  playbackEnabled: boolean;
+  setPlaybackEnabled: (enabled: boolean) => void;
+
   // Emergency Controls
   emergencyKillAll: () => Promise<void>;
   emergencyEnableAll: () => Promise<void>;
@@ -254,6 +258,7 @@ const STORAGE_KEYS = {
   DISABLE_DELAY: 'algo_live_disable_delay',
   LOGGING_ENABLED: 'algo_live_logging_enabled',
   RECORDING_ENABLED: 'algo_live_recording_enabled',
+  PLAYBACK_ENABLED: 'algo_live_playback_enabled',
 };
 
 export function AudioMonitoringProvider({ children }: { children: React.ReactNode }) {
@@ -273,6 +278,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [logs, setLogs] = useState<AudioLogEntry[]>([]);
   const [loggingEnabled, setLoggingEnabledState] = useState(true); // enabled by default
   const [recordingEnabled, setRecordingEnabledState] = useState(false); // disabled by default to save storage
+  const [playbackEnabled, setPlaybackEnabledState] = useState(false); // disabled by default
 
   // Volume mode
   const [useGlobalVolume, setUseGlobalVolumeState] = useState(false);
@@ -308,6 +314,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingStartTimeRef = useRef<string | null>(null);
+
+  // Playback
+  const playbackAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const {
     isCapturing,
@@ -525,6 +534,75 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     });
   }, [user]);
 
+  // Start playback from recorded chunks
+  const startPlayback = useCallback(async () => {
+    try {
+      if (!playbackEnabled) {
+        debugLog('[Playback] Playback disabled, skipping');
+        return;
+      }
+
+      if (recordedChunksRef.current.length === 0) {
+        console.warn('[Playback] No recorded chunks available yet');
+        return;
+      }
+
+      // Stop any existing playback
+      if (playbackAudioRef.current) {
+        playbackAudioRef.current.pause();
+        playbackAudioRef.current = null;
+      }
+
+      // Get the mimeType from MediaRecorder
+      const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
+
+      // Create blob from chunks collected so far
+      const audioBlob = new Blob(recordedChunksRef.current, { type: mimeType });
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      console.log(`[Playback] Starting playback of ${audioBlob.size} bytes (${mimeType})`);
+
+      // Create audio element and play
+      const audio = new Audio(audioUrl);
+      playbackAudioRef.current = audio;
+
+      audio.onended = () => {
+        console.log('[Playback] Playback finished');
+        URL.revokeObjectURL(audioUrl);
+        playbackAudioRef.current = null;
+      };
+
+      audio.onerror = (error) => {
+        console.error('[Playback] Playback error:', error);
+        URL.revokeObjectURL(audioUrl);
+        playbackAudioRef.current = null;
+      };
+
+      await audio.play();
+
+      addLog({
+        type: "audio_detected",
+        message: `Started playback of recorded audio (${(audioBlob.size / 1024).toFixed(1)} KB)`,
+      });
+    } catch (error) {
+      console.error('[Playback] Failed to start playback:', error);
+    }
+  }, [playbackEnabled, addLog]);
+
+  // Stop playback
+  const stopPlayback = useCallback(() => {
+    if (playbackAudioRef.current) {
+      console.log('[Playback] Stopping playback');
+      playbackAudioRef.current.pause();
+      playbackAudioRef.current = null;
+
+      addLog({
+        type: "audio_silent",
+        message: "Stopped playback",
+      });
+    }
+  }, [addLog]);
+
   // Update gain when volume changes
   useEffect(() => {
     setGainVolume(volume);
@@ -626,6 +704,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
       if (savedUseGlobalVolume !== null) {
         setUseGlobalVolumeState(savedUseGlobalVolume === 'true');
+      }
+      const savedPlaybackEnabled = localStorage.getItem(STORAGE_KEYS.PLAYBACK_ENABLED);
+      if (savedPlaybackEnabled !== null) {
+        setPlaybackEnabledState(savedPlaybackEnabled === 'true');
       }
 
       // Mark as restored
@@ -749,6 +831,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Saving global volume mode:', useGlobalVolume);
     localStorage.setItem(STORAGE_KEYS.USE_GLOBAL_VOLUME, useGlobalVolume.toString());
   }, [useGlobalVolume]);
+
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving playback enabled:', playbackEnabled);
+    localStorage.setItem(STORAGE_KEYS.PLAYBACK_ENABLED, playbackEnabled.toString());
+  }, [playbackEnabled]);
 
   // Watch for target volume changes - restart ramp if speakers are enabled
   useEffect(() => {
@@ -1577,6 +1665,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               debugLog('[AudioMonitoring] AUDIO DETECTED - Paging already at mode 1 (always on)');
             }
 
+            // NEW: Start playback AFTER paging device is ready
+            // This ensures device is listening before audio plays
+            if (playbackEnabled) {
+              // Small delay to let device fully initialize
+              await new Promise(resolve => setTimeout(resolve, 200));
+              await startPlayback();
+            }
+
             // Then ramp the volume (only if ramp enabled)
             if (rampEnabled) {
               debugLog('[AudioMonitoring] Ramp ENABLED - Starting volume ramp');
@@ -1630,6 +1726,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               speakersEnabledTimeRef.current = null;
 
               (async () => {
+                // Stop playback first
+                stopPlayback();
+
                 // Stop recording and upload
                 const recordingUrl = await stopRecordingAndUpload();
 
@@ -1676,7 +1775,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, startPlayback, stopPlayback, rampEnabled]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -1796,6 +1895,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       controllingSpakersRef.current = false;
       debugLog(`[AudioMonitoring] ✓ Clean shutdown complete: All devices mode 0, speakers ${getIdleVolumeString()}`);
     }
+
+    // Clean up playback
+    if (playbackAudioRef.current) {
+      playbackAudioRef.current.pause();
+      playbackAudioRef.current = null;
+    }
   }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
 
   const setVolume = useCallback((vol: number) => {
@@ -1856,6 +1961,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   const setRecordingEnabled = useCallback((enabled: boolean) => {
     setRecordingEnabledState(enabled);
+  }, []);
+
+  const setPlaybackEnabled = useCallback((enabled: boolean) => {
+    setPlaybackEnabledState(enabled);
+    debugLog('[AudioMonitoring] Playback mode:', enabled ? 'ENABLED' : 'DISABLED');
   }, []);
 
   const clearLogs = useCallback(() => {
@@ -1926,6 +2036,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setLoggingEnabled,
         recordingEnabled,
         setRecordingEnabled,
+        playbackEnabled,
+        setPlaybackEnabled,
         emergencyKillAll,
         emergencyEnableAll,
         controlSingleSpeaker,

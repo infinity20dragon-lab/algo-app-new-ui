@@ -117,9 +117,13 @@ export function useSessionSync() {
     isBeingControlled,
   ]);
 
+  // TEMPORARILY DISABLED: Remote control feature is buggy and causes infinite loops
   // Apply remote updates from Firebase (when being controlled by admin OR when admin viewing user)
   useEffect(() => {
     if (!sessionState) return;
+
+    // Remote control feature is temporarily disabled
+    return; // DISABLED
 
     // CRITICAL: Admin MUST apply user's state to local context to control it!
     // This way admin's sliders/buttons show user's actual values
