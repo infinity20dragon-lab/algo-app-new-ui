@@ -195,17 +195,19 @@ export default function ActivityPage() {
                 {/* Date Picker */}
                 <div className="flex items-center gap-2">
                   <Label htmlFor="date-picker" className="text-sm text-[var(--text-secondary)]">
-                    <Calendar className="inline h-4 w-4 mr-1 text-white" />
                     Date:
                   </Label>
-                  <Input
-                    id="date-picker"
-                    type="date"
-                    value={selectedDate}
-                    onChange={(e) => setSelectedDate(e.target.value)}
-                    max={getPSTDate()}
-                    className="w-auto"
-                  />
+                  <div className="relative">
+                    <Calendar className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-white pointer-events-none z-10" />
+                    <Input
+                      id="date-picker"
+                      type="date"
+                      value={selectedDate}
+                      onChange={(e) => setSelectedDate(e.target.value)}
+                      max={getPSTDate()}
+                      className="w-auto pl-8 [&::-webkit-calendar-picker-indicator]:opacity-0 [&::-webkit-calendar-picker-indicator]:absolute [&::-webkit-calendar-picker-indicator]:right-0 [&::-webkit-calendar-picker-indicator]:w-full [&::-webkit-calendar-picker-indicator]:h-full [&::-webkit-calendar-picker-indicator]:cursor-pointer"
+                    />
+                  </div>
                 </div>
 
                 {/* Refresh Button */}
