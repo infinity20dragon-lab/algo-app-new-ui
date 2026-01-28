@@ -1356,14 +1356,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   // Set paging device multicast mode (0=disabled, 1=transmitter, 2=receiver)
   // Smart: Checks current mode first to avoid redundant API calls
   const setPagingMulticast = useCallback(async (mode: 0 | 1 | 2) => {
-    const pagingDevices = devices.filter(d => d.type === "8301");
+    // CRITICAL: Only control SELECTED paging devices, not all paging devices!
+    const pagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
+    );
 
     if (pagingDevices.length === 0) {
-      debugLog('[AudioMonitoring] No paging devices found');
+      debugLog('[AudioMonitoring] No selected paging devices found');
       return;
     }
 
-    debugLog(`[AudioMonitoring] Checking ${pagingDevices.length} paging device(s) before setting mode ${mode}...`);
+    debugLog(`[AudioMonitoring] Checking ${pagingDevices.length} selected paging device(s) before setting mode ${mode}...`);
 
     await Promise.allSettled(
       pagingDevices.map(async (paging) => {
@@ -1428,14 +1431,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       })
     );
-  }, [devices, addLog]);
+  }, [devices, selectedDevices, addLog]);
 
   // Wait for paging device to be ready by polling until mcast.mode = 1
   const waitForPagingReady = useCallback(async (): Promise<void> => {
-    const pagingDevices = devices.filter(d => d.type === "8301");
+    // CRITICAL: Only poll SELECTED paging devices, not all paging devices!
+    const pagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
+    );
 
     if (pagingDevices.length === 0) {
-      console.warn('[AudioMonitoring] No paging devices to poll');
+      console.warn('[AudioMonitoring] No selected paging devices to poll');
       return;
     }
 
@@ -1481,7 +1487,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
     // Timeout - proceed anyway
     console.warn(`[AudioMonitoring] ⚠️ Timeout waiting for paging device, proceeding anyway after ${maxWaitMs}ms`);
-  }, [devices]);
+  }, [devices, selectedDevices]);
 
   // Set all speakers multicast mode (0=disabled, 1=transmitter, 2=receiver)
   const setSpeakersMulticast = useCallback(async (mode: 0 | 1 | 2) => {
