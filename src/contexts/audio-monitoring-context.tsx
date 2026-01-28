@@ -1489,6 +1489,62 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     console.warn(`[AudioMonitoring] ⚠️ Timeout waiting for paging device, proceeding anyway after ${maxWaitMs}ms`);
   }, [devices, selectedDevices]);
 
+  // Wait for paging device to turn OFF by polling until mcast.mode = 0
+  const waitForPagingOff = useCallback(async (): Promise<void> => {
+    // CRITICAL: Only poll SELECTED paging devices, not all paging devices!
+    const pagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
+    );
+
+    if (pagingDevices.length === 0) {
+      console.warn('[AudioMonitoring] No selected paging devices to poll for OFF');
+      return;
+    }
+
+    const paging = pagingDevices[0]; // Use first paging device
+    const startTime = Date.now();
+    const maxWaitMs = 10000; // Maximum 10 seconds for turning off (devices can be slow)
+    const pollInterval = 200; // Check every 200ms
+
+    debugLog(`[AudioMonitoring] 🔄 Polling ${paging.name} until mcast.mode = 0 (OFF)...`);
+
+    while (Date.now() - startTime < maxWaitMs) {
+      try {
+        // Poll the mcast.mode setting
+        const response = await fetch("/api/algo/settings/get", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ipAddress: paging.ipAddress,
+            password: paging.apiPassword,
+            authMethod: paging.authMethod,
+            setting: "mcast.mode",
+          }),
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const currentMode = data.value;
+
+          if (currentMode === "0") {
+            const elapsed = Date.now() - startTime;
+            debugLog(`[AudioMonitoring] ✅ Paging device OFF! Mode = 0 after ${elapsed}ms`);
+            return; // Device is off!
+          }
+
+          debugLog(`[AudioMonitoring] ⏳ Mode = ${currentMode}, waiting for OFF... (${Date.now() - startTime}ms)`);
+        }
+      } catch (error) {
+        debugLog(`[AudioMonitoring] Polling error: ${error}`);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
+
+    // Timeout - proceed anyway
+    console.warn(`[AudioMonitoring] ⚠️ Timeout waiting for paging device to turn OFF, proceeding anyway after ${maxWaitMs}ms`);
+  }, [devices, selectedDevices]);
+
   // Set all speakers multicast mode (0=disabled, 1=transmitter, 2=receiver)
   const setSpeakersMulticast = useCallback(async (mode: 0 | 1 | 2) => {
     const linkedSpeakerIds = new Set<string>();
@@ -2116,6 +2172,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         } else {
           debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 0 (disabled - will toggle on audio)');
           await setPagingMulticast(0);
+
+          // CRITICAL: Wait for paging device to actually turn OFF before proceeding
+          debugLog('[AudioMonitoring] Step 2.5: Waiting for paging device to confirm OFF (mode 0)...');
+          await waitForPagingOff();
+
           // pagingWasEnabledRef stays false - will be set to true when audio is detected
         }
 
@@ -2145,7 +2206,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setSpeakersEnabled(true);
       }
     })();
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, checkSpeakerConnectivity]);
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, waitForPagingOff, setSpeakersMulticast, checkSpeakerConnectivity]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');
