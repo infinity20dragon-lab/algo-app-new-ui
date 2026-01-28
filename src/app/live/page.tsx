@@ -51,6 +51,7 @@ export default function LiveBroadcastPage() {
   const {
     isCapturing,
     audioLevel,
+    playbackAudioLevel,
     selectedInputDevice,
     targetVolume,
     audioThreshold,
@@ -104,6 +105,7 @@ export default function LiveBroadcastPage() {
   // Displayed values (what the UI shows)
   const displayedIsCapturing = displayState?.audioInputMonitoring ?? isCapturing;
   const displayedAudioLevel = displayState?.audioLevel ?? audioLevel;
+  const displayedPlaybackAudioLevel = displayState?.playbackAudioLevel ?? playbackAudioLevel;
   const displayedSelectedInputDevice = displayState?.selectedInputDevice ?? selectedInputDevice;
   const displayedTargetVolume = displayState?.targetVolume ?? targetVolume;
   const displayedAudioThreshold = displayState?.audioThreshold ?? audioThreshold;
@@ -375,10 +377,10 @@ export default function LiveBroadcastPage() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-6">
-                {/* VU Meter */}
+                {/* Input Audio VU Meter */}
                 <div className="p-6 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
                   <div className="flex items-center justify-between mb-4">
-                    <span className="text-sm font-semibold text-[var(--text-secondary)]">Audio Level</span>
+                    <span className="text-sm font-semibold text-[var(--text-secondary)]">Input Level</span>
                     <span className="text-sm font-mono text-[var(--accent-blue)]">
                       {displayedIsCapturing ? `${displayedAudioLevel.toFixed(1)}%` : "-- %"}
                     </span>
@@ -398,6 +400,27 @@ export default function LiveBroadcastPage() {
                     </span>
                   </div>
                 </div>
+
+                {/* Playback Audio VU Meter */}
+                {playbackEnabled && (
+                  <div className="p-6 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
+                    <div className="flex items-center justify-between mb-4">
+                      <span className="text-sm font-semibold text-[var(--text-secondary)]">Playback Level</span>
+                      <span className="text-sm font-mono text-[var(--accent-green)]">
+                        {displayedPlaybackAudioLevel > 0 ? `${displayedPlaybackAudioLevel.toFixed(1)}%` : "-- %"}
+                      </span>
+                    </div>
+                    <VUMeter level={displayedPlaybackAudioLevel} barCount={24} showPeakHold={false} />
+
+                    {/* Playback status */}
+                    <div className="mt-4 flex items-center gap-2">
+                      <div className={`w-2 h-2 rounded-full ${displayedPlaybackAudioLevel > 0 ? 'bg-[var(--accent-green)] animate-pulse' : 'bg-[var(--text-muted)]'}`}></div>
+                      <span className="text-xs text-[var(--text-muted)]">
+                        {displayedPlaybackAudioLevel > 0 ? "Playing to system audio" : "No playback"}
+                      </span>
+                    </div>
+                  </div>
+                )}
 
                 {/* Status Grid */}
                 <div className="grid grid-cols-3 gap-4">

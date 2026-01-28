@@ -70,6 +70,7 @@ export interface SessionState {
 
   // Real-time audio state (for display only)
   audioLevel: number;
+  playbackAudioLevel: number;
   audioDetected: boolean;
   speakersEnabled: boolean;
 

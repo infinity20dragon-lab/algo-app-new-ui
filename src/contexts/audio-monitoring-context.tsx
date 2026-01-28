@@ -80,6 +80,7 @@ interface AudioMonitoringContextType {
   // Audio capture state
   isCapturing: boolean;
   audioLevel: number;
+  playbackAudioLevel: number; // Audio level of live playback output
   selectedInputDevice: string;
   volume: number;
   targetVolume: number;
@@ -320,6 +321,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const playbackAudioRef = useRef<HTMLAudioElement | null>(null);
   const isPlayingLiveRef = useRef<boolean>(false); // Track if live playback is active
   const playbackPositionRef = useRef<number>(0); // Track playback position in seconds
+  const [playbackAudioLevel, setPlaybackAudioLevel] = useState<number>(0);
+  const playbackAudioContextRef = useRef<AudioContext | null>(null);
+  const playbackAnalyserRef = useRef<AnalyserNode | null>(null);
+  const playbackAnimationFrameRef = useRef<number | null>(null);
 
   const {
     isCapturing,
@@ -551,6 +556,75 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     });
   }, [user]);
 
+  // Track playback audio levels
+  const startPlaybackLevelTracking = useCallback((audioElement: HTMLAudioElement) => {
+    try {
+      // Only setup once - can't call createMediaElementSource multiple times on same element
+      if (playbackAudioContextRef.current && playbackAnalyserRef.current) {
+        debugLog('[Playback] Audio level tracking already active');
+        return;
+      }
+
+      // Create AudioContext
+      playbackAudioContextRef.current = new AudioContext();
+      const audioContext = playbackAudioContextRef.current;
+
+      // Create analyser
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      playbackAnalyserRef.current = analyser;
+
+      // Connect audio element to analyser, then to destination
+      // IMPORTANT: Must connect to destination or audio won't play!
+      const source = audioContext.createMediaElementSource(audioElement);
+      source.connect(analyser);
+      analyser.connect(audioContext.destination);
+
+      debugLog('[Playback] Connected audio element to analyser and destination');
+
+      // Start monitoring levels
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      const updateLevel = () => {
+        if (!playbackAnalyserRef.current || !isPlayingLiveRef.current) {
+          setPlaybackAudioLevel(0);
+          return;
+        }
+
+        playbackAnalyserRef.current.getByteFrequencyData(dataArray);
+
+        // Calculate RMS level (similar to input audio level calculation)
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const normalized = dataArray[i] / 255;
+          sum += normalized * normalized;
+        }
+        const rms = Math.sqrt(sum / dataArray.length);
+        const level = Math.min(100, rms * 200); // Scale to 0-100%
+
+        setPlaybackAudioLevel(level);
+
+        // Continue monitoring
+        playbackAnimationFrameRef.current = requestAnimationFrame(updateLevel);
+      };
+
+      updateLevel();
+    } catch (error) {
+      console.error('[Playback] Failed to setup audio level tracking:', error);
+      // Continue playback even if tracking fails
+    }
+  }, []);
+
+  // Stop playback level tracking
+  const stopPlaybackLevelTracking = useCallback(() => {
+    if (playbackAnimationFrameRef.current) {
+      cancelAnimationFrame(playbackAnimationFrameRef.current);
+      playbackAnimationFrameRef.current = null;
+    }
+    setPlaybackAudioLevel(0);
+    debugLog('[Playback] Stopped audio level tracking');
+  }, []);
+
   // Continue playing (for live streaming effect)
   const continuePlayback = useCallback(async () => {
     try {
@@ -589,6 +663,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Create audio element
       const audio = new Audio(audioUrl);
       playbackAudioRef.current = audio;
+
+      // Setup audio level tracking (only on first audio element)
+      if (!playbackAudioContextRef.current) {
+        startPlaybackLevelTracking(audio);
+      }
 
       // Set playback position to where we left off
       audio.currentTime = playbackPositionRef.current;
@@ -631,7 +710,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setTimeout(() => continuePlayback(), 500);
       }
     }
-  }, [playbackEnabled]);
+  }, [playbackEnabled, startPlaybackLevelTracking]);
 
   // Start live playback from recorded chunks
   const startPlayback = useCallback(async () => {
@@ -679,17 +758,28 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     isPlayingLiveRef.current = false;
     playbackPositionRef.current = 0;
 
+    // Stop audio level tracking
+    stopPlaybackLevelTracking();
+
     // Stop current audio
     if (playbackAudioRef.current) {
       playbackAudioRef.current.pause();
       playbackAudioRef.current = null;
     }
 
+    // Clean up AudioContext
+    if (playbackAudioContextRef.current) {
+      playbackAudioContextRef.current.close();
+      playbackAudioContextRef.current = null;
+      playbackAnalyserRef.current = null;
+      debugLog('[Playback] Cleaned up AudioContext');
+    }
+
     addLog({
       type: "audio_silent",
       message: "Stopped live playback stream",
     });
-  }, [addLog]);
+  }, [addLog, stopPlaybackLevelTracking]);
 
   // Update gain when volume changes
   useEffect(() => {
@@ -2193,6 +2283,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       value={{
         isCapturing,
         audioLevel,
+        playbackAudioLevel,
         selectedInputDevice,
         volume,
         targetVolume,
