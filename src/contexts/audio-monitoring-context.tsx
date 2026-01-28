@@ -317,7 +317,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // Sustained audio tracking
   const sustainedAudioStartRef = useRef<number | null>(null);
-  const speculativeRecordingRef = useRef<boolean>(false); // Track if we started recording before sustain check
+  const continuousRecordingRef = useRef<boolean>(false); // Track if continuous recording is active
+  const validRecordingStartIndexRef = useRef<number>(0); // Track where valid recording starts in chunks array
   const sustainCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const speakersEnabledTimeRef = useRef<number | null>(null);
   const pagingWasEnabledRef = useRef<boolean>(false); // Track if we enabled paging during this session
@@ -729,6 +730,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       // Create blob from ALL chunks (full recording so far)
       const audioBlob = new Blob(recordedChunksRef.current, { type: mimeType });
+
+      // Check if blob has actual data (not empty from discarded recording)
+      if (audioBlob.size === 0) {
+        debugLog('[Playback] Blob is empty (likely from discarded recording), waiting for new chunks...');
+        setTimeout(() => continuePlayback(), 100);
+        return;
+      }
+
       const audioUrl = URL.createObjectURL(audioBlob);
 
       debugLog(`[Playback] LIVE STREAM: Playing from ${playbackPositionRef.current.toFixed(2)}s (total: ${(audioBlob.size / 1024).toFixed(1)}KB)`);
@@ -2156,12 +2165,19 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         sustainedAudioStartRef.current = Date.now();
         debugLog(`[AudioMonitoring] Audio above threshold (${audioLevel.toFixed(1)}%), starting ${sustainDuration}ms sustain timer`);
 
-        // NEW: Start recording immediately (pre-sustain) to capture audio from the beginning
-        // If audio is not sustained, we'll discard this recording
-        if (!speculativeRecordingRef.current && recordingEnabled) {
-          speculativeRecordingRef.current = true;
-          debugLog('[AudioMonitoring] Starting speculative recording (pre-sustain) to capture from beginning');
-          startRecording();
+        // Start continuous recording if not already active (captures from beginning)
+        if (!continuousRecordingRef.current && recordingEnabled) {
+          continuousRecordingRef.current = true;
+          validRecordingStartIndexRef.current = recordedChunksRef.current.length; // Mark where this recording starts
+
+          // Only start MediaRecorder if not already running
+          const isAlreadyRecording = mediaRecorderRef.current?.state === 'recording';
+          if (!isAlreadyRecording) {
+            debugLog('[AudioMonitoring] Starting continuous recording to capture from beginning');
+            startRecording();
+          } else {
+            debugLog('[AudioMonitoring] MediaRecorder already running, marking start point for this audio');
+          }
         }
       }
 
@@ -2227,11 +2243,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           }
 
           (async () => {
-            // Recording already started (speculative recording during sustain check)
-            // Mark it as confirmed (not speculative anymore) - keep the recording!
-            if (speculativeRecordingRef.current) {
-              speculativeRecordingRef.current = false;
+            // Recording already running (continuous mode) - just confirm it's valid
+            if (continuousRecordingRef.current) {
               debugLog('[AudioMonitoring] Audio sustained - confirming recording (captured from beginning)');
+              // Keep the recording - it already has audio from the start
+              continuousRecordingRef.current = false; // No longer speculative
+            } else {
+              // Fallback: Start recording if somehow not running (shouldn't happen)
+              const isRecording = mediaRecorderRef.current?.state === 'recording';
+              if (!isRecording && recordingEnabled) {
+                debugLog('[AudioMonitoring] WARNING: Recording not active, starting now');
+                await startRecording();
+              }
             }
 
             // Enable PoE devices (lights, etc.) in auto mode
@@ -2296,17 +2319,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         debugLog(`[AudioMonitoring] Audio dropped below threshold before sustain duration`);
         sustainedAudioStartRef.current = null;
 
-        // NEW: Stop and discard speculative recording (noise spike, not a real call)
-        if (speculativeRecordingRef.current) {
-          speculativeRecordingRef.current = false;
-          debugLog('[AudioMonitoring] Discarding speculative recording (audio not sustained - likely noise spike)');
-
-          // Stop the MediaRecorder and discard chunks
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-            mediaRecorderRef.current.stop();
-            // Clear the chunks array to discard the recording
-            recordedChunksRef.current = [];
+        // Discard chunks from the noise spike but KEEP MediaRecorder running
+        if (continuousRecordingRef.current) {
+          const chunksToDiscard = recordedChunksRef.current.length - validRecordingStartIndexRef.current;
+          if (chunksToDiscard > 0) {
+            debugLog(`[AudioMonitoring] Discarding ${chunksToDiscard} chunks from noise spike (keeping MediaRecorder running)`);
+            recordedChunksRef.current.splice(validRecordingStartIndexRef.current);
           }
+          continuousRecordingRef.current = false;
         }
       }
 
@@ -2342,6 +2362,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               (async () => {
                 // Stop recording and upload (happens at audio end + disable delay)
                 const recordingUrl = await stopRecordingAndUpload();
+
+                // Reset continuous recording flag for next call
+                continuousRecordingRef.current = false;
+                validRecordingStartIndexRef.current = 0;
 
                 if (playbackEnabled) {
                   // NEW FLOW: When live playback is enabled, wait for playback to finish before shutdown
@@ -2606,8 +2630,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       playbackAudioRef.current = null;
     }
 
-    // Reset speculative recording flag
-    speculativeRecordingRef.current = false;
+    // Reset continuous recording flag
+    continuousRecordingRef.current = false;
+    validRecordingStartIndexRef.current = 0;
   }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
 
   const setVolume = useCallback((vol: number) => {
