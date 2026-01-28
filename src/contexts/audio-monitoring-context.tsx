@@ -316,6 +316,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const sustainCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const speakersEnabledTimeRef = useRef<number | null>(null);
   const pagingWasEnabledRef = useRef<boolean>(false); // Track if we enabled paging during this session
+  const shutdownInProgressRef = useRef<boolean>(false); // Track if shutdown is in progress (to prevent race conditions)
 
   // Recording
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -2108,6 +2109,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         const sustainedFor = Date.now() - sustainedAudioStartRef.current;
 
         if (sustainedFor >= sustainDuration) {
+          // 🚨 EMERGENCY INTERCEPTION: Cancel any ongoing shutdown!
+          if (shutdownInProgressRef.current) {
+            console.log('');
+            console.log('═══════════════════════════════════════════════════════');
+            console.log('🚨 EMERGENCY CALL INTERCEPTED DURING SHUTDOWN! 🚨');
+            console.log('New audio detected while paging was shutting down');
+            console.log('CANCELLING SHUTDOWN - Keeping paging ON for new call');
+            console.log('═══════════════════════════════════════════════════════');
+            console.log('');
+            shutdownInProgressRef.current = false; // CANCEL THE SHUTDOWN!
+
+            addLog({
+              type: "audio_detected",
+              audioLevel,
+              message: `🚨 EMERGENCY: New call during shutdown - shutdown cancelled!`,
+            });
+          }
+
           // Audio has been sustained - ramp volume up!
           // CRITICAL: Speakers are already listening (multicast enabled at start)
           // We only need to ramp up volume - this is INSTANT compared to enabling multicast
@@ -2258,8 +2277,27 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   stopPlayback();
                 }
 
+                // 🚨 CRITICAL: Set shutdown flag NOW (after playback completes)
+                // This protects the actual shutdown sequence (PoE disable, paging mode 0, volume ramp)
+                shutdownInProgressRef.current = true;
+                debugLog('[AudioMonitoring] 🔒 SHUTDOWN STARTED - Flag set (paging will go to mode 0)');
+
+                // 🚨 Check if new audio arrived after playback stopped
+                if (!shutdownInProgressRef.current) {
+                  debugLog('[AudioMonitoring] 🚨 NEW AUDIO DETECTED after playback - ABORTING SHUTDOWN!');
+                  controllingSpakersRef.current = false;
+                  return; // Exit shutdown immediately
+                }
+
                 // Disable PoE devices (lights, etc.) in auto mode
                 await controlPoEDevices(false);
+
+                // 🚨 FINAL CHECK before disabling paging (most critical!)
+                if (!shutdownInProgressRef.current) {
+                  debugLog('[AudioMonitoring] 🚨 NEW AUDIO DETECTED before paging OFF - ABORTING SHUTDOWN!');
+                  controllingSpakersRef.current = false;
+                  return; // Exit shutdown immediately - paging stays ON
+                }
 
                 // NEW FLOW: Disable paging transmitter (mode 0) - NO MORE AUDIO!
                 // Speakers stay in mode 2 (listening), ready for next audio
@@ -2302,6 +2340,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   message: shutdownMessage,
                   recordingUrl: recordingUrl || undefined,
                 });
+
+                // 🚨 Shutdown complete - clear flag
+                shutdownInProgressRef.current = false;
+                debugLog('[AudioMonitoring] 🔓 SHUTDOWN COMPLETE - Flag cleared');
 
                 controllingSpakersRef.current = false;
               })();
