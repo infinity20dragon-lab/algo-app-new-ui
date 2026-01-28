@@ -483,7 +483,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [recordingEnabled, user, monitoringStream, getBestAudioMimeType]);
 
-  // Stop recording and upload to Firebase
+  // Stop recording and upload to Firebase (unless playback is enabled - then it's temporary only)
   const stopRecordingAndUpload = useCallback(async (): Promise<string | null> => {
     return new Promise((resolve) => {
       try {
@@ -503,6 +503,20 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
             if (audioBlob.size === 0) {
               console.warn('[Recording] No audio data recorded');
+              resolve(null);
+              return;
+            }
+
+            // Check if playback is enabled - if so, skip Firebase upload (temporary recording only)
+            if (playbackEnabled) {
+              console.log(`[Recording] Playback enabled - skipping Firebase upload (${audioBlob.size} bytes recorded for playback only)`);
+
+              // Clean up temporary recording
+              recordedChunksRef.current = [];
+              recordingStartTimeRef.current = null;
+              mediaRecorderRef.current = null;
+
+              debugLog('[Recording] Temporary recording cleaned up (not saved to Firebase)');
               resolve(null);
               return;
             }
@@ -554,33 +568,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         resolve(null);
       }
     });
-  }, [user]);
+  }, [user, playbackEnabled]);
 
-  // Track playback audio levels
-  const startPlaybackLevelTracking = useCallback((audioElement: HTMLAudioElement) => {
+  // Setup AudioContext and Analyser (only once)
+  const setupPlaybackAudioContext = useCallback(() => {
+    if (playbackAudioContextRef.current && playbackAnalyserRef.current) {
+      return; // Already setup
+    }
+
     try {
-      // Only setup once - can't call createMediaElementSource multiple times on same element
-      if (playbackAudioContextRef.current && playbackAnalyserRef.current) {
-        debugLog('[Playback] Audio level tracking already active');
-        return;
-      }
-
       // Create AudioContext
       playbackAudioContextRef.current = new AudioContext();
-      const audioContext = playbackAudioContextRef.current;
 
       // Create analyser
-      const analyser = audioContext.createAnalyser();
+      const analyser = playbackAudioContextRef.current.createAnalyser();
       analyser.fftSize = 256;
       playbackAnalyserRef.current = analyser;
 
-      // Connect audio element to analyser, then to destination
-      // IMPORTANT: Must connect to destination or audio won't play!
-      const source = audioContext.createMediaElementSource(audioElement);
-      source.connect(analyser);
-      analyser.connect(audioContext.destination);
-
-      debugLog('[Playback] Connected audio element to analyser and destination');
+      debugLog('[Playback] Created AudioContext and Analyser');
 
       // Start monitoring levels
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
@@ -610,8 +615,28 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       updateLevel();
     } catch (error) {
-      console.error('[Playback] Failed to setup audio level tracking:', error);
-      // Continue playback even if tracking fails
+      console.error('[Playback] Failed to setup AudioContext:', error);
+    }
+  }, []);
+
+  // Connect audio element to analyser (called for EACH new audio element)
+  const connectAudioElementToAnalyser = useCallback((audioElement: HTMLAudioElement) => {
+    try {
+      if (!playbackAudioContextRef.current || !playbackAnalyserRef.current) {
+        console.warn('[Playback] AudioContext not ready, skipping connection');
+        return;
+      }
+
+      // Connect this audio element to the existing analyser
+      // IMPORTANT: Must connect to destination or audio won't play!
+      const source = playbackAudioContextRef.current.createMediaElementSource(audioElement);
+      source.connect(playbackAnalyserRef.current);
+      playbackAnalyserRef.current.connect(playbackAudioContextRef.current.destination);
+
+      debugLog('[Playback] Connected new audio element to analyser');
+    } catch (error) {
+      console.error('[Playback] Failed to connect audio element:', error);
+      // Continue playback even if connection fails
     }
   }, []);
 
@@ -664,10 +689,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const audio = new Audio(audioUrl);
       playbackAudioRef.current = audio;
 
-      // Setup audio level tracking (only on first audio element)
+      // Setup AudioContext and Analyser (only once on first audio element)
       if (!playbackAudioContextRef.current) {
-        startPlaybackLevelTracking(audio);
+        setupPlaybackAudioContext();
       }
+
+      // Connect THIS audio element to the analyser (every time)
+      connectAudioElementToAnalyser(audio);
 
       // Set playback position to where we left off
       audio.currentTime = playbackPositionRef.current;
@@ -710,7 +738,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setTimeout(() => continuePlayback(), 500);
       }
     }
-  }, [playbackEnabled, startPlaybackLevelTracking]);
+  }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser]);
 
   // Start live playback from recorded chunks
   const startPlayback = useCallback(async () => {
@@ -2104,13 +2132,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 }
 
                 // Log with recording URL if available
+                const recordingStatus = recordingUrl
+                  ? ' 🎙️ Recording saved'
+                  : (playbackEnabled ? ' 🎵 Playback only (not saved)' : '');
+
                 addLog({
                   type: "volume_change",
                   speakersEnabled: true, // Speakers STAY in mode 2 (ready)
                   volume: rampEnabled ? 0 : targetVolume,
                   message: rampEnabled
-                    ? `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingUrl ? ' 🎙️ Recording saved' : ''}`
-                    : `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - Speakers stay at operating volume${recordingUrl ? ' 🎙️ Recording saved' : ''}`,
+                    ? `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - NO STATIC!${recordingStatus}`
+                    : `Paging OFF after ${disableDelay/1000}s silence (duration: ${duration}s) - Speakers stay at operating volume${recordingStatus}`,
                   recordingUrl: recordingUrl || undefined,
                 });
 
