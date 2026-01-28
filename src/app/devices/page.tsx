@@ -559,10 +559,47 @@ export default function DevicesPage() {
                   {/* Speaker Linking (only for 8301 paging devices) */}
                   {formData.type === "8301" && (
                     <div className="space-y-2">
-                      <Label className="flex items-center gap-2">
-                        <Link2 className="h-4 w-4" />
-                        Linked Speakers
-                      </Label>
+                      <div className="flex items-center justify-between">
+                        <Label className="flex items-center gap-2">
+                          <Link2 className="h-4 w-4" />
+                          Linked Speakers
+                        </Label>
+                        {devices.filter(d => d.type !== "8301" && d.id !== editingDevice?.id).length > 0 && (
+                          <div className="flex gap-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => {
+                                const allSpeakerIds = devices
+                                  .filter(d => d.type !== "8301" && d.id !== editingDevice?.id)
+                                  .map(d => d.id);
+                                setFormData({
+                                  ...formData,
+                                  linkedSpeakerIds: allSpeakerIds,
+                                });
+                              }}
+                              className="text-xs h-7 px-2"
+                            >
+                              Add All
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              onClick={() => {
+                                setFormData({
+                                  ...formData,
+                                  linkedSpeakerIds: [],
+                                });
+                              }}
+                              className="text-xs h-7 px-2"
+                            >
+                              Remove All
+                            </Button>
+                          </div>
+                        )}
+                      </div>
                       <p className="text-xs text-[var(--text-muted)] mb-2">
                         Speakers will auto-enable when playing and auto-disable when done (no white noise)
                       </p>
@@ -836,92 +873,185 @@ export default function DevicesPage() {
             </CardContent>
           </Card>
         ) : (
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {devices.map((device) => (
-              <Card key={device.id}>
-                <CardHeader className="pb-3">
-                  <div className="flex items-start justify-between">
-                    <div className="flex-1">
-                      <div className="flex items-center gap-2 mb-1">
-                        <CardTitle className="text-lg">{device.name}</CardTitle>
-                        <div className={`h-2 w-2 rounded-full ${device.isOnline ? 'bg-[var(--accent-green)]' : 'bg-[var(--accent-red)]'}`}></div>
-                      </div>
-                      <CardDescription>{device.ipAddress}</CardDescription>
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <Badge variant={device.isOnline ? "success" : "secondary"}>
-                        {device.isOnline ? "Online" : "Offline"}
-                      </Badge>
-                      {device.isOnline && device.authValid === false && (
-                        <Badge variant="warning" className="text-xs">
-                          Auth Error
-                        </Badge>
-                      )}
-                    </div>
-                  </div>
-                  {device.isOnline && device.authValid === false && (
-                    <div className="bg-[var(--accent-orange)]/10 border border-[var(--accent-orange)]/30 rounded-lg p-3 text-sm text-[var(--accent-orange)]">
-                      <strong>Authentication Failed:</strong> Wrong password or auth method. Please check device settings.
-                    </div>
-                  )}
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  <div className="flex flex-wrap gap-2 text-sm">
-                    <Badge variant="outline">{device.type.toUpperCase()}</Badge>
-                    {device.zone && (
-                      <Badge variant="outline">{device.zone}</Badge>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
-                    <Volume2 className="h-4 w-4" />
-                    <span>
-                      Volume: {device.volume}%
-                      {device.type !== "8301" && (
-                        <span className="text-[var(--accent-orange)]"> (max: {device.maxVolume ?? 100}%)</span>
-                      )}
-                    </span>
-                  </div>
-                  {device.type === "8301" && device.linkedSpeakerIds && device.linkedSpeakerIds.length > 0 && (
-                    <div className="flex items-center gap-2 text-sm text-[var(--accent-blue)]">
-                      <Link2 className="h-4 w-4" />
-                      <span>
-                        {device.linkedSpeakerIds.length} linked speaker{device.linkedSpeakerIds.length !== 1 ? "s" : ""}
-                      </span>
-                    </div>
-                  )}
-                  <p className="text-xs text-[var(--text-muted)]">
-                    Last seen: {formatDate(device.lastSeen)}
-                  </p>
-                  <div className="flex gap-2 pt-2">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleTestTone(device)}
-                      isLoading={testingDevice === device.id}
-                    >
-                      <Play className="mr-1 h-3 w-3" />
-                      Test
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => openEditForm(device)}
-                    >
-                      <Pencil className="mr-1 h-3 w-3" />
-                      Edit
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleDelete(device.id)}
-                    >
-                      <Trash2 className="mr-1 h-3 w-3" />
-                      Delete
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
+          <div className="space-y-6">
+            {/* Paging Devices Section */}
+            {devices.filter(d => d.type === "8301").length > 0 && (
+              <div>
+                <h2 className="text-lg font-semibold text-[var(--text-primary)] mb-3 flex items-center gap-2">
+                  <div className="h-1 w-1 rounded-full bg-[var(--accent-blue)]"></div>
+                  Paging Devices ({devices.filter(d => d.type === "8301").length})
+                </h2>
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {devices.filter(d => d.type === "8301").map((device) => (
+                    <Card key={device.id}>
+                      <CardHeader className="pb-3">
+                        <div className="flex items-start justify-between">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-1">
+                              <CardTitle className="text-lg">{device.name}</CardTitle>
+                              <div className={`h-2 w-2 rounded-full ${device.isOnline ? 'bg-[var(--accent-green)]' : 'bg-[var(--accent-red)]'}`}></div>
+                            </div>
+                            <CardDescription>{device.ipAddress}</CardDescription>
+                          </div>
+                          <div className="flex flex-col gap-1">
+                            <Badge variant={device.isOnline ? "success" : "secondary"}>
+                              {device.isOnline ? "Online" : "Offline"}
+                            </Badge>
+                            {device.isOnline && device.authValid === false && (
+                              <Badge variant="warning" className="text-xs">
+                                Auth Error
+                              </Badge>
+                            )}
+                          </div>
+                        </div>
+                        {device.isOnline && device.authValid === false && (
+                          <div className="bg-[var(--accent-orange)]/10 border border-[var(--accent-orange)]/30 rounded-lg p-3 text-sm text-[var(--accent-orange)]">
+                            <strong>Authentication Failed:</strong> Wrong password or auth method. Please check device settings.
+                          </div>
+                        )}
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="flex flex-wrap gap-2 text-sm">
+                          <Badge variant="outline">{device.type.toUpperCase()}</Badge>
+                          {device.zone && (
+                            <Badge variant="outline">{device.zone}</Badge>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+                          <Volume2 className="h-4 w-4" />
+                          <span>Volume: {device.volume}%</span>
+                        </div>
+                        {device.linkedSpeakerIds && device.linkedSpeakerIds.length > 0 && (
+                          <div className="flex items-center gap-2 text-sm text-[var(--accent-blue)]">
+                            <Link2 className="h-4 w-4" />
+                            <span>
+                              {device.linkedSpeakerIds.length} linked speaker{device.linkedSpeakerIds.length !== 1 ? "s" : ""}
+                            </span>
+                          </div>
+                        )}
+                        <p className="text-xs text-[var(--text-muted)]">
+                          Last seen: {formatDate(device.lastSeen)}
+                        </p>
+                        <div className="flex gap-2 pt-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => handleTestTone(device)}
+                            isLoading={testingDevice === device.id}
+                          >
+                            <Play className="mr-1 h-3 w-3" />
+                            Test
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => openEditForm(device)}
+                          >
+                            <Pencil className="mr-1 h-3 w-3" />
+                            Edit
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => handleDelete(device.id)}
+                          >
+                            <Trash2 className="mr-1 h-3 w-3" />
+                            Delete
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Speakers Section */}
+            {devices.filter(d => d.type !== "8301").length > 0 && (
+              <div>
+                <h2 className="text-lg font-semibold text-[var(--text-primary)] mb-3 flex items-center gap-2">
+                  <div className="h-1 w-1 rounded-full bg-[var(--accent-orange)]"></div>
+                  Speakers ({devices.filter(d => d.type !== "8301").length})
+                </h2>
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {devices.filter(d => d.type !== "8301").map((device) => (
+                    <Card key={device.id}>
+                      <CardHeader className="pb-3">
+                        <div className="flex items-start justify-between">
+                          <div className="flex-1">
+                            <div className="flex items-center gap-2 mb-1">
+                              <CardTitle className="text-lg">{device.name}</CardTitle>
+                              <div className={`h-2 w-2 rounded-full ${device.isOnline ? 'bg-[var(--accent-green)]' : 'bg-[var(--accent-red)]'}`}></div>
+                            </div>
+                            <CardDescription>{device.ipAddress}</CardDescription>
+                          </div>
+                          <div className="flex flex-col gap-1">
+                            <Badge variant={device.isOnline ? "success" : "secondary"}>
+                              {device.isOnline ? "Online" : "Offline"}
+                            </Badge>
+                            {device.isOnline && device.authValid === false && (
+                              <Badge variant="warning" className="text-xs">
+                                Auth Error
+                              </Badge>
+                            )}
+                          </div>
+                        </div>
+                        {device.isOnline && device.authValid === false && (
+                          <div className="bg-[var(--accent-orange)]/10 border border-[var(--accent-orange)]/30 rounded-lg p-3 text-sm text-[var(--accent-orange)]">
+                            <strong>Authentication Failed:</strong> Wrong password or auth method. Please check device settings.
+                          </div>
+                        )}
+                      </CardHeader>
+                      <CardContent className="space-y-3">
+                        <div className="flex flex-wrap gap-2 text-sm">
+                          <Badge variant="outline">{device.type.toUpperCase()}</Badge>
+                          {device.zone && (
+                            <Badge variant="outline">{device.zone}</Badge>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
+                          <Volume2 className="h-4 w-4" />
+                          <span>
+                            Volume: {device.volume}%
+                            <span className="text-[var(--accent-orange)]"> (max: {device.maxVolume ?? 100}%)</span>
+                          </span>
+                        </div>
+                        <p className="text-xs text-[var(--text-muted)]">
+                          Last seen: {formatDate(device.lastSeen)}
+                        </p>
+                        <div className="flex gap-2 pt-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => handleTestTone(device)}
+                            isLoading={testingDevice === device.id}
+                          >
+                            <Play className="mr-1 h-3 w-3" />
+                            Test
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => openEditForm(device)}
+                          >
+                            <Pencil className="mr-1 h-3 w-3" />
+                            Edit
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => handleDelete(device.id)}
+                          >
+                            <Trash2 className="mr-1 h-3 w-3" />
+                            Delete
+                          </Button>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
