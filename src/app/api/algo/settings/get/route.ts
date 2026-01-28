@@ -10,8 +10,11 @@ interface GetSettingRequest {
 }
 
 export async function POST(request: NextRequest) {
+  let requestBody: GetSettingRequest | null = null;
+
   try {
     const body: GetSettingRequest = await request.json();
+    requestBody = body;
     const { ipAddress, password, authMethod, setting } = body;
 
     if (!ipAddress || !password || !setting) {
@@ -36,6 +39,11 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("[GetSetting API] Error:", error);
+    if (requestBody) {
+      console.error("[GetSetting API] Device:", requestBody.ipAddress);
+      console.error("[GetSetting API] Setting:", requestBody.setting);
+    }
+    console.error("[GetSetting API] Full error:", error instanceof Error ? error.stack : error);
 
     return NextResponse.json(
       {

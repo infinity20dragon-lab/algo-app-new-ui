@@ -1368,35 +1368,44 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     await Promise.allSettled(
       pagingDevices.map(async (paging) => {
         try {
-          // First, check current mode
-          const checkResponse = await fetch("/api/algo/settings/get", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              ipAddress: paging.ipAddress,
-              password: paging.apiPassword,
-              authMethod: paging.authMethod,
-              setting: "mcast.mode",
-            }),
-          });
+          // First, check current mode (with error handling)
+          let shouldProceed = true;
 
-          if (checkResponse.ok) {
-            const checkData = await checkResponse.json();
-            const currentMode = checkData.value;
+          try {
+            const checkResponse = await fetch("/api/algo/settings/get", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                ipAddress: paging.ipAddress,
+                password: paging.apiPassword,
+                authMethod: paging.authMethod,
+                setting: "mcast.mode",
+              }),
+            });
 
-            if (currentMode === mode.toString()) {
-              debugLog(`[AudioMonitoring] ⏭️  ${paging.name} already at mode ${mode}, skipping`);
-              addLog({
-                type: "speakers_enabled",
-                message: `Paging ${paging.name} already at mode ${mode}, skipped redundant call`,
-              });
-              return; // Already at target mode, skip
+            if (checkResponse.ok) {
+              const checkData = await checkResponse.json();
+              const currentMode = checkData.value;
+
+              if (currentMode === mode.toString()) {
+                debugLog(`[AudioMonitoring] ⏭️  ${paging.name} already at mode ${mode}, skipping`);
+                addLog({
+                  type: "speakers_enabled",
+                  message: `Paging ${paging.name} already at mode ${mode}, skipped redundant call`,
+                });
+                return; // Already at target mode, skip
+              }
+
+              debugLog(`[AudioMonitoring] ${paging.name} is mode ${currentMode}, changing to ${mode}...`);
+            } else {
+              console.warn(`[AudioMonitoring] Failed to check ${paging.name} mode (HTTP ${checkResponse.status}), proceeding with mode change anyway`);
             }
-
-            debugLog(`[AudioMonitoring] ${paging.name} is mode ${currentMode}, changing to ${mode}...`);
+          } catch (checkError) {
+            console.warn(`[AudioMonitoring] Failed to check ${paging.name} mode:`, checkError);
+            console.warn(`[AudioMonitoring] Proceeding with mode change anyway...`);
           }
 
-          // Current mode is different, proceed with change
+          // Proceed with mode change
           await fetch("/api/algo/speakers/mcast", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
