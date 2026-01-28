@@ -57,7 +57,7 @@ let mp3Worker: Worker | null = null;
 
 export interface AudioLogEntry {
   timestamp: string;
-  type: "audio_detected" | "audio_silent" | "speakers_enabled" | "speakers_disabled" | "volume_change";
+  type: "audio_detected" | "audio_silent" | "speakers_enabled" | "speakers_disabled" | "volume_change" | "system";
   audioLevel?: number;
   audioThreshold?: number;
   speakersEnabled?: boolean;
@@ -260,6 +260,7 @@ const STORAGE_KEYS = {
   LOGGING_ENABLED: 'algo_live_logging_enabled',
   RECORDING_ENABLED: 'algo_live_recording_enabled',
   PLAYBACK_ENABLED: 'algo_live_playback_enabled',
+  LAST_CONSOLE_CLEAR: 'algo_live_last_console_clear',
 };
 
 export function AudioMonitoringProvider({ children }: { children: React.ReactNode }) {
@@ -544,7 +545,16 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             // Generate filename with PST timestamp (already formatted: YYYY-MM-DD-HH-MM-SS-AM/PM)
             const timestamp = recordingStartTimeRef.current!;
             const filename = `recording-${timestamp}.${fileExtension}`;
-            const filePath = `audio-recordings/${user.uid}/${filename}`;
+
+            // Create daily folder based on PST date (format: YYYY-MM-DD-pst-recordings)
+            const now = new Date();
+            const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+            const year = pstTime.getFullYear();
+            const month = String(pstTime.getMonth() + 1).padStart(2, '0');
+            const day = String(pstTime.getDate()).padStart(2, '0');
+            const dailyFolder = `${year}-${month}-${day}-pst-recordings`;
+
+            const filePath = `audio-recordings/${user.uid}/${dailyFolder}/${filename}`;
 
             // Upload to Firebase Storage
             debugLog(`[Recording] Uploading ${fileExtension.toUpperCase()} to ${filePath}`);
@@ -1051,6 +1061,86 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Saving playback enabled:', playbackEnabled);
     localStorage.setItem(STORAGE_KEYS.PLAYBACK_ENABLED, playbackEnabled.toString());
   }, [playbackEnabled]);
+
+  // Daily console clear for long-running sessions (clears at 3 AM)
+  useEffect(() => {
+    const checkConsoleClear = () => {
+      const now = new Date();
+      const currentHour = now.getHours();
+      const currentDate = now.toDateString();
+
+      // Get last clear date
+      const lastClear = localStorage.getItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR);
+
+      // Clear console at 3 AM if not already cleared today
+      if (currentHour === 3 && lastClear !== currentDate) {
+        console.log('🧹 [System] Performing daily console clear to free memory...');
+        console.log(`📅 Last clear: ${lastClear || 'Never'}`);
+        console.log(`📊 Clearing console for 24/7 operation maintenance`);
+
+        // Save clear date before clearing (so we can see it in logs afterward)
+        localStorage.setItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR, currentDate);
+
+        // Small delay to ensure logs are visible
+        setTimeout(() => {
+          console.clear();
+          console.log('✅ [System] Console cleared at 3:00 AM - logs reset for new day');
+          console.log(`📅 Date: ${currentDate}`);
+        }, 1000);
+      }
+    };
+
+    // Check immediately on mount
+    checkConsoleClear();
+
+    // Check every hour
+    const interval = setInterval(checkConsoleClear, 60 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Daily activity log refresh at midnight PST
+  useEffect(() => {
+    const checkLogRefresh = () => {
+      const now = new Date();
+      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const currentHour = pstTime.getHours();
+      const currentMinute = pstTime.getMinutes();
+      const pstDateString = pstTime.toDateString();
+
+      // Get last log refresh date
+      const lastLogRefresh = localStorage.getItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR + '_logs');
+
+      // Refresh logs at midnight PST (00:00) if not already refreshed today
+      if (currentHour === 0 && currentMinute === 0 && lastLogRefresh !== pstDateString) {
+        console.log('🔄 [System] Midnight PST - Refreshing activity logs for new day...');
+        console.log(`📅 Previous log date: ${lastLogRefresh || 'First run'}`);
+        console.log(`📅 New log date: ${pstDateString}`);
+
+        // Save refresh date
+        localStorage.setItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR + '_logs', pstDateString);
+
+        // Clear activity logs (they're already saved to Firebase)
+        setLogs([]);
+
+        // Add a system log for the new day
+        setTimeout(() => {
+          addLog({
+            type: "system",
+            message: `🌅 New day started - Activity logs refreshed for ${pstDateString} (PST)`,
+          });
+        }, 100);
+      }
+    };
+
+    // Check immediately on mount
+    checkLogRefresh();
+
+    // Check every minute (to catch midnight precisely)
+    const interval = setInterval(checkLogRefresh, 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [addLog]);
 
   // Watch for target volume changes - restart ramp if speakers are enabled
   useEffect(() => {

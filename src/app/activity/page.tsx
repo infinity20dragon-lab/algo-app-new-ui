@@ -195,7 +195,7 @@ export default function ActivityPage() {
                 {/* Date Picker */}
                 <div className="flex items-center gap-2">
                   <Label htmlFor="date-picker" className="text-sm text-[var(--text-secondary)]">
-                    <Calendar className="inline h-4 w-4 mr-1" />
+                    <Calendar className="inline h-4 w-4 mr-1 text-[var(--text-secondary)]" />
                     Date:
                   </Label>
                   <Input

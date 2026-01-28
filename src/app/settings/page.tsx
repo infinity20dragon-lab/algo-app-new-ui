@@ -4,6 +4,7 @@ import { AppLayout } from "@/components/layout/app-layout";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/ui/password-input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/contexts/auth-context";
 import { Settings2, User, Info, Shield, Volume2, VolumeX, CheckCircle2, Radio } from "lucide-react";
@@ -104,9 +105,8 @@ export default function SettingsPage() {
                 <Shield className="h-4 w-4 text-[var(--text-muted)]" />
                 Default API Password
               </Label>
-              <Input
+              <PasswordInput
                 id="defaultPassword"
-                type="password"
                 defaultValue="algo"
                 placeholder="algo"
               />

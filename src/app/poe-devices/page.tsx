@@ -5,6 +5,7 @@ import { AppLayout } from "@/components/layout/app-layout";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/ui/password-input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
@@ -417,9 +418,8 @@ export default function PoEDevicesPage() {
 
                   <div className="space-y-2">
                     <Label htmlFor="switch-password">Password</Label>
-                    <Input
+                    <PasswordInput
                       id="switch-password"
-                      type="password"
                       placeholder="Switch password"
                       value={switchFormData.password}
                       onChange={(e) =>
