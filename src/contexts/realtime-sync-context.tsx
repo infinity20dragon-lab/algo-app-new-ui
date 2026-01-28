@@ -68,6 +68,7 @@ export interface SessionState {
   recordingEnabled: boolean;
   playbackEnabled: boolean;
   playbackDelay: number;
+  playbackDisableDelay: number;
 
   // Real-time audio state (for display only)
   audioLevel: number;

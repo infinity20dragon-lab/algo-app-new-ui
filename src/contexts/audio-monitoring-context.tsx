@@ -1327,6 +1327,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     return currentTime >= dayStartHour && currentTime < dayEndHour;
   }, [dayStartHour, dayEndHour]);
 
+  // Helper to determine if ramping should be skipped (speakers stay at max)
+  // Returns true if: ramp disabled OR (day/night mode enabled AND currently daytime)
+  const shouldSkipRamping = useCallback(() => {
+    if (!rampEnabled) {
+      return true; // Ramp disabled - always skip
+    }
+    if (dayNightMode && isDaytime()) {
+      return true; // Day/night mode enabled and it's daytime - skip ramping
+    }
+    return false; // Nighttime or day/night mode disabled - use ramping
+  }, [rampEnabled, dayNightMode, isDaytime]);
+
   // Get the effective ramp duration based on settings
   const getEffectiveRampDuration = useCallback(() => {
     // If ramp is disabled, return 0 (instant)
@@ -1510,12 +1522,29 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         debugLog(`[AudioMonitoring] ⏰ Day/night mode changed: ${previousDayModeRef.current ? 'DAY' : 'NIGHT'} → ${currentIsDaytime ? 'DAY' : 'NIGHT'}`);
         previousDayModeRef.current = currentIsDaytime;
 
-        // If speakers are currently enabled, restart the ramp with new settings
+        // If speakers are currently enabled, adjust volume based on new time period
         // Use refs to check current state without adding to dependencies
         if (speakersEnabled && !controllingSpakersRef.current) {
-          const currentVolume = currentVolumeRef.current;
-          debugLog(`[AudioMonitoring] Restarting volume ramp due to day/night change from ${currentVolume}%`);
-          startVolumeRamp(currentVolume);
+          if (currentIsDaytime) {
+            // Transitioned to DAYTIME (e.g., 6:00 AM) - Set speakers to max immediately
+            debugLog(`[AudioMonitoring] ⏰ DAYTIME started - Setting speakers to operating volume (max)`);
+            setDevicesVolume(100); // Max volume for daytime
+            addLog({
+              type: "volume_change",
+              volume: 100,
+              message: "⏰ Daytime mode activated - Speakers set to operating volume (max)",
+            });
+          } else {
+            // Transitioned to NIGHTTIME (e.g., 6:00 PM) - Set speakers to idle
+            debugLog(`[AudioMonitoring] ⏰ NIGHTTIME started - Setting speakers to idle volume`);
+            stopVolumeRamp(); // Stop any active ramp
+            setDevicesVolume(0); // Idle volume for nighttime
+            addLog({
+              type: "volume_change",
+              volume: 0,
+              message: `⏰ Nighttime mode activated - Speakers set to idle (${getIdleVolumeString()})`,
+            });
+          }
         }
       }
     }, 60000); // Check every 60 seconds
@@ -2160,22 +2189,23 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           controllingSpakersRef.current = true;
           speakersEnabledTimeRef.current = Date.now(); // Track when audio started playing
 
+          const skipRamp = shouldSkipRamping();
           addLog({
             type: "audio_detected",
             audioLevel,
             audioThreshold,
-            message: rampEnabled
-              ? `Audio sustained ${sustainDuration}ms at ${audioLevel.toFixed(1)}% - ramping volume (speakers already listening)`
-              : `Audio sustained ${sustainDuration}ms at ${audioLevel.toFixed(1)}% (speakers already listening)`,
+            message: skipRamp
+              ? `Audio sustained ${sustainDuration}ms at ${audioLevel.toFixed(1)}% (speakers already listening)`
+              : `Audio sustained ${sustainDuration}ms at ${audioLevel.toFixed(1)}% - ramping volume (speakers already listening)`,
           });
 
-          if (rampEnabled) {
+          if (skipRamp) {
             addLog({
               type: "volume_change",
               audioLevel,
               speakersEnabled: true,
               volume: targetVolume,
-              message: `Volume ramping to ${targetVolume}% (paging mode 1 → speakers receive audio)`,
+              message: `Speakers at operating volume ${targetVolume}% (paging mode 1 → speakers receive audio)`,
             });
           } else {
             addLog({
@@ -2183,7 +2213,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               audioLevel,
               speakersEnabled: true,
               volume: targetVolume,
-              message: `Speakers at operating volume ${targetVolume}% (paging mode 1 → speakers receive audio)`,
+              message: `Volume ramping to ${targetVolume}% (paging mode 1 → speakers receive audio)`,
             });
           }
 
@@ -2213,11 +2243,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
             // CRITICAL: Start volume ramp BEFORE playback!
             // This ensures speakers are audible when audio starts playing
-            if (rampEnabled) {
-              debugLog('[AudioMonitoring] Ramp ENABLED - Starting volume ramp');
-              startVolumeRamp();
+            const skipRampNow = shouldSkipRamping();
+            if (skipRampNow) {
+              const reason = !rampEnabled ? 'Ramp DISABLED' : 'DAYTIME (day/night mode)';
+              debugLog(`[AudioMonitoring] ${reason} - Speakers already at operating volume, no ramp needed`);
             } else {
-              debugLog('[AudioMonitoring] Ramp DISABLED - Speakers already at operating volume, no ramp needed');
+              debugLog('[AudioMonitoring] NIGHTTIME or ramp mode - Starting volume ramp');
+              startVolumeRamp();
             }
 
             // NEW: Wait for playback delay (configurable) before starting playback
@@ -2357,13 +2389,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 }
 
                 // Ramp down or keep at operating volume
-                if (rampEnabled) {
-                  debugLog('[AudioMonitoring] Ramp ENABLED - Ramping volume down to idle');
+                const skipRampDown = shouldSkipRamping();
+                if (skipRampDown) {
+                  const reason = !rampEnabled ? 'Ramp DISABLED' : 'DAYTIME (day/night mode)';
+                  debugLog(`[AudioMonitoring] ${reason} - Keeping speakers at operating volume`);
+                  // Speakers stay at operating volume - no change needed
+                } else {
+                  debugLog('[AudioMonitoring] NIGHTTIME or ramp mode - Ramping volume down to idle');
                   stopVolumeRamp();
                   await setDevicesVolume(0);
-                } else {
-                  debugLog('[AudioMonitoring] Ramp DISABLED - Keeping speakers at operating volume');
-                  // Speakers stay at operating volume - no change needed
                 }
 
                 // Log with recording URL if available
@@ -2397,7 +2431,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, waitForPagingReady, recordingEnabled]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticast, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, waitForPagingReady, recordingEnabled, shouldSkipRamping]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -2424,15 +2458,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Run speaker setup in background - offline speakers shouldn't block monitoring
     (async () => {
       try {
-        // Step 1: Set speakers to starting volume (depends on ramp setting)
-        if (rampEnabled) {
-          // Ramp enabled: Start at idle volume, will ramp up when audio detected
-          debugLog(`[AudioMonitoring] Step 1: Ramp ENABLED - Setting speakers to idle volume ${getIdleVolumeString()}`);
-          await setDevicesVolume(0); // 0% = idle volume
-        } else {
-          // Ramp disabled: Start at operating volume, stay there
-          debugLog(`[AudioMonitoring] Step 1: Ramp DISABLED - Setting speakers to operating volume`);
+        // Step 1: Set speakers to starting volume (depends on ramp setting and time of day)
+        const skipRamp = shouldSkipRamping();
+        if (skipRamp) {
+          // Ramp disabled OR daytime with day/night mode: Start at operating volume, stay there
+          const reason = !rampEnabled ? 'Ramp DISABLED' : 'DAYTIME (day/night mode)';
+          debugLog(`[AudioMonitoring] Step 1: ${reason} - Setting speakers to operating volume`);
           await setDevicesVolume(100); // 100% scales to each speaker's maxVolume (operating volume)
+        } else {
+          // Nighttime or day/night mode disabled: Start at idle volume, will ramp up when audio detected
+          debugLog(`[AudioMonitoring] Step 1: NIGHTTIME or ramp mode - Setting speakers to idle volume ${getIdleVolumeString()}`);
+          await setDevicesVolume(0); // 0% = idle volume
         }
 
         // Wait briefly to ensure volume command is fully processed
@@ -2461,14 +2497,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
         setSpeakersEnabled(true); // Mark as ready
 
-        const volumeMsg = rampEnabled
-          ? `Idle Volume=${getIdleVolumeString()} (will ramp when audio detected)`
-          : `Operating Volume (ramp disabled)`;
+        const skipRampForLog = shouldSkipRamping();
+        const volumeMsg = skipRampForLog
+          ? `Operating Volume (${!rampEnabled ? 'ramp disabled' : 'daytime - no ramping'})`
+          : `Idle Volume=${getIdleVolumeString()} (will ramp when audio detected)`;
 
         addLog({
           type: "speakers_enabled",
           speakersEnabled: true,
-          volume: rampEnabled ? 0 : 100,
+          volume: skipRampForLog ? 100 : 0,
           message: alwaysKeepPagingOn
             ? `Monitoring ready: Paging=ALWAYS ON (Mode 1), Speakers=LISTENING, ${volumeMsg}`
             : `Monitoring ready: Paging=OFF, Speakers=LISTENING, ${volumeMsg}`,
@@ -2481,7 +2518,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setSpeakersEnabled(true);
       }
     })();
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, waitForPagingOff, setSpeakersMulticast, checkSpeakerConnectivity]);
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, waitForPagingOff, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');
