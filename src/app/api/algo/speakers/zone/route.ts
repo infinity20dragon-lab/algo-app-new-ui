@@ -71,6 +71,10 @@ export async function POST(request: NextRequest) {
     // Make the request to the Algo device
     const algoUrl = `http://${ipAddress}/control/shmcast.lua`;
 
+    console.log(`[Zone API] Changing zone to ${zone} for ${ipAddress}`);
+    console.log(`[Zone API] Request URL: ${algoUrl}`);
+    console.log(`[Zone API] Form data:`, formData.toString());
+
     // Create auth header
     const auth = Buffer.from(`admin:${password}`).toString('base64');
 
@@ -83,9 +87,16 @@ export async function POST(request: NextRequest) {
       body: formData.toString(),
     });
 
+    console.log(`[Zone API] Response status: ${response.status}`);
+
     if (!response.ok) {
+      const responseText = await response.text();
+      console.error(`[Zone API] Error response:`, responseText);
       throw new Error(`Algo device returned ${response.status}: ${response.statusText}`);
     }
+
+    const responseText = await response.text();
+    console.log(`[Zone API] Success response:`, responseText.substring(0, 200));
 
     return NextResponse.json({
       success: true,
