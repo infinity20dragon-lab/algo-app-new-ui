@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
+import { AlgoClient } from "@/lib/algo/client";
 import type { AlgoAuthMethod } from "@/lib/algo/types";
 
 interface PagingZoneRequest {
   ipAddress: string;
   password: string;
-  authMethod?: AlgoAuthMethod; // Optional, defaults to basic
+  authMethod?: AlgoAuthMethod;
   zone: number; // 1-50
 }
 
@@ -27,76 +28,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Build the form data for zone change
-    // Based on the web interface POST to /control/shmcast.lua
-    const formData = new URLSearchParams();
-
-    // Keep device in transmitter mode (mode 1)
-    formData.append("mcast.mode", "1");
-
-    // Set the transmit zone
-    formData.append("mcast.tx.fixed", String(zone));
-
-    // Required fields from the web interface
-    formData.append("mcast.polycom.mode", "0");
-    formData.append("mcast.zones.exp", "0");
-    formData.append("mcast.polycom.zone", "224.0.1.116:5001");
-    formData.append("mcast.groups.select", "0");
-    formData.append("mcast.polycom.default", "1");
-    formData.append("mcast.zones.select", "0");
-    formData.append("mcast.zones.tone", "Default");
-    formData.append("mcast.dtmf.fixed", "0");
-    formData.append("save", "Save");
-
-    // Add all paging groups (enabled)
-    for (let i = 1; i <= 25; i++) {
-      formData.append(`pbgroup${i}`, "1");
-    }
-
-    // Add all transmit zones (enabled)
-    for (let i = 10; i <= 50; i++) {
-      formData.append(`txzone${i}`, "1");
-    }
-
-    // Add common receive zones
-    formData.append("rxzone1", "1");
-    formData.append("rxzone8", "1");
-    formData.append("rxzone9", "1");
-
-    // Add groups
-    formData.append("group1", "1");
-    formData.append("group24", "1");
-    formData.append("group25", "1");
-
-    // Make the request to the Algo device
-    const algoUrl = `http://${ipAddress}/control/shmcast.lua`;
-
-    console.log(`[Zone API] Changing zone to ${zone} for ${ipAddress}`);
-    console.log(`[Zone API] Request URL: ${algoUrl}`);
-    console.log(`[Zone API] Form data:`, formData.toString());
-
-    // Create auth header
-    const auth = Buffer.from(`admin:${password}`).toString('base64');
-
-    const response = await fetch(algoUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": `Basic ${auth}`,
-      },
-      body: formData.toString(),
+    // Use AlgoClient to set the zone - simple!
+    const client = new AlgoClient({
+      ipAddress,
+      password,
+      authMethod: authMethod || "basic",
     });
 
-    console.log(`[Zone API] Response status: ${response.status}`);
+    await client.setSetting({ "mcast.tx.fixed": String(zone) });
 
-    if (!response.ok) {
-      const responseText = await response.text();
-      console.error(`[Zone API] Error response:`, responseText);
-      throw new Error(`Algo device returned ${response.status}: ${response.statusText}`);
-    }
-
-    const responseText = await response.text();
-    console.log(`[Zone API] Success response:`, responseText.substring(0, 200));
+    console.log(`[Zone API] ✓ Changed paging zone to ${zone} for ${ipAddress}`);
 
     return NextResponse.json({
       success: true,
