@@ -683,6 +683,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
+      // 🚨 CRITICAL: Check if recording is stopped FIRST (before chunk check)
+      // This prevents infinite loop when recording ends with no chunks left
+      const mediaRecorder = mediaRecorderRef.current;
+      const isRecording = mediaRecorder?.state === 'recording';
+
+      if (!isRecording && !playbackAudioRef.current && recordedChunksRef.current.length === 0) {
+        // Recording stopped, no audio playing, and no chunks left - we're done!
+        debugLog('[Playback] Recording stopped with no chunks remaining, live stream complete');
+        isPlayingLiveRef.current = false;
+        return;
+      }
+
       // Check if there are chunks to play
       if (recordedChunksRef.current.length === 0) {
         // Only warn once to avoid console spam
@@ -700,11 +712,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         noChunksWarningShownRef.current = false;
       }
 
-      const mediaRecorder = mediaRecorderRef.current;
-      const isRecording = mediaRecorder?.state === 'recording';
-
+      // Additional check: if recording stopped and no audio playing, we're done
       if (!isRecording && !playbackAudioRef.current) {
-        // Recording stopped and no audio playing, we're done
         debugLog('[Playback] Recording stopped, live stream complete');
         isPlayingLiveRef.current = false;
         return;
@@ -2260,9 +2269,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   // NEW FLOW: When live playback is enabled, wait for playback to finish before shutdown
                   debugLog('[AudioMonitoring] Live playback enabled - recording stopped, but keeping paging ON until playback finishes...');
 
-                  // Wait for playback to complete
+                  // Wait for playback to complete with timeout safety mechanism
                   const checkPlaybackFinished = async () => {
+                    const maxWaitTime = 30000; // 30 seconds maximum wait
+                    const startTime = Date.now();
+
                     while (isPlayingLiveRef.current) {
+                      // Safety timeout: if playback is stuck for 30s, force it to stop
+                      if (Date.now() - startTime > maxWaitTime) {
+                        console.warn('[AudioMonitoring] ⚠️ Playback timeout after 30s - forcing shutdown');
+                        isPlayingLiveRef.current = false;
+                        break;
+                      }
                       await new Promise(resolve => setTimeout(resolve, 100)); // Check every 100ms
                     }
                   };
