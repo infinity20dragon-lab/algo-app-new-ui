@@ -672,16 +672,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
+      // Resume AudioContext if suspended (browser autoplay policy)
+      if (playbackAudioContextRef.current.state === 'suspended') {
+        playbackAudioContextRef.current.resume().catch(err => {
+          debugLog('[Playback] Could not resume AudioContext:', err);
+        });
+      }
+
       // Connect this audio element to the existing analyser
       // IMPORTANT: Must connect to destination or audio won't play!
       const source = playbackAudioContextRef.current.createMediaElementSource(audioElement);
       source.connect(playbackAnalyserRef.current);
       playbackAnalyserRef.current.connect(playbackAudioContextRef.current.destination);
 
-      debugLog('[Playback] Connected new audio element to analyser');
+      debugLog('[Playback] ✓ Connected new audio element to analyser');
     } catch (error) {
-      console.error('[Playback] Failed to connect audio element:', error);
-      // Continue playback even if connection fails
+      // This can fail if the audio element is already connected or AudioContext is closed
+      // Log but continue - audio will still play to system output
+      debugLog('[Playback] Could not connect to analyser (audio will still play):', error);
     }
   }, []);
 
@@ -964,9 +972,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
       connectAudioElementToAnalyser(audio);
 
-      // Start from where we left off
-      audio.currentTime = playbackPositionRef.current;
-
       audio.ontimeupdate = () => {
         playbackPositionRef.current = audio.currentTime;
       };
@@ -983,15 +988,48 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       };
 
       audio.onerror = (error) => {
-        console.error('[Playback] Playback error:', error);
+        console.error('[Playback] Playback error - blob may be corrupted:', error);
         URL.revokeObjectURL(audioUrl);
         playbackAudioRef.current = null;
+
+        // On error, reset position to avoid infinite loop
+        playbackPositionRef.current = 0;
 
         if (isPlayingLiveRef.current) {
           setTimeout(() => continuePlayback(), 200);
         }
       };
 
+      // Wait for metadata to load before seeking
+      await new Promise<void>((resolve, reject) => {
+        const timeoutId = setTimeout(() => reject(new Error('Metadata timeout')), 5000);
+
+        audio.onloadedmetadata = () => {
+          clearTimeout(timeoutId);
+
+          // Check if our playback position is valid for this blob
+          if (playbackPositionRef.current > audio.duration) {
+            debugLog(`[Playback] Position ${playbackPositionRef.current.toFixed(2)}s exceeds duration ${audio.duration.toFixed(2)}s, resetting to 0`);
+            playbackPositionRef.current = 0;
+          }
+
+          // Seek to the saved position
+          audio.currentTime = playbackPositionRef.current;
+          debugLog(`[Playback] Seeking to ${playbackPositionRef.current.toFixed(2)}s (duration: ${audio.duration.toFixed(2)}s)`);
+
+          resolve();
+        };
+
+        audio.onerror = () => {
+          clearTimeout(timeoutId);
+          reject(new Error('Audio load error'));
+        };
+
+        // Load the audio
+        audio.load();
+      });
+
+      // Audio automatically plays to system output (captured by BlackHole)
       await audio.play();
     } catch (error) {
       console.error('[Playback] Failed to continue playback:', error);
@@ -2960,13 +2998,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         // Wait briefly to ensure volume command is fully processed
         await new Promise(resolve => setTimeout(resolve, 200));
 
-        // Step 2: NEW APPROACH - Use zones instead of mode toggling (avoids stuck device!)
-        // Set paging to mode 1 (always transmitting) and use zones to control
-        debugLog('[AudioMonitoring] Step 2: Setting paging device to mode 1 (transmitter - always on)');
-        await setPagingMulticast(1);
-
-        // Step 2.5: Set paging to Zone 2 (idle - speakers only listen to Zone 1)
-        debugLog('[AudioMonitoring] Step 2.5: Setting paging to Zone 2 (idle state)');
+        // Step 2: Set paging to Zone 2 (idle - speakers only listen to Zone 1)
+        // NOTE: We don't change mcast mode here - only change zones!
+        debugLog('[AudioMonitoring] Step 2: Setting paging to Zone 2 (idle state)');
         await setPagingZone(2);
 
         // Wait for zone change to confirm
@@ -3003,7 +3037,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setSpeakersEnabled(true);
       }
     })();
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticast, setPagingZone, waitForPagingZoneReady, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping]);
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingZone, waitForPagingZoneReady, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');
@@ -3041,16 +3075,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Step 1: Set speakers to idle volume
       await setDevicesVolume(0);
 
-      // Step 2: Set paging device to mode 0 (ONLY if it was enabled during this session)
-      if (pagingWasEnabledRef.current) {
-        debugLog('[AudioMonitoring] Paging was enabled during session - disabling now');
-        await setPagingMulticast(0);
-        pagingWasEnabledRef.current = false;
-      } else {
-        debugLog('[AudioMonitoring] Paging was never enabled - skipping redundant disable');
-      }
-
-      // Step 3: Set all speakers to mode 0 (disabled)
+      // Step 2: Set all speakers to mode 0 (disabled)
+      // NOTE: We don't change paging mcast mode - only zones!
       await setSpeakersMulticast(0);
 
       controllingSpakersRef.current = false;
@@ -3068,7 +3094,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Reset continuous recording flag
     continuousRecordingRef.current = false;
     validRecordingStartIndexRef.current = 0;
-  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
+  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setSpeakersMulticast, addLog]);
 
   const setVolume = useCallback((vol: number) => {
     setVolumeState(vol);
