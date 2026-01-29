@@ -74,10 +74,10 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}) {
     // Use the higher of the two
     const level = Math.max(freqLevel, timeLevel);
 
-    // Optional: Uncomment for debugging
-    // if (Math.random() < 0.01) {
-    //   console.log("Audio level:", level);
-    // }
+    // Debug: Log when audio is detected
+    if (level > 0) {
+      console.log(`[AudioCapture] Level: ${level}% (freq: ${freqLevel}%, time: ${timeLevel}%)`);
+    }
 
     setState((prev) => ({ ...prev, audioLevel: level }));
 
