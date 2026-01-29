@@ -57,7 +57,7 @@ export interface CallConfig {
   // Callbacks
   onStateChange?: (state: CallState) => void;
   onError?: (error: Error) => void;
-  onLog?: (entry: { type: string; message: string; audioLevel?: number }) => void;
+  onLog?: (entry: { type: any; message: string; audioLevel?: number }) => void;
   onUpload?: (blob: Blob, mimeType: string) => Promise<string>; // Returns download URL
 }
 
@@ -91,8 +91,12 @@ export class CallCoordinator {
   private mediaSource: MediaSource | null = null;
   private sourceBuffer: SourceBuffer | null = null;
   private audio: HTMLAudioElement | null = null;
+  private mediaSourceUrl: string | null = null;
   private chunkQueue: Blob[] = [];
   private isAppending: boolean = false;
+  private lastAppendStartTime: number = 0; // Track when append started
+  private mediaSourceReady: Promise<void> | null = null;
+  private chunkProcessWatchdog: NodeJS.Timeout | null = null; // Watchdog to unstick chunk processing
 
   // Timing
   private silenceDeadline: number = 0;
@@ -102,6 +106,9 @@ export class CallCoordinator {
   // State
   private aborted: boolean = false;
   private isInZone1: boolean = false; // Track if paging device is already in Zone 1
+  private isPlaybackActive: boolean = false; // Track if audio.play() has actually started
+  private mediaSourceCrashed: boolean = false; // Track if MediaSource permanently failed
+  private recoveryAttempts: number = 0; // Track recovery attempts to prevent infinite loops
 
   constructor(config: CallConfig) {
     this.config = {
@@ -246,8 +253,8 @@ export class CallCoordinator {
       return;
     }
 
-    // If we're playing, transition to SilenceWait state
-    if (this.state === CallState.Playing) {
+    // If we're playing AND playback has actually started, transition to SilenceWait state
+    if (this.state === CallState.Playing && this.isPlaybackActive) {
       this.silenceDeadline = now + this.config.disableDelay;
       this.transitionTo(CallState.SilenceWait);
       this.log(`Silence detected, starting ${(this.config.disableDelay / 1000).toFixed(1)}s countdown`);
@@ -270,6 +277,10 @@ export class CallCoordinator {
     if (this.state === CallState.BufferingForDelay ||
         this.state === CallState.Playing ||
         this.state === CallState.SilenceWait) {
+      // Log every 20th chunk
+      if (this.metrics.chunksRecorded % 20 === 0) {
+        this.log(`📥 Chunk ${this.metrics.chunksRecorded} enqueued (queue now: ${this.chunkQueue.length + 1})`);
+      }
       this.enqueueChunk(chunk);
     }
   }
@@ -306,6 +317,14 @@ export class CallCoordinator {
     this.state = newState;
     this.log(`State transition: ${oldState} → ${newState}`);
     this.config.onStateChange(newState);
+
+    // Clear console after call completes (clean slate for next call)
+    if (oldState === CallState.Saving && newState === CallState.Idle) {
+      setTimeout(() => {
+        console.clear();
+        this.log('🆕 Ready for next call (console cleared)');
+      }, 100); // Small delay so logs above are visible briefly
+    }
 
     // Handle state entry logic
     this.onStateEnter(newState);
@@ -547,31 +566,104 @@ export class CallCoordinator {
   private initializeMediaSource(): void {
     this.log('Initializing MediaSource');
 
+    // Cleanup any existing MediaSource first
+    if (this.mediaSourceUrl) {
+      URL.revokeObjectURL(this.mediaSourceUrl);
+      this.mediaSourceUrl = null;
+    }
+    this.mediaSource = null;
+    this.sourceBuffer = null;
+    this.mediaSourceReady = null;
+    this.chunkQueue = [];
+    this.isAppending = false;
+    this.lastAppendStartTime = 0;
+    this.mediaSourceCrashed = false; // Reset for fresh MediaSource
+    // Don't reset recoveryAttempts here - we're recovering, not starting a new call
+
+    // Create fresh MediaSource
     this.mediaSource = new MediaSource();
     this.audio = new Audio();
-    this.audio.src = URL.createObjectURL(this.mediaSource);
+    this.mediaSourceUrl = URL.createObjectURL(this.mediaSource);
+    this.audio.src = this.mediaSourceUrl;
 
-    this.mediaSource.addEventListener('sourceopen', () => {
-      try {
-        const mimeType = this.getBestMimeType();
-        this.sourceBuffer = this.mediaSource!.addSourceBuffer(mimeType);
-        this.sourceBuffer.mode = 'sequence'; // Gapless playback
+    // Create a promise that resolves when MediaSource is ready
+    this.mediaSourceReady = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('MediaSource initialization timeout'));
+      }, 5000);
 
-        this.sourceBuffer.addEventListener('updateend', () => {
-          this.isAppending = false;
+      this.mediaSource!.addEventListener('sourceopen', () => {
+        clearTimeout(timeout);
+        try {
+          const mimeType = this.getBestMimeType();
+          this.sourceBuffer = this.mediaSource!.addSourceBuffer(mimeType);
+          this.sourceBuffer.mode = 'sequence'; // Gapless playback
+
+          this.sourceBuffer.addEventListener('updateend', () => {
+            this.isAppending = false;
+            this.lastAppendStartTime = 0;
+            this.processChunkQueue();
+          });
+
+          this.sourceBuffer.addEventListener('error', (e) => {
+            this.log(`⚠️ SourceBuffer error: ${e}`);
+            this.log(`   MediaSource readyState: ${this.mediaSource?.readyState}`);
+            this.log(`   SourceBuffer updating: ${this.sourceBuffer?.updating}`);
+            this.log(`   Recorded chunks: ${this.recordedChunks.length}`);
+            this.log(`   Recording start index: ${this.recordingStartIndex}`);
+            this.log(`   → Attempting MediaSource recovery...`);
+
+            this.isAppending = false;
+            this.lastAppendStartTime = 0;
+            this.chunkQueue = []; // Clear corrupted chunks
+
+            // Try to recover by reinitializing MediaSource (fire and forget)
+            this.recoverMediaSource().catch((err) => {
+              this.log(`   → Recovery failed catastrophically: ${err}`);
+            });
+          });
+
+          this.sourceBuffer.addEventListener('abort', () => {
+            this.log('⚠️ SourceBuffer aborted');
+            this.isAppending = false;
+            this.lastAppendStartTime = 0;
+            this.chunkQueue = [];
+          });
+
+          this.log(`MediaSource ready (readyState: ${this.mediaSource!.readyState})`);
+
+          // Queue all existing chunks from validated recording (like it was before!)
+          const chunksToQueue = this.recordedChunks.length - this.recordingStartIndex;
+          this.log(`Queueing ${chunksToQueue} chunks for playback`);
+          for (let i = this.recordingStartIndex; i < this.recordedChunks.length; i++) {
+            this.enqueueChunk(this.recordedChunks[i]);
+          }
+
+          // CRITICAL: Trigger processing of any chunks that arrived during initialization
+          // These chunks were enqueued but paused waiting for SourceBuffer
           this.processChunkQueue();
-        });
 
-        this.log('MediaSource ready');
+          // Start watchdog to prevent stuck chunk processing
+          try {
+            this.startChunkProcessWatchdog();
+          } catch (error) {
+            this.log(`⚠️ Failed to start watchdog: ${error}`);
+          }
 
-        // Queue all existing chunks from validated recording
-        for (let i = this.recordingStartIndex; i < this.recordedChunks.length; i++) {
-          this.enqueueChunk(this.recordedChunks[i]);
+          resolve();
+        } catch (error) {
+          clearTimeout(timeout);
+          this.config.onError(error as Error);
+          reject(error);
         }
+      });
 
-      } catch (error) {
-        this.config.onError(error as Error);
-      }
+      this.mediaSource!.addEventListener('error', () => {
+        clearTimeout(timeout);
+        const error = new Error('MediaSource error');
+        this.config.onError(error);
+        reject(error);
+      });
     });
   }
 
@@ -580,38 +672,215 @@ export class CallCoordinator {
     this.processChunkQueue();
   }
 
+  /**
+   * Start a watchdog that periodically checks for stuck chunk processing
+   * This prevents isAppending from getting permanently stuck
+   */
+  private startChunkProcessWatchdog(): void {
+    // Clear any existing watchdog
+    if (this.chunkProcessWatchdog) {
+      clearInterval(this.chunkProcessWatchdog);
+    }
+
+    this.log('🐕 Watchdog started');
+    let tickCount = 0;
+
+    // Check every 500ms for stuck state
+    this.chunkProcessWatchdog = setInterval(() => {
+      tickCount++;
+
+      // Log every 10 ticks to confirm watchdog is running
+      if (tickCount % 10 === 0) {
+        this.log(`🐕 Watchdog alive (tick ${tickCount}, queue: ${this.chunkQueue.length}, isAppending: ${this.isAppending})`);
+      }
+
+      // Check if isAppending is stuck (been true for > 1 second)
+      if (this.isAppending && this.lastAppendStartTime > 0) {
+        const stuckDuration = Date.now() - this.lastAppendStartTime;
+        if (stuckDuration > 1000) {
+          this.log(`⚠️ WATCHDOG: isAppending stuck for ${stuckDuration}ms, forcing reset`);
+          this.log(`   SourceBuffer updating: ${this.sourceBuffer?.updating}`);
+          this.log(`   MediaSource state: ${this.mediaSource?.readyState}`);
+          this.log(`   Chunks in queue: ${this.chunkQueue.length}`);
+          this.log(`   Recorded chunks: ${this.recordedChunks.length}`);
+
+          this.isAppending = false;
+          this.lastAppendStartTime = 0;
+
+          // Trigger processing to restart the flow
+          this.processChunkQueue();
+        }
+      }
+
+      // Also trigger processing if we have queued chunks but nothing is appending
+      if (!this.isAppending && this.chunkQueue.length > 0 && this.sourceBuffer && this.mediaSource?.readyState === 'open') {
+        this.processChunkQueue();
+      }
+    }, 500);
+  }
+
+  /**
+   * Stop the chunk processing watchdog
+   */
+  private stopChunkProcessWatchdog(): void {
+    if (this.chunkProcessWatchdog) {
+      clearInterval(this.chunkProcessWatchdog);
+      this.chunkProcessWatchdog = null;
+    }
+  }
+
+  /**
+   * Recover from MediaSource crash by reinitializing
+   */
+  private async recoverMediaSource(): Promise<void> {
+    // Prevent infinite recovery loops (max 2 attempts)
+    if (this.recoveryAttempts >= 2) {
+      this.log('   → Max recovery attempts reached, giving up on playback');
+      this.mediaSourceCrashed = true;
+      this.stopChunkProcessWatchdog();
+      return;
+    }
+
+    this.recoveryAttempts++;
+    this.log(`   → Cleaning up crashed MediaSource (attempt ${this.recoveryAttempts}/2)`);
+
+    // Stop watchdog
+    this.stopChunkProcessWatchdog();
+
+    // Revoke old URL
+    if (this.mediaSourceUrl) {
+      URL.revokeObjectURL(this.mediaSourceUrl);
+      this.mediaSourceUrl = null;
+    }
+
+    // Clear references
+    this.mediaSource = null;
+    this.sourceBuffer = null;
+    this.mediaSourceReady = null;
+    this.isAppending = false;
+    this.lastAppendStartTime = 0;
+    this.mediaSourceCrashed = false;
+
+    // Create fresh MediaSource
+    this.log('   → Reinitializing MediaSource for recovery');
+    this.initializeMediaSource();
+
+    // Wait for new MediaSource to be ready
+    if (this.mediaSourceReady) {
+      try {
+        await this.mediaSourceReady;
+        this.log('   → MediaSource recovered successfully');
+
+        // If we're already in Playing or SilenceWait state, try to resume playback
+        if (this.state === CallState.Playing || this.state === CallState.SilenceWait) {
+          this.log('   → Resuming playback after recovery');
+          await this.startPlayback();
+        }
+      } catch (error) {
+        this.log(`   → Recovery failed: ${error}`);
+        this.log(`   → Playback disabled, recording continues`);
+        this.mediaSourceCrashed = true; // Mark as permanently failed
+        this.stopChunkProcessWatchdog(); // Stop trying
+      }
+    }
+  }
+
   private processChunkQueue(): void {
     if (this.isAppending || this.chunkQueue.length === 0) {
       return;
     }
 
-    if (!this.sourceBuffer || this.mediaSource?.readyState !== 'open') {
+    // If MediaSource crashed, silently discard chunks (already logged the error)
+    if (this.mediaSourceCrashed) {
+      return;
+    }
+
+    if (!this.sourceBuffer) {
+      // Warn if chunks are piling up
+      if (this.chunkQueue.length > 20) {
+        this.log(`⚠️ No SourceBuffer! ${this.chunkQueue.length} chunks waiting`);
+      }
+      return;
+    }
+
+    if (this.mediaSource?.readyState !== 'open') {
+      // CRITICAL: Only clear queue if MediaSource is 'ended' (permanently closed)
+      // If it's 'closed', it might just be initializing - keep chunks queued!
+      if (this.mediaSource?.readyState === 'ended' && this.chunkQueue.length > 0) {
+        this.log(`⚠️ MediaSource ended, clearing ${this.chunkQueue.length} queued chunks`);
+        this.chunkQueue = [];
+      } else if (this.chunkQueue.length > 20) {
+        // Warn if chunks are piling up while MediaSource is closed
+        this.log(`⚠️ MediaSource state=${this.mediaSource?.readyState}, ${this.chunkQueue.length} chunks waiting`);
+      }
       return;
     }
 
     if (this.sourceBuffer.updating) {
+      if (this.chunkQueue.length > 20) {
+        this.log(`⚠️ SourceBuffer busy updating, ${this.chunkQueue.length} chunks waiting`);
+      }
       return;
     }
 
+    // Log processing every 20 chunks
+    if (this.chunkQueue.length % 20 === 0 && this.chunkQueue.length > 0) {
+      this.log(`📤 Processing chunk (${this.chunkQueue.length} in queue)`);
+    }
+
     this.isAppending = true;
+    this.lastAppendStartTime = Date.now(); // Track when append started
     const chunk = this.chunkQueue.shift()!;
 
     chunk.arrayBuffer().then((buffer) => {
       if (!this.sourceBuffer || this.mediaSource?.readyState !== 'open') {
         this.isAppending = false;
+        this.lastAppendStartTime = 0;
+        // Only clear queue if MediaSource is permanently ended, not just closed
+        if (this.mediaSource?.readyState === 'ended' && this.chunkQueue.length > 0) {
+          this.log(`⚠️ MediaSource ended, clearing ${this.chunkQueue.length} queued chunks`);
+          this.chunkQueue = [];
+        }
         return;
       }
 
       try {
         this.sourceBuffer.appendBuffer(buffer);
+        // Success - chunk is being appended, updateend will fire
       } catch (error) {
-        this.log(`Error appending chunk: ${error}`);
+        this.log(`⚠️ SourceBuffer.appendBuffer() error: ${error}`);
+        this.log(`   MediaSource state: ${this.mediaSource?.readyState}`);
+        this.log(`   SourceBuffer updating: ${this.sourceBuffer.updating}`);
+        this.log(`   Buffer size: ${buffer.byteLength} bytes`);
         this.isAppending = false;
+        this.lastAppendStartTime = 0;
+        // Clear queue on error
+        this.chunkQueue = [];
       }
+    }).catch((error) => {
+      this.log(`⚠️ Chunk arrayBuffer() conversion failed: ${error}`);
+      this.isAppending = false;
+      this.lastAppendStartTime = 0;
+      this.chunkQueue = [];
     });
   }
 
   private async waitForBuffering(): Promise<void> {
+    // Wait for MediaSource to be ready before we do anything else
+    if (this.mediaSourceReady) {
+      this.log('⏳ Waiting for MediaSource to initialize...');
+      try {
+        await this.mediaSourceReady;
+        this.log('✓ MediaSource initialized and ready');
+      } catch (error) {
+        this.log(`⚠️ MediaSource initialization failed: ${error}`);
+        this.config.onError(error as Error);
+        // Try to continue without playback
+        this.transitionTo(CallState.SilenceWait);
+        return;
+      }
+    }
+
     // This delay is for HARDWARE readiness (paging device + speakers switching zones)
     // OPTIMIZATION: Skip delay if we're already in Zone 1 (subsequent calls)
     if (this.isInZone1) {
@@ -628,17 +897,6 @@ export class CallCoordinator {
       await new Promise(resolve => setTimeout(resolve, this.config.playbackDelay));
 
       this.log('   ✓ Hardware stabilized and ready');
-    }
-
-    // Log current buffer status (informational only)
-    try {
-      if (this.sourceBuffer && this.sourceBuffer.buffered.length > 0) {
-        const buffered = this.sourceBuffer.buffered.end(0) - this.sourceBuffer.buffered.start(0);
-        this.metrics.bufferedDuration = buffered;
-        this.log(`📊 Buffer status: ${buffered.toFixed(2)}s of audio ready for playback`);
-      }
-    } catch (error) {
-      // SourceBuffer might have been removed - ignore and continue
     }
 
     // Check if we should go directly to SilenceWait (user stopped talking during buffering)
@@ -658,12 +916,83 @@ export class CallCoordinator {
       return;
     }
 
+    // Double-check MediaSource is ready
+    if (!this.sourceBuffer || this.mediaSource?.readyState !== 'open') {
+      this.log('⚠️ MediaSource not ready for playback');
+      this.log(`   MediaSource state: ${this.mediaSource?.readyState || 'null'}`);
+      this.log(`   SourceBuffer: ${this.sourceBuffer ? 'exists' : 'null'}`);
+      this.log('   → Skipping playback, continuing to silence detection');
+
+      // DON'T call onError - just skip playback and continue recording
+      // This prevents the whole call from failing if playback has issues
+      this.isPlaybackActive = true; // Mark as "active" to allow state transitions
+
+      // If there's a silence countdown, continue it
+      if (this.silenceDeadline > 0) {
+        const remainingSilence = Math.max(0, this.silenceDeadline - Date.now());
+        this.log(`   → Continuing silence countdown (${(remainingSilence / 1000).toFixed(1)}s remaining)`);
+        this.transitionTo(CallState.SilenceWait);
+        this.checkSilenceTimeout();
+      } else {
+        // No silence yet, go to SilenceWait and wait for it
+        this.transitionTo(CallState.SilenceWait);
+      }
+      return;
+    }
+
+    // CRITICAL: Wait for SourceBuffer to have ANY buffered data before playing
+    // MediaSource is designed for streaming - it will continue loading while playing
+    // We just need SOME audio to start, then it streams the rest
+    const maxWaitMs = 3000; // Wait up to 3 seconds for any buffer
+    const startWait = Date.now();
+    let buffered = 0;
+
+    while (Date.now() - startWait < maxWaitMs) {
+      try {
+        if (this.sourceBuffer!.buffered.length > 0) {
+          buffered = this.sourceBuffer!.buffered.end(0) - this.sourceBuffer!.buffered.start(0);
+          if (buffered > 0) {
+            this.log(`✓ Buffer ready: ${buffered.toFixed(2)}s buffered, starting playback`);
+            break;
+          }
+        }
+      } catch (e) {
+        // Ignore buffered range errors
+      }
+      await new Promise(resolve => setTimeout(resolve, 100)); // Check every 100ms
+    }
+
+    // Log if we timed out
+    if (buffered === 0) {
+      this.log(`⚠️ No buffered audio after ${Date.now() - startWait}ms`);
+      this.log(`   Chunks in queue: ${this.chunkQueue.length}`);
+      this.log(`   Recorded chunks: ${this.recordedChunks.length}`);
+      this.log(`   Is appending: ${this.isAppending}`);
+      this.log(`   SourceBuffer updating: ${this.sourceBuffer!.updating}`);
+      this.log(`   → MediaSource may be stuck, will attempt play anyway`);
+    }
+
     try {
-      await this.audio.play();
+      // CRITICAL: Add timeout to prevent audio.play() from hanging indefinitely
+      // Give it 5 seconds since MediaSource might still be appending first chunk
+      const playPromise = this.audio.play();
+      const timeoutPromise = new Promise<void>((_, reject) =>
+        setTimeout(() => reject(new Error('audio.play() timeout - MediaSource may be stuck')), 5000)
+      );
+
+      await Promise.race([playPromise, timeoutPromise]);
       this.metrics.playbackStartTime = Date.now();
       this.log('✓ Playback started');
 
-      // If user stopped talking during buffering, immediately transition to SilenceWait
+      // CRITICAL: Wait 200ms to ensure audio is actually audible before any state transitions
+      // This prevents the "hit or miss" playback issue where audio.play() resolves
+      // before the browser has decoded and played any audible audio
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      // Mark playback as active - now onSilence() can transition to SilenceWait
+      this.isPlaybackActive = true;
+
+      // If user stopped talking during buffering, transition to SilenceWait
       if (this.silenceDeadline > 0) {
         const remainingSilence = Math.max(0, this.silenceDeadline - Date.now());
         this.log(`   → Continuing silence countdown (${(remainingSilence / 1000).toFixed(1)}s remaining)`);
@@ -671,8 +1000,19 @@ export class CallCoordinator {
         this.checkSilenceTimeout();
       }
     } catch (error) {
-      this.log(`Playback error: ${error}`);
-      this.config.onError(error as Error);
+      this.log(`⚠️ Playback failed: ${error}`);
+      this.log('   → Skipping playback, recording continues normally');
+
+      // Mark as "active" so we can transition to SilenceWait
+      this.isPlaybackActive = true;
+
+      // Continue to SilenceWait even if playback failed
+      if (this.silenceDeadline > 0) {
+        const remainingSilence = Math.max(0, this.silenceDeadline - Date.now());
+        this.log(`   → Continuing silence countdown (${(remainingSilence / 1000).toFixed(1)}s remaining)`);
+        this.transitionTo(CallState.SilenceWait);
+        this.checkSilenceTimeout();
+      }
     }
   }
 
@@ -904,11 +1244,17 @@ export class CallCoordinator {
   private async cleanup(success: boolean): Promise<void> {
     this.log(`🧹 Cleanup (${success ? 'upload successful' : 'upload failed'})`);
 
-    // Stop audio
+    // Stop audio and revoke object URL
     if (this.audio) {
       this.audio.pause();
       this.audio.src = '';
       this.audio = null;
+    }
+
+    // CRITICAL: Revoke object URL to prevent memory leaks
+    if (this.mediaSourceUrl) {
+      URL.revokeObjectURL(this.mediaSourceUrl);
+      this.mediaSourceUrl = null;
     }
 
     // Clean MediaSource
@@ -925,10 +1271,20 @@ export class CallCoordinator {
 
     this.sourceBuffer = null;
     this.chunkQueue = [];
+    this.mediaSourceReady = null; // Reset promise for next call
+    this.isAppending = false;
+    this.lastAppendStartTime = 0;
+    this.isPlaybackActive = false; // Reset playback state for next call
+    this.mediaSourceCrashed = false; // Reset crash flag for next call
+    this.recoveryAttempts = 0; // Reset recovery attempts for next call
+
+    // Stop chunk processing watchdog
+    this.stopChunkProcessWatchdog();
 
     // Clean recording - ALWAYS clear chunks after upload (success or failure)
     // The blob has already been created and uploaded, we don't need the chunks anymore
     this.recordedChunks = [];
+    this.recordingStartIndex = 0; // CRITICAL: Reset for next call
 
     this.mediaRecorder = null;
 
