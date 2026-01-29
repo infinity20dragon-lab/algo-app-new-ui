@@ -818,18 +818,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           sourceBuffer.removeEventListener('error', onError);
           isAppendingRef.current = false;
 
-          // Log detailed error information
+          // Log detailed error information (safely, without accessing removed SourceBuffer)
           const mediaSource = mediaSourceRef.current;
           console.error('[MediaSource] SourceBuffer append error:', {
             error: e,
-            sourceBufferUpdating: sourceBuffer.updating,
             mediaSourceReadyState: mediaSource?.readyState,
-            sourceBufferMode: sourceBuffer.mode,
-            buffered: sourceBuffer.buffered.length > 0 ? {
-              start: sourceBuffer.buffered.start(0),
-              end: sourceBuffer.buffered.end(0),
-            } : 'empty',
             arrayBufferSize: arrayBuffer.byteLength,
+            chunkCount: hasInitSegmentRef.current ? 'has init' : 'first chunk',
           });
 
           reject(new Error('SourceBuffer append error'));
@@ -962,6 +957,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         // Setup ondataavailable to feed ONLY MediaSource (not the main recording)
         streamingRecorder.ondataavailable = (event) => {
           if (event.data.size > 0 && mediaSourceReadyRef.current && isPlayingLiveRef.current) {
+            // CRITICAL FIX: Skip tiny chunks (< 100 bytes) - they're incomplete initialization segments
+            // WebM needs a proper cluster with both init + media data
+            if (event.data.size < 100) {
+              debugLog(`[MediaSource] Skipping tiny chunk: ${event.data.size} bytes (incomplete segment)`);
+              return;
+            }
+
             debugLog(`[MediaSource] Appending chunk: ${event.data.size} bytes`);
             appendChunkToSourceBuffer(event.data);
           } else if (event.data.size > 0 && !mediaSourceReadyRef.current) {
@@ -970,6 +972,16 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         };
 
         streamingRecorder.start(1000); // 1000ms chunks for complete WebM segments
+
+        // CRITICAL FIX: Request data immediately to get a complete segment with init + media
+        // This ensures the first chunk has both initialization segment and media data
+        setTimeout(() => {
+          if (streamingRecorder.state === 'recording') {
+            debugLog('[Playback] Requesting complete segment from MediaRecorder');
+            streamingRecorder.requestData();
+          }
+        }, 200); // Wait 200ms to accumulate some media data
+
         debugLog('[Playback] Streaming MediaRecorder started with 1s chunks');
       }
 
