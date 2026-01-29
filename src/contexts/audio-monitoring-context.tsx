@@ -8,9 +8,15 @@ import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage
 import { ref as dbRef, set, push } from "firebase/database";
 import { useAuth } from "@/contexts/auth-context";
 import { getIdleVolumeString, getAlwaysKeepPagingOn } from "@/lib/settings";
+import { CallCoordinator, CallState } from "@/lib/call-coordinator";
 
 // Debug mode - set to false for production to reduce console noise
 const DEBUG_MODE = process.env.NODE_ENV === 'development';
+
+// 🚀 FEATURE FLAG: New CallCoordinator System
+// Set to true to use the new state machine architecture
+// Set to false to use the legacy implementation
+const USE_NEW_CALL_SYSTEM = true; // ✅ ENABLED - Using new state machine!
 
 // Debug logging helper - only logs in development
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -348,7 +354,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const isAppendingRef = useRef<boolean>(false);
   const hasInitSegmentRef = useRef<boolean>(false);
   const mediaSourceReadyRef = useRef<boolean>(false);
-  const streamingRecorderRef = useRef<MediaRecorder | null>(null); // Separate recorder for MediaSource streaming
+  const streamingRecorderRef = useRef<MediaRecorder | null>(null); // Track which recorder started current playback
+
+  // 🚀 NEW CALL COORDINATOR SYSTEM
+  const callCoordinatorRef = useRef<CallCoordinator | null>(null);
 
   const {
     isCapturing,
@@ -504,9 +513,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         if (event.data.size > 0) {
           recordedChunksRef.current.push(event.data);
 
-          // NEW: Append chunk to MediaSource if live playback is active
-          if (playbackEnabled && isPlayingLiveRef.current && mediaSourceReadyRef.current) {
-            appendChunkToSourceBuffer(event.data);
+          // 🚀 NEW CALL COORDINATOR SYSTEM: Feed chunks to coordinator
+          if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
+            callCoordinatorRef.current.onChunkRecorded(event.data);
+          } else {
+            // Legacy system: Append chunk to MediaSource if live playback is active AND this is the recorder that started playback
+            if (playbackEnabled && isPlayingLiveRef.current && mediaSourceReadyRef.current && streamingRecorderRef.current === mediaRecorder) {
+              appendChunkToSourceBuffer(event.data);
+            }
           }
         }
       };
@@ -716,16 +730,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     isAppendingRef.current = false;
     pendingChunksQueueRef.current = [];
 
-    // Stop streaming recorder if it's still running
-    if (streamingRecorderRef.current && streamingRecorderRef.current.state !== 'inactive') {
-      try {
-        streamingRecorderRef.current.stop();
-        streamingRecorderRef.current = null;
-        debugLog('[MediaSource] Stopped streaming MediaRecorder during cleanup');
-      } catch (error) {
-        debugLog('[MediaSource] Error stopping streaming recorder:', error);
-      }
-    }
+    // Disconnect from the recorder (but don't stop it - it may still be recording)
+    streamingRecorderRef.current = null;
 
     // End stream
     try {
@@ -829,6 +835,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
           // Log detailed error information (safely, without accessing removed SourceBuffer)
           const mediaSource = mediaSourceRef.current;
+
+          // If MediaSource is 'ended', this is expected (playback finished, queued chunks don't matter)
+          if (mediaSource?.readyState === 'ended') {
+            debugLog('[MediaSource] SourceBuffer append failed - MediaSource already ended (playback finished)');
+            resolve(); // Resolve instead of reject - this is harmless
+            return;
+          }
+
           console.error('[MediaSource] SourceBuffer append error:', {
             error: e,
             mediaSourceReadyState: mediaSource?.readyState,
@@ -924,180 +938,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser, cleanupMediaSource, getBestAudioMimeType]);
 
-  // Play continuously from recorded chunks (blob-based, simpler and more reliable)
-  const continuePlayback = useCallback(async () => {
-    try {
-      if (!isPlayingLiveRef.current || !playbackEnabled) {
-        debugLog('[Playback] Playback stopped or disabled');
-        return;
-      }
-
-      const mediaRecorder = mediaRecorderRef.current;
-      const isRecording = mediaRecorder?.state === 'recording';
-
-      // If recording stopped and no audio playing and no chunks, we're done
-      if (!isRecording && !playbackAudioRef.current && recordedChunksRef.current.length === 0) {
-        debugLog('[Playback] Playback complete - no more chunks');
-        isPlayingLiveRef.current = false;
-        return;
-      }
-
-      // Check if there are chunks to play
-      if (recordedChunksRef.current.length === 0) {
-        debugLog('[Playback] No chunks yet, waiting...');
-        setTimeout(() => continuePlayback(), 100);
-        return;
-      }
-
-      const mimeType = mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
-
-      // Create blob from ALL recorded chunks (play everything we have so far)
-      const audioBlob = new Blob(recordedChunksRef.current, { type: mimeType });
-
-      if (audioBlob.size === 0) {
-        debugLog('[Playback] Empty blob, waiting for chunks...');
-        setTimeout(() => continuePlayback(), 100);
-        return;
-      }
-
-      // CRITICAL: If recording stopped and blob size isn't growing, check if we're at the end
-      if (!isRecording) {
-        // Create a temporary audio element to check duration
-        const tempAudio = new Audio(URL.createObjectURL(audioBlob));
-        await new Promise<void>((resolve) => {
-          tempAudio.onloadedmetadata = () => {
-            const blobDuration = tempAudio.duration;
-            URL.revokeObjectURL(tempAudio.src);
-
-            // If playback position is at or near the end (within 1 second), we're done
-            if (playbackPositionRef.current >= blobDuration - 1) {
-              debugLog(`[Playback] Reached end of recording (position: ${playbackPositionRef.current.toFixed(2)}s, duration: ${blobDuration.toFixed(2)}s)`);
-              isPlayingLiveRef.current = false;
-              resolve();
-              return;
-            }
-            resolve();
-          };
-          tempAudio.onerror = () => resolve(); // Continue on error
-        });
-
-        // If we stopped playback above, exit
-        if (!isPlayingLiveRef.current) {
-          return;
-        }
-      }
-
-      const audioUrl = URL.createObjectURL(audioBlob);
-
-      debugLog(`[Playback] Playing blob: ${(audioBlob.size / 1024).toFixed(1)}KB from ${playbackPositionRef.current.toFixed(2)}s`);
-
-      const audio = new Audio();
-      playbackAudioRef.current = audio;
-
-      // Setup all handlers BEFORE loading
-      let hasErrored = false;
-
-      audio.ontimeupdate = () => {
-        playbackPositionRef.current = audio.currentTime;
-      };
-
-      audio.onended = () => {
-        playbackPositionRef.current = audio.currentTime || audio.duration || 0;
-        debugLog(`[Playback] Segment ended at ${playbackPositionRef.current.toFixed(2)}s, continuing...`);
-        URL.revokeObjectURL(audioUrl);
-        playbackAudioRef.current = null;
-
-        if (isPlayingLiveRef.current) {
-          setTimeout(() => continuePlayback(), 50);
-        }
-      };
-
-      audio.onerror = (error) => {
-        if (hasErrored) return; // Prevent multiple error handlers
-        hasErrored = true;
-
-        console.error('[Playback] Audio load/play error:', error);
-        URL.revokeObjectURL(audioUrl);
-        playbackAudioRef.current = null;
-
-        // Increment error counter
-        playbackErrorCountRef.current += 1;
-
-        // Stop after 3 consecutive failures to prevent infinite loop
-        if (playbackErrorCountRef.current >= 3) {
-          console.error('[Playback] Too many consecutive errors, stopping playback');
-          isPlayingLiveRef.current = false;
-          playbackErrorCountRef.current = 0;
-          return;
-        }
-
-        // On error, reset position to avoid infinite loop
-        playbackPositionRef.current = 0;
-
-        if (isPlayingLiveRef.current) {
-          setTimeout(() => continuePlayback(), 500);
-        }
-      };
-
-      // Set source and wait for ready
-      audio.src = audioUrl;
-
-      await new Promise<void>((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          if (!hasErrored) {
-            hasErrored = true;
-            reject(new Error('Metadata timeout'));
-          }
-        }, 5000);
-
-        audio.onloadedmetadata = () => {
-          clearTimeout(timeoutId);
-
-          // Check if our playback position is valid for this blob
-          if (playbackPositionRef.current > audio.duration && audio.duration !== Infinity) {
-            debugLog(`[Playback] Position ${playbackPositionRef.current.toFixed(2)}s exceeds duration, resetting to 0`);
-            playbackPositionRef.current = 0;
-          }
-
-          // Seek to the saved position
-          audio.currentTime = playbackPositionRef.current;
-
-          resolve();
-        };
-      });
-
-      // NOW connect to analyser after audio is loaded
-      if (!playbackAudioContextRef.current) {
-        setupPlaybackAudioContext();
-      }
-      connectAudioElementToAnalyser(audio);
-
-      // Audio automatically plays to system output (captured by BlackHole)
-      await audio.play();
-
-      // Reset error counter on successful play
-      playbackErrorCountRef.current = 0;
-    } catch (error) {
-      console.error('[Playback] Failed to continue playback:', error);
-
-      // Increment error counter
-      playbackErrorCountRef.current += 1;
-
-      // Stop after 3 consecutive failures
-      if (playbackErrorCountRef.current >= 3) {
-        console.error('[Playback] Too many consecutive errors, stopping playback');
-        isPlayingLiveRef.current = false;
-        playbackErrorCountRef.current = 0;
-        return;
-      }
-
-      if (isPlayingLiveRef.current) {
-        setTimeout(() => continuePlayback(), 200);
-      }
-    }
-  }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser]);
-
-  // Start playback from recorded chunks
+  // Start playback from recorded chunks using MediaSource API
   const startPlayback = useCallback(async () => {
     try {
       if (!playbackEnabled) {
@@ -1110,25 +951,64 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
-      console.log('[Playback] 🔴 Starting BLOB playback from beginning');
+      console.log('[Playback] 🔴 Starting MediaSource LIVE STREAM playback');
 
+      // Initialize MediaSource
+      const audio = await initializeMediaSource();
+      if (!audio) {
+        console.error('[Playback] Failed to initialize MediaSource');
+        return;
+      }
+
+      // Mark as playing
       isPlayingLiveRef.current = true;
       playbackPositionRef.current = 0;
-      playbackErrorCountRef.current = 0; // Reset error counter
+      playbackErrorCountRef.current = 0;
 
-      addLog({
-        type: "audio_detected",
-        message: `Started blob playback (${recordedChunksRef.current.length} chunks)`,
-      });
+      // Track which MediaRecorder started this playback session
+      streamingRecorderRef.current = mediaRecorderRef.current;
 
-      // Start the playback loop
-      await continuePlayback();
+      // Queue all existing chunks (they'll append automatically via the queue system)
+      debugLog(`[Playback] Queuing ${recordedChunksRef.current.length} existing chunks`);
+      for (const chunk of recordedChunksRef.current) {
+        appendChunkToSourceBuffer(chunk); // Don't await - let them queue and process
+      }
+
+      // Wait until we have at least 1 second of audio buffered before playing
+      // This prevents MediaSource from ending prematurely
+      const startWait = Date.now();
+      const maxWait = 5000; // 5 second timeout
+      while (Date.now() - startWait < maxWait) {
+        const sourceBuffer = sourceBufferRef.current;
+        if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+          const bufferedDuration = sourceBuffer.buffered.end(0) - sourceBuffer.buffered.start(0);
+          if (bufferedDuration >= 1.0) {
+            debugLog(`[Playback] Buffered ${bufferedDuration.toFixed(2)}s of audio, ready to play`);
+            break;
+          }
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      // Start audio playback
+      try {
+        await audio.play();
+        console.log('[Playback] ✓ MediaSource playback started successfully');
+
+        addLog({
+          type: "audio_detected",
+          message: `Started MediaSource streaming (${recordedChunksRef.current.length} chunks from beginning)`,
+        });
+      } catch (playError) {
+        console.error('[Playback] Audio.play() failed:', playError);
+      }
 
     } catch (error) {
       console.error('[Playback] Failed to start playback:', error);
       isPlayingLiveRef.current = false;
+      cleanupMediaSource();
     }
-  }, [playbackEnabled, addLog, continuePlayback]);
+  }, [playbackEnabled, addLog, initializeMediaSource, appendChunkToSourceBuffer, cleanupMediaSource]);
 
   // Stop playback
   const stopPlayback = useCallback(() => {
@@ -1145,8 +1025,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Stop current audio
     if (playbackAudioRef.current) {
       playbackAudioRef.current.pause();
+      playbackAudioRef.current.src = ''; // Clear MediaSource URL
       playbackAudioRef.current = null;
     }
+
+    // Clean up MediaSource
+    cleanupMediaSource();
 
     // Clean up AudioContext
     if (playbackAudioContextRef.current) {
@@ -1160,7 +1044,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       type: "audio_silent",
       message: "Stopped live playback stream",
     });
-  }, [addLog, stopPlaybackLevelTracking]);
+  }, [addLog, stopPlaybackLevelTracking, cleanupMediaSource]);
 
   // Update gain when volume changes
   useEffect(() => {
@@ -2679,6 +2563,16 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       return;
     }
 
+    // 🚀 NEW CALL COORDINATOR SYSTEM: Delegate to CallCoordinator if enabled
+    if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
+      if (audioLevel > audioThreshold) {
+        callCoordinatorRef.current.onAudioDetected(audioLevel);
+      } else {
+        callCoordinatorRef.current.onSilence();
+      }
+      return; // Skip legacy audio detection logic
+    }
+
     // Use configurable disable delay (default 3 seconds)
 
     if (audioLevel > audioThreshold) {
@@ -3012,6 +2906,57 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingZone, waitForPagingZoneReady, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, recordingEnabled, shouldSkipRamping]);
 
+  // 🚀 NEW CALL COORDINATOR: Upload callback for saving recordings to Firebase
+  const uploadRecordingToFirebase = useCallback(async (blob: Blob, mimeType: string): Promise<string> => {
+    if (!user) {
+      throw new Error('No user logged in');
+    }
+
+    try {
+      // Determine file extension based on mime type
+      let fileExtension = 'webm';
+      if (mimeType.includes('ogg')) {
+        fileExtension = 'ogg';
+      } else if (mimeType.includes('mp4')) {
+        fileExtension = 'm4a';
+      }
+
+      // Generate timestamp for filename
+      const now = new Date();
+      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const year = pstTime.getFullYear();
+      const month = String(pstTime.getMonth() + 1).padStart(2, '0');
+      const day = String(pstTime.getDate()).padStart(2, '0');
+      let hours = pstTime.getHours();
+      const minutes = String(pstTime.getMinutes()).padStart(2, '0');
+      const seconds = String(pstTime.getSeconds()).padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12;
+      const hoursStr = String(hours).padStart(2, '0');
+
+      const timestamp = `${year}-${month}-${day}-${hoursStr}-${minutes}-${seconds}-${ampm}`;
+      const filename = `recording-${timestamp}.${fileExtension}`;
+
+      // Create daily folder
+      const dailyFolder = `${year}-${month}-${day}-pst-recordings`;
+      const filePath = `audio-recordings/${user.uid}/${dailyFolder}/${filename}`;
+
+      // Upload to Firebase Storage
+      debugLog(`[CallCoordinator] Uploading ${fileExtension.toUpperCase()} to ${filePath}`);
+      const fileRef = storageRef(storage, filePath);
+      await uploadBytes(fileRef, blob);
+
+      // Get download URL
+      const downloadUrl = await getDownloadURL(fileRef);
+      debugLog('[CallCoordinator] Upload successful:', downloadUrl);
+
+      return downloadUrl;
+    } catch (error) {
+      console.error('[CallCoordinator] Upload failed:', error);
+      throw error;
+    }
+  }, [user]);
+
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
 
@@ -3027,6 +2972,37 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Start audio capture IMMEDIATELY - don't wait for speaker setup
     // This ensures the UI responds instantly and audio is being captured
     startCapture(inputDevice);
+
+    // 🚀 NEW CALL COORDINATOR SYSTEM: Initialize if enabled
+    if (USE_NEW_CALL_SYSTEM && monitoringStream) {
+      debugLog('[CallCoordinator] Initializing new call coordinator system');
+
+      // Get the first selected paging device (type 8301)
+      const pagingDevices = devices.filter(d =>
+        d.type === "8301" && selectedDevices.includes(d.id)
+      );
+      const pagingDevice = pagingDevices.length > 0
+        ? { id: pagingDevices[0].id, name: pagingDevices[0].name, ip: pagingDevices[0].ip }
+        : null;
+
+      const config = {
+        audioThreshold,
+        sustainDuration,
+        playbackEnabled,
+        playbackDelay: playbackDelay, // Already in milliseconds
+        disableDelay: disableDelay, // Already in milliseconds
+        pagingDevice,
+        setPagingZone,
+        waitForPagingZoneReady,
+        onLog: addLog,
+        onUpload: uploadRecordingToFirebase,
+      };
+
+      callCoordinatorRef.current = new CallCoordinator(config);
+      await callCoordinatorRef.current.start(monitoringStream);
+
+      debugLog('[CallCoordinator] Call coordinator started');
+    }
 
     // Check speaker connectivity first (in background)
     checkSpeakerConnectivity();
@@ -3092,7 +3068,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setSpeakersEnabled(true);
       }
     })();
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingZone, waitForPagingZoneReady, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping]);
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingZone, waitForPagingZoneReady, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping, sustainDuration, playbackEnabled, playbackDelay, disableDelay, devices, selectedDevices, uploadRecordingToFirebase, monitoringStream]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');
@@ -3138,6 +3114,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       debugLog(`[AudioMonitoring] ✓ Clean shutdown complete: All devices mode 0, speakers ${getIdleVolumeString()}`);
     }
 
+    // 🚀 NEW CALL COORDINATOR SYSTEM: Abort if active
+    if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
+      debugLog('[CallCoordinator] Aborting call coordinator');
+      await callCoordinatorRef.current.abort();
+      callCoordinatorRef.current = null;
+    }
+
     // Clean up playback
     isPlayingLiveRef.current = false;
     playbackPositionRef.current = 0;
@@ -3146,10 +3129,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       playbackAudioRef.current = null;
     }
 
+    // Clean up MediaSource if active
+    cleanupMediaSource();
+
     // Reset continuous recording flag
     continuousRecordingRef.current = false;
     validRecordingStartIndexRef.current = 0;
-  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setSpeakersMulticast, addLog]);
+  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setSpeakersMulticast, addLog, cleanupMediaSource]);
 
   const setVolume = useCallback((vol: number) => {
     setVolumeState(vol);
