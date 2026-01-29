@@ -963,14 +963,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       debugLog(`[Playback] Playing blob: ${(audioBlob.size / 1024).toFixed(1)}KB from ${playbackPositionRef.current.toFixed(2)}s`);
 
-      const audio = new Audio(audioUrl);
+      const audio = new Audio();
       playbackAudioRef.current = audio;
 
-      // Setup audio context for level monitoring
-      if (!playbackAudioContextRef.current) {
-        setupPlaybackAudioContext();
-      }
-      connectAudioElementToAnalyser(audio);
+      // Setup all handlers BEFORE loading
+      let hasErrored = false;
 
       audio.ontimeupdate = () => {
         playbackPositionRef.current = audio.currentTime;
@@ -988,7 +985,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       };
 
       audio.onerror = (error) => {
-        console.error('[Playback] Playback error - blob may be corrupted:', error);
+        if (hasErrored) return; // Prevent multiple error handlers
+        hasErrored = true;
+
+        console.error('[Playback] Audio load/play error:', error);
         URL.revokeObjectURL(audioUrl);
         playbackAudioRef.current = null;
 
@@ -996,13 +996,20 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         playbackPositionRef.current = 0;
 
         if (isPlayingLiveRef.current) {
-          setTimeout(() => continuePlayback(), 200);
+          setTimeout(() => continuePlayback(), 500);
         }
       };
 
-      // Wait for metadata to load before seeking
+      // Set source and wait for ready
+      audio.src = audioUrl;
+
       await new Promise<void>((resolve, reject) => {
-        const timeoutId = setTimeout(() => reject(new Error('Metadata timeout')), 5000);
+        const timeoutId = setTimeout(() => {
+          if (!hasErrored) {
+            hasErrored = true;
+            reject(new Error('Metadata timeout'));
+          }
+        }, 5000);
 
         audio.onloadedmetadata = () => {
           clearTimeout(timeoutId);
@@ -1019,15 +1026,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
           resolve();
         };
-
-        audio.onerror = () => {
-          clearTimeout(timeoutId);
-          reject(new Error('Audio load error'));
-        };
-
-        // Load the audio
-        audio.load();
       });
+
+      // NOW connect to analyser after audio is loaded
+      if (!playbackAudioContextRef.current) {
+        setupPlaybackAudioContext();
+      }
+      connectAudioElementToAnalyser(audio);
 
       // Audio automatically plays to system output (captured by BlackHole)
       await audio.play();
