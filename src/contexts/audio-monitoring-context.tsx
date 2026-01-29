@@ -303,7 +303,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [dayStartHour, setDayStartHourState] = useState(6); // 6 AM
   const [dayEndHour, setDayEndHourState] = useState(18); // 6 PM
   const [nightRampDuration, setNightRampDurationState] = useState(10); // 10 seconds for night
-  const [sustainDuration, setSustainDurationState] = useState(1000); // 1 second default (in ms)
+  const [sustainDuration, setSustainDurationState] = useState(50); // 50ms default for faster detection (in ms)
   const [disableDelay, setDisableDelayState] = useState(3000); // 3 seconds default (in ms)
 
   const audioDetectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -915,8 +915,93 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser, cleanupMediaSource, getBestAudioMimeType]);
 
-  // Continue playing (for live streaming effect)
-  // Start live playback from recorded chunks
+  // Play continuously from recorded chunks (blob-based, simpler and more reliable)
+  const continuePlayback = useCallback(async () => {
+    try {
+      if (!isPlayingLiveRef.current || !playbackEnabled) {
+        debugLog('[Playback] Playback stopped or disabled');
+        return;
+      }
+
+      const mediaRecorder = mediaRecorderRef.current;
+      const isRecording = mediaRecorder?.state === 'recording';
+
+      // If recording stopped and no audio playing and no chunks, we're done
+      if (!isRecording && !playbackAudioRef.current && recordedChunksRef.current.length === 0) {
+        debugLog('[Playback] Playback complete - no more chunks');
+        isPlayingLiveRef.current = false;
+        return;
+      }
+
+      // Check if there are chunks to play
+      if (recordedChunksRef.current.length === 0) {
+        debugLog('[Playback] No chunks yet, waiting...');
+        setTimeout(() => continuePlayback(), 100);
+        return;
+      }
+
+      const mimeType = mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
+
+      // Create blob from ALL recorded chunks (play everything we have so far)
+      const audioBlob = new Blob(recordedChunksRef.current, { type: mimeType });
+
+      if (audioBlob.size === 0) {
+        debugLog('[Playback] Empty blob, waiting for chunks...');
+        setTimeout(() => continuePlayback(), 100);
+        return;
+      }
+
+      const audioUrl = URL.createObjectURL(audioBlob);
+
+      debugLog(`[Playback] Playing blob: ${(audioBlob.size / 1024).toFixed(1)}KB from ${playbackPositionRef.current.toFixed(2)}s`);
+
+      const audio = new Audio(audioUrl);
+      playbackAudioRef.current = audio;
+
+      // Setup audio context for level monitoring
+      if (!playbackAudioContextRef.current) {
+        setupPlaybackAudioContext();
+      }
+      connectAudioElementToAnalyser(audio);
+
+      // Start from where we left off
+      audio.currentTime = playbackPositionRef.current;
+
+      audio.ontimeupdate = () => {
+        playbackPositionRef.current = audio.currentTime;
+      };
+
+      audio.onended = () => {
+        playbackPositionRef.current = audio.currentTime || audio.duration || 0;
+        debugLog(`[Playback] Segment ended at ${playbackPositionRef.current.toFixed(2)}s, continuing...`);
+        URL.revokeObjectURL(audioUrl);
+        playbackAudioRef.current = null;
+
+        if (isPlayingLiveRef.current) {
+          setTimeout(() => continuePlayback(), 50);
+        }
+      };
+
+      audio.onerror = (error) => {
+        console.error('[Playback] Playback error:', error);
+        URL.revokeObjectURL(audioUrl);
+        playbackAudioRef.current = null;
+
+        if (isPlayingLiveRef.current) {
+          setTimeout(() => continuePlayback(), 200);
+        }
+      };
+
+      await audio.play();
+    } catch (error) {
+      console.error('[Playback] Failed to continue playback:', error);
+      if (isPlayingLiveRef.current) {
+        setTimeout(() => continuePlayback(), 200);
+      }
+    }
+  }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser]);
+
+  // Start playback from recorded chunks
   const startPlayback = useCallback(async () => {
     try {
       if (!playbackEnabled) {
@@ -929,83 +1014,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
-      console.log('[Playback] 🔴 Starting MediaSource LIVE STREAM playback');
+      console.log('[Playback] 🔴 Starting BLOB playback from beginning');
 
-      // STEP 1: Initialize MediaSource FIRST (must be ready before chunks arrive)
-      const audio = await initializeMediaSource();
-      if (!audio) {
-        console.error('[Playback] Failed to initialize MediaSource');
-        return;
-      }
-
-      // Mark as playing
       isPlayingLiveRef.current = true;
+      playbackPositionRef.current = 0;
 
-      // STEP 2: Start streaming MediaRecorder with LONGER chunks for better segment completeness
-      // Longer chunks (1000ms) = more complete WebM segments = better SourceBuffer compatibility
-      if (monitoringStream) {
-        debugLog('[Playback] Creating dedicated MediaRecorder for MediaSource streaming (1000ms chunks for complete segments)');
+      addLog({
+        type: "audio_detected",
+        message: `Started blob playback (${recordedChunksRef.current.length} chunks)`,
+      });
 
-        const mimeType = getBestAudioMimeType();
-        const streamingRecorder = new MediaRecorder(monitoringStream, {
-          mimeType,
-          audioBitsPerSecond: 128000,
-        });
-
-        streamingRecorderRef.current = streamingRecorder;
-
-        // Setup ondataavailable to feed ONLY MediaSource (not the main recording)
-        streamingRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0 && mediaSourceReadyRef.current && isPlayingLiveRef.current) {
-            // CRITICAL FIX: Skip tiny chunks (< 100 bytes) - they're incomplete initialization segments
-            // WebM needs a proper cluster with both init + media data
-            if (event.data.size < 100) {
-              debugLog(`[MediaSource] Skipping tiny chunk: ${event.data.size} bytes (incomplete segment)`);
-              return;
-            }
-
-            debugLog(`[MediaSource] Appending chunk: ${event.data.size} bytes`);
-            appendChunkToSourceBuffer(event.data);
-          } else if (event.data.size > 0 && !mediaSourceReadyRef.current) {
-            console.warn(`[MediaSource] Chunk arrived but MediaSource not ready (size: ${event.data.size})`);
-          }
-        };
-
-        streamingRecorder.start(1000); // 1000ms chunks for complete WebM segments
-
-        // CRITICAL FIX: Request data immediately to get a complete segment with init + media
-        // This ensures the first chunk has both initialization segment and media data
-        setTimeout(() => {
-          if (streamingRecorder.state === 'recording') {
-            debugLog('[Playback] Requesting complete segment from MediaRecorder');
-            streamingRecorder.requestData();
-          }
-        }, 200); // Wait 200ms to accumulate some media data
-
-        debugLog('[Playback] Streaming MediaRecorder started with 1s chunks');
-      }
-
-      debugLog(`[Playback] MediaSource ready - streaming from dedicated recorder (${recordedChunksRef.current.length} chunks in main recording)`);
-
-      // Start audio playback (first chunk will arrive within 1 second)
-      try {
-        await audio.play();
-        console.log('[Playback] ✓ MediaSource playback started - waiting for chunks');
-
-        addLog({
-          type: "audio_detected",
-          message: `Started MediaSource streaming (live, ${recordedChunksRef.current.length} chunks recorded)`,
-        });
-      } catch (playError) {
-        console.error('[Playback] Audio.play() failed:', playError);
-      }
+      // Start the playback loop
+      await continuePlayback();
 
     } catch (error) {
       console.error('[Playback] Failed to start playback:', error);
       isPlayingLiveRef.current = false;
-      cleanupMediaSource();
     }
-  }, [playbackEnabled, addLog, initializeMediaSource, appendChunkToSourceBuffer, cleanupMediaSource, getBestAudioMimeType, monitoringStream]);
+  }, [playbackEnabled, addLog, continuePlayback]);
 
   // Stop playback
   const stopPlayback = useCallback(() => {
@@ -1019,22 +1045,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Stop audio level tracking
     stopPlaybackLevelTracking();
 
-    // Stop streaming MediaRecorder
-    if (streamingRecorderRef.current && streamingRecorderRef.current.state !== 'inactive') {
-      streamingRecorderRef.current.stop();
-      streamingRecorderRef.current = null;
-      debugLog('[Playback] Stopped streaming MediaRecorder');
-    }
-
     // Stop current audio
     if (playbackAudioRef.current) {
       playbackAudioRef.current.pause();
-      playbackAudioRef.current.src = ''; // Clear MediaSource URL
       playbackAudioRef.current = null;
     }
-
-    // Clean up MediaSource
-    cleanupMediaSource();
 
     // Clean up AudioContext
     if (playbackAudioContextRef.current) {
@@ -1048,7 +1063,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       type: "audio_silent",
       message: "Stopped live playback stream",
     });
-  }, [addLog, stopPlaybackLevelTracking, cleanupMediaSource]);
+  }, [addLog, stopPlaybackLevelTracking]);
 
   // Update gain when volume changes
   useEffect(() => {
@@ -3050,13 +3065,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       playbackAudioRef.current = null;
     }
 
-    // Clean up MediaSource if active
-    cleanupMediaSource();
-
     // Reset continuous recording flag
     continuousRecordingRef.current = false;
     validRecordingStartIndexRef.current = 0;
-  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog, cleanupMediaSource]);
+  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setPagingMulticast, setSpeakersMulticast, addLog]);
 
   const setVolume = useCallback((vol: number) => {
     setVolumeState(vol);
