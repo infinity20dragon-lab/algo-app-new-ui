@@ -74,11 +74,6 @@ export function useAudioCapture(options: UseAudioCaptureOptions = {}) {
     // Use the higher of the two
     const level = Math.max(freqLevel, timeLevel);
 
-    // Debug: Log when audio is detected
-    if (level > 0) {
-      console.log(`[AudioCapture] Level: ${level}% (freq: ${freqLevel}%, time: ${timeLevel}%)`);
-    }
-
     setState((prev) => ({ ...prev, audioLevel: level }));
 
     animationFrameRef.current = requestAnimationFrame(updateAudioLevel);

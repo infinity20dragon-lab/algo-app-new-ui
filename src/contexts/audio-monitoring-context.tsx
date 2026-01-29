@@ -334,6 +334,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const isPlayingLiveRef = useRef<boolean>(false); // Track if live playback is active
   const playbackPositionRef = useRef<number>(0); // Track playback position in seconds
   const noChunksWarningShownRef = useRef<boolean>(false); // Track if we've shown "no chunks" warning
+  const playbackErrorCountRef = useRef<number>(0); // Track consecutive playback errors
   const [playbackAudioLevel, setPlaybackAudioLevel] = useState<number>(0);
   const playbackAudioContextRef = useRef<AudioContext | null>(null);
   const playbackAnalyserRef = useRef<AnalyserNode | null>(null);
@@ -992,6 +993,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         URL.revokeObjectURL(audioUrl);
         playbackAudioRef.current = null;
 
+        // Increment error counter
+        playbackErrorCountRef.current += 1;
+
+        // Stop after 3 consecutive failures to prevent infinite loop
+        if (playbackErrorCountRef.current >= 3) {
+          console.error('[Playback] Too many consecutive errors, stopping playback');
+          isPlayingLiveRef.current = false;
+          playbackErrorCountRef.current = 0;
+          return;
+        }
+
         // On error, reset position to avoid infinite loop
         playbackPositionRef.current = 0;
 
@@ -1035,8 +1047,23 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       // Audio automatically plays to system output (captured by BlackHole)
       await audio.play();
+
+      // Reset error counter on successful play
+      playbackErrorCountRef.current = 0;
     } catch (error) {
       console.error('[Playback] Failed to continue playback:', error);
+
+      // Increment error counter
+      playbackErrorCountRef.current += 1;
+
+      // Stop after 3 consecutive failures
+      if (playbackErrorCountRef.current >= 3) {
+        console.error('[Playback] Too many consecutive errors, stopping playback');
+        isPlayingLiveRef.current = false;
+        playbackErrorCountRef.current = 0;
+        return;
+      }
+
       if (isPlayingLiveRef.current) {
         setTimeout(() => continuePlayback(), 200);
       }
@@ -1060,6 +1087,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       isPlayingLiveRef.current = true;
       playbackPositionRef.current = 0;
+      playbackErrorCountRef.current = 0; // Reset error counter
 
       addLog({
         type: "audio_detected",
@@ -2850,13 +2878,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
                   // Wait for playback to complete with timeout safety mechanism
                   const checkPlaybackFinished = async () => {
-                    const maxWaitTime = 30000; // 30 seconds maximum wait
+                    const maxWaitTime = 120000; // 2 minutes maximum wait (for long recordings)
                     const startTime = Date.now();
 
                     while (isPlayingLiveRef.current) {
-                      // Safety timeout: if playback is stuck for 30s, force it to stop
+                      // Safety timeout: if playback is stuck for 2 minutes, force it to stop
                       if (Date.now() - startTime > maxWaitTime) {
-                        console.warn('[AudioMonitoring] ⚠️ Playback timeout after 30s - forcing shutdown');
+                        console.warn('[AudioMonitoring] ⚠️ Playback timeout after 2 minutes - forcing shutdown');
                         isPlayingLiveRef.current = false;
                         break;
                       }
