@@ -709,12 +709,12 @@ export default function LiveBroadcastPage() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <Label>Sustain Duration</Label>
-                    <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedSustainDuration / 1000).toFixed(1)}s</span>
+                    <span className="text-sm font-mono text-[var(--accent-blue)]">{displayedSustainDuration >= 1000 ? `${(displayedSustainDuration / 1000).toFixed(1)}s` : `${displayedSustainDuration}ms`}</span>
                   </div>
                   <Slider
-                    min={0}
+                    min={10}
                     max={3000}
-                    step={100}
+                    step={10}
                     value={displayedSustainDuration}
                     onChange={(e) => setSustainDuration(parseInt(e.target.value))}
                   />

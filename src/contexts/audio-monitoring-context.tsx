@@ -1015,14 +1015,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           clearTimeout(timeoutId);
 
           // Check if our playback position is valid for this blob
-          if (playbackPositionRef.current > audio.duration) {
-            debugLog(`[Playback] Position ${playbackPositionRef.current.toFixed(2)}s exceeds duration ${audio.duration.toFixed(2)}s, resetting to 0`);
+          if (playbackPositionRef.current > audio.duration && audio.duration !== Infinity) {
+            debugLog(`[Playback] Position ${playbackPositionRef.current.toFixed(2)}s exceeds duration, resetting to 0`);
             playbackPositionRef.current = 0;
           }
 
           // Seek to the saved position
           audio.currentTime = playbackPositionRef.current;
-          debugLog(`[Playback] Seeking to ${playbackPositionRef.current.toFixed(2)}s (duration: ${audio.duration.toFixed(2)}s)`);
 
           resolve();
         };
