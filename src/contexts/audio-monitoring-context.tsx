@@ -960,6 +960,33 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
+      // CRITICAL: If recording stopped and blob size isn't growing, check if we're at the end
+      if (!isRecording) {
+        // Create a temporary audio element to check duration
+        const tempAudio = new Audio(URL.createObjectURL(audioBlob));
+        await new Promise<void>((resolve) => {
+          tempAudio.onloadedmetadata = () => {
+            const blobDuration = tempAudio.duration;
+            URL.revokeObjectURL(tempAudio.src);
+
+            // If playback position is at or near the end (within 1 second), we're done
+            if (playbackPositionRef.current >= blobDuration - 1) {
+              debugLog(`[Playback] Reached end of recording (position: ${playbackPositionRef.current.toFixed(2)}s, duration: ${blobDuration.toFixed(2)}s)`);
+              isPlayingLiveRef.current = false;
+              resolve();
+              return;
+            }
+            resolve();
+          };
+          tempAudio.onerror = () => resolve(); // Continue on error
+        });
+
+        // If we stopped playback above, exit
+        if (!isPlayingLiveRef.current) {
+          return;
+        }
+      }
+
       const audioUrl = URL.createObjectURL(audioBlob);
 
       debugLog(`[Playback] Playing blob: ${(audioBlob.size / 1024).toFixed(1)}KB from ${playbackPositionRef.current.toFixed(2)}s`);
@@ -2859,18 +2886,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               (async () => {
                 let recordingUrl: string | null = null;
 
-                if (playbackEnabled && isPlayingLiveRef.current) {
-                  // NEW FLOW: When live playback is active, DON'T stop recording yet!
-                  // MediaSource needs continuous chunks from the MediaRecorder
-                  debugLog('[AudioMonitoring] Live playback active - keeping MediaRecorder running for streaming...');
-                } else {
-                  // Stop recording and upload (happens at audio end + disable delay)
-                  recordingUrl = await stopRecordingAndUpload();
+                // Stop recording and upload (happens at audio end + disable delay)
+                // IMPORTANT: Always stop recording here, even during playback!
+                // Blob playback will continue from the recorded chunks
+                recordingUrl = await stopRecordingAndUpload();
 
-                  // Reset continuous recording flag for next call
-                  continuousRecordingRef.current = false;
-                  validRecordingStartIndexRef.current = 0;
-                }
+                // Reset continuous recording flag for next call
+                continuousRecordingRef.current = false;
+                validRecordingStartIndexRef.current = 0;
 
                 if (playbackEnabled) {
                   // Wait for playback to finish before shutdown
