@@ -699,9 +699,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const cleanupMediaSource = useCallback(() => {
     debugLog('[MediaSource] Cleaning up');
 
+    // CRITICAL: Disable MediaSource FIRST to prevent new chunks from trying to append
+    mediaSourceReadyRef.current = false;
+    hasInitSegmentRef.current = false;
+
     // Stop appending
     isAppendingRef.current = false;
     pendingChunksQueueRef.current = [];
+
+    // Stop streaming recorder if it's still running
+    if (streamingRecorderRef.current && streamingRecorderRef.current.state !== 'inactive') {
+      try {
+        streamingRecorderRef.current.stop();
+        streamingRecorderRef.current = null;
+        debugLog('[MediaSource] Stopped streaming MediaRecorder during cleanup');
+      } catch (error) {
+        debugLog('[MediaSource] Error stopping streaming recorder:', error);
+      }
+    }
 
     // End stream
     try {
@@ -726,8 +741,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Clear refs
     sourceBufferRef.current = null;
     mediaSourceRef.current = null;
-    hasInitSegmentRef.current = false;
-    mediaSourceReadyRef.current = false;
 
     debugLog('[MediaSource] Cleanup complete');
   }, []);
@@ -769,8 +782,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         hasInitSegmentRef.current = true;
       }
 
+      // CRITICAL: Re-check before append (MediaSource might have been cleaned up during arrayBuffer conversion)
+      if (!sourceBufferRef.current || !mediaSourceRef.current || mediaSourceRef.current.readyState !== 'open') {
+        debugLog('[MediaSource] SourceBuffer removed during append preparation, discarding chunk');
+        isAppendingRef.current = false;
+        return;
+      }
+
+      // Debug logging
+      debugLog(`[MediaSource] Appending ${arrayBuffer.byteLength} bytes to SourceBuffer (MediaSource state: ${mediaSourceRef.current.readyState})`);
+
       // Append to SourceBuffer
-      sourceBuffer.appendBuffer(arrayBuffer);
+      try {
+        sourceBuffer.appendBuffer(arrayBuffer);
+      } catch (appendError) {
+        console.error('[MediaSource] appendBuffer threw error:', appendError);
+        isAppendingRef.current = false;
+        throw appendError;
+      }
 
       // Wait for append to complete
       await new Promise<void>((resolve, reject) => {
@@ -788,7 +817,21 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           sourceBuffer.removeEventListener('updateend', onUpdateEnd);
           sourceBuffer.removeEventListener('error', onError);
           isAppendingRef.current = false;
-          console.error('[MediaSource] SourceBuffer append error:', e);
+
+          // Log detailed error information
+          const mediaSource = mediaSourceRef.current;
+          console.error('[MediaSource] SourceBuffer append error:', {
+            error: e,
+            sourceBufferUpdating: sourceBuffer.updating,
+            mediaSourceReadyState: mediaSource?.readyState,
+            sourceBufferMode: sourceBuffer.mode,
+            buffered: sourceBuffer.buffered.length > 0 ? {
+              start: sourceBuffer.buffered.start(0),
+              end: sourceBuffer.buffered.end(0),
+            } : 'empty',
+            arrayBufferSize: arrayBuffer.byteLength,
+          });
+
           reject(new Error('SourceBuffer append error'));
         };
 
@@ -812,8 +855,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return null;
       }
 
-      // Check codec support
-      const mimeType = 'audio/webm; codecs="opus"';
+      // Use the SAME mimeType as MediaRecorder to ensure compatibility
+      const mimeType = getBestAudioMimeType();
+      debugLog(`[MediaSource] Using mimeType: ${mimeType}`);
+
       if (!MediaSource.isTypeSupported(mimeType)) {
         console.error('[MediaSource] Codec not supported:', mimeType);
         return null;
@@ -873,7 +918,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       cleanupMediaSource();
       return null;
     }
-  }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser, cleanupMediaSource]);
+  }, [playbackEnabled, setupPlaybackAudioContext, connectAudioElementToAnalyser, cleanupMediaSource, getBestAudioMimeType]);
 
   // Continue playing (for live streaming effect)
   // Start live playback from recorded chunks
@@ -891,10 +936,20 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
       console.log('[Playback] 🔴 Starting MediaSource LIVE STREAM playback');
 
-      // Create a SEPARATE MediaRecorder just for MediaSource streaming
-      // This ensures we get proper initialization segments without disrupting the main recording
+      // STEP 1: Initialize MediaSource FIRST (must be ready before chunks arrive)
+      const audio = await initializeMediaSource();
+      if (!audio) {
+        console.error('[Playback] Failed to initialize MediaSource');
+        return;
+      }
+
+      // Mark as playing
+      isPlayingLiveRef.current = true;
+
+      // STEP 2: Start streaming MediaRecorder with LONGER chunks for better segment completeness
+      // Longer chunks (1000ms) = more complete WebM segments = better SourceBuffer compatibility
       if (monitoringStream) {
-        debugLog('[Playback] Creating dedicated MediaRecorder for MediaSource streaming');
+        debugLog('[Playback] Creating dedicated MediaRecorder for MediaSource streaming (1000ms chunks for complete segments)');
 
         const mimeType = getBestAudioMimeType();
         const streamingRecorder = new MediaRecorder(monitoringStream, {
@@ -906,31 +961,24 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
         // Setup ondataavailable to feed ONLY MediaSource (not the main recording)
         streamingRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0 && mediaSourceReadyRef.current) {
+          if (event.data.size > 0 && mediaSourceReadyRef.current && isPlayingLiveRef.current) {
+            debugLog(`[MediaSource] Appending chunk: ${event.data.size} bytes`);
             appendChunkToSourceBuffer(event.data);
+          } else if (event.data.size > 0 && !mediaSourceReadyRef.current) {
+            console.warn(`[MediaSource] Chunk arrived but MediaSource not ready (size: ${event.data.size})`);
           }
         };
 
-        streamingRecorder.start(100); // 100ms chunks
-        debugLog('[Playback] Streaming MediaRecorder started (parallel to main recording)');
+        streamingRecorder.start(1000); // 1000ms chunks for complete WebM segments
+        debugLog('[Playback] Streaming MediaRecorder started with 1s chunks');
       }
-
-      // Initialize MediaSource
-      const audio = await initializeMediaSource();
-      if (!audio) {
-        console.error('[Playback] Failed to initialize MediaSource');
-        return;
-      }
-
-      // Mark as playing
-      isPlayingLiveRef.current = true;
 
       debugLog(`[Playback] MediaSource ready - streaming from dedicated recorder (${recordedChunksRef.current.length} chunks in main recording)`);
 
-      // Start audio playback (first chunk will arrive within 100ms)
+      // Start audio playback (first chunk will arrive within 1 second)
       try {
         await audio.play();
-        console.log('[Playback] ✓ MediaSource playback started - streaming live audio');
+        console.log('[Playback] ✓ MediaSource playback started - waiting for chunks');
 
         addLog({
           type: "audio_detected",
