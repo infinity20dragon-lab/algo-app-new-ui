@@ -2553,6 +2553,241 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [selectedDevices, devices, addLog]);
 
+  // 🚀 NEW CALL COORDINATOR: Upload callback for saving recordings to Firebase
+  const uploadRecordingToFirebase = useCallback(async (blob: Blob, mimeType: string): Promise<string> => {
+    if (!user) {
+      throw new Error('No user logged in');
+    }
+
+    try {
+      // Determine file extension based on mime type
+      let fileExtension = 'webm';
+      if (mimeType.includes('ogg')) {
+        fileExtension = 'ogg';
+      } else if (mimeType.includes('mp4')) {
+        fileExtension = 'm4a';
+      }
+
+      // Generate timestamp for filename
+      const now = new Date();
+      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const year = pstTime.getFullYear();
+      const month = String(pstTime.getMonth() + 1).padStart(2, '0');
+      const day = String(pstTime.getDate()).padStart(2, '0');
+      let hours = pstTime.getHours();
+      const minutes = String(pstTime.getMinutes()).padStart(2, '0');
+      const seconds = String(pstTime.getSeconds()).padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12;
+      const hoursStr = String(hours).padStart(2, '0');
+
+      const timestamp = `${year}-${month}-${day}-${hoursStr}-${minutes}-${seconds}-${ampm}`;
+      const filename = `recording-${timestamp}.${fileExtension}`;
+
+      // Create daily folder
+      const dailyFolder = `${year}-${month}-${day}-pst-recordings`;
+      const filePath = `audio-recordings/${user.uid}/${dailyFolder}/${filename}`;
+
+      // Upload to Firebase Storage
+      debugLog(`[CallCoordinator] Uploading ${fileExtension.toUpperCase()} to ${filePath}`);
+      const fileRef = storageRef(storage, filePath);
+      await uploadBytes(fileRef, blob);
+
+      // Get download URL
+      const downloadUrl = await getDownloadURL(fileRef);
+      debugLog('[CallCoordinator] Upload successful:', downloadUrl);
+
+      return downloadUrl;
+    } catch (error) {
+      console.error('[CallCoordinator] Upload failed:', error);
+      throw error;
+    }
+  }, [user]);
+
+  // 🚀 NEW CALL COORDINATOR SYSTEM: Initialize/update when config changes
+  useEffect(() => {
+    if (!USE_NEW_CALL_SYSTEM) return;
+    if (!isCapturing) return;
+    if (!monitoringStream) return;
+
+    // If CallCoordinator exists and is in Idle state, recreate it with new config
+    // If it's in an active call, don't interrupt it
+    if (callCoordinatorRef.current) {
+      const currentState = callCoordinatorRef.current.getState();
+      if (currentState !== 'Idle') {
+        // Don't recreate during active call - let it finish
+        debugLog('[CallCoordinator] Config changed but call is active, will apply on next call');
+        return;
+      } else {
+        // In Idle state - safe to recreate with new config
+        debugLog('[CallCoordinator] Config changed, recreating coordinator in Idle state');
+        callCoordinatorRef.current.abort(); // Clean up old instance
+        callCoordinatorRef.current = null;
+      }
+    }
+
+    debugLog('[CallCoordinator] Initializing CallCoordinator with current config');
+
+    // Get the first selected paging device (type 8301)
+    const pagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
+    );
+    const pagingDevice = pagingDevices.length > 0
+      ? { id: pagingDevices[0].id, name: pagingDevices[0].name, ip: pagingDevices[0].ipAddress }
+      : null;
+
+    // Extract linked speakers for this paging device
+    const linkedSpeakers = pagingDevice
+      ? devices
+          .filter(d => {
+            // Find the paging device in the devices array
+            const paging = devices.find(pd => pd.id === pagingDevice.id);
+            // Check if this device is in the paging device's linkedSpeakerIds
+            return d.type !== "8301" && paging?.linkedSpeakerIds?.includes(d.id);
+          })
+          .map(s => ({
+            id: s.id,
+            name: s.name,
+            ip: s.ipAddress,
+            maxVolume: s.maxVolume ?? 100,
+          }))
+      : [];
+
+    debugLog(`[CallCoordinator] Found ${linkedSpeakers.length} linked speakers for paging device ${pagingDevice?.name || 'N/A'}`);
+
+    // Create speaker volume control callback
+    const setSpeakerVolume = async (speakerId: string, volumePercent: number) => {
+      const speaker = devices.find(d => d.id === speakerId);
+      if (!speaker || !speaker.ipAddress || !speaker.apiPassword) {
+        debugLog(`[CallCoordinator] Speaker ${speakerId} not found or missing credentials`);
+        return;
+      }
+
+      // Calculate actual volume based on useGlobalVolume mode
+      let actualVolume: number;
+      if (useGlobalVolume) {
+        // Global mode: use volumePercent directly
+        actualVolume = volumePercent;
+      } else {
+        // Individual mode: volumePercent represents ramp progress (0-100%)
+        // Scale by speaker's maxVolume
+        const speakerMaxVolume = speaker.maxVolume ?? 100;
+        actualVolume = (volumePercent / 100) * speakerMaxVolume;
+      }
+
+      // Convert 0-100% to dB for Algo API
+      let volumeDbString: string;
+      if (actualVolume === 0) {
+        volumeDbString = getIdleVolumeString(); // IDLE state
+      } else {
+        const volumeScale = Math.round((actualVolume / 100) * 10);
+        const volumeDb = (volumeScale - 10) * 3;
+        volumeDbString = volumeDb === 0 ? "0dB" : `${volumeDb}dB`;
+      }
+
+      try {
+        const response = await fetch("/api/algo/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ipAddress: speaker.ipAddress,
+            password: speaker.apiPassword,
+            authMethod: speaker.authMethod || "standard",
+            settings: {
+              "audio.page.vol": volumeDbString,
+            },
+          }),
+        });
+
+        if (!response.ok) {
+          debugLog(`[CallCoordinator] ❌ Failed to set ${speaker.name} volume`);
+        } else {
+          debugLog(`[CallCoordinator] ✓ Set ${speaker.name} to ${volumeDbString} (${actualVolume.toFixed(0)}%)`);
+        }
+      } catch (error) {
+        debugLog(`[CallCoordinator] ❌ Network error setting ${speaker.name} volume`);
+      }
+    };
+
+    // Extract PoE devices (for passing to CallCoordinator)
+    const poeDevicesForCoordinator = poeDevices
+      .filter(d => d.mode === "auto")
+      .map(d => ({
+        id: d.id,
+        name: d.name,
+        mode: d.mode,
+      }));
+
+    const config = {
+      audioThreshold,
+      sustainDuration,
+      playbackEnabled,
+      playbackDelay: playbackDelay,
+      // Use playbackDisableDelay when playback is enabled, otherwise use legacy disableDelay
+      disableDelay: playbackEnabled ? playbackDisableDelay : disableDelay,
+      pagingDevice,
+      setPagingZone,
+      waitForPagingZoneReady,
+      onLog: addLog,
+      onUpload: uploadRecordingToFirebase,
+      // Speaker volume control
+      linkedSpeakers,
+      setSpeakerVolume,
+      rampEnabled,
+      dayNightMode,
+      dayStartHour,
+      dayEndHour,
+      nightRampDuration,
+      targetVolume,
+      // PoE device control
+      poeDevices: poeDevicesForCoordinator,
+      controlPoEDevices,
+    };
+
+    callCoordinatorRef.current = new CallCoordinator(config);
+
+    // Start the coordinator with the monitoring stream
+    callCoordinatorRef.current.start(monitoringStream).then(() => {
+      debugLog('[CallCoordinator] ✅ Call coordinator started and ready');
+    }).catch((error) => {
+      console.error('[CallCoordinator] Failed to start:', error);
+    });
+
+    // Cleanup function - abort coordinator if monitoring stops or config changes during active call
+    return () => {
+      if (callCoordinatorRef.current && callCoordinatorRef.current.getState() !== 'Idle') {
+        debugLog('[CallCoordinator] Stopping active call due to monitoring stop or config change');
+        callCoordinatorRef.current.abort();
+        callCoordinatorRef.current = null;
+      }
+    };
+  }, [
+    isCapturing,
+    monitoringStream,
+    audioThreshold,
+    sustainDuration,
+    playbackEnabled,
+    playbackDelay,
+    disableDelay,
+    playbackDisableDelay,
+    devices,
+    selectedDevices,
+    setPagingZone,
+    waitForPagingZoneReady,
+    addLog,
+    uploadRecordingToFirebase,
+    useGlobalVolume,
+    rampEnabled,
+    dayNightMode,
+    dayStartHour,
+    dayEndHour,
+    nightRampDuration,
+    targetVolume,
+    poeDevices,
+    controlPoEDevices,
+    getIdleVolumeString,
+  ]);
+
   // Audio activity detection with sustained audio requirement
   useEffect(() => {
     if (!isCapturing) {
@@ -2906,57 +3141,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingZone, waitForPagingZoneReady, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, recordingEnabled, shouldSkipRamping]);
 
-  // 🚀 NEW CALL COORDINATOR: Upload callback for saving recordings to Firebase
-  const uploadRecordingToFirebase = useCallback(async (blob: Blob, mimeType: string): Promise<string> => {
-    if (!user) {
-      throw new Error('No user logged in');
-    }
-
-    try {
-      // Determine file extension based on mime type
-      let fileExtension = 'webm';
-      if (mimeType.includes('ogg')) {
-        fileExtension = 'ogg';
-      } else if (mimeType.includes('mp4')) {
-        fileExtension = 'm4a';
-      }
-
-      // Generate timestamp for filename
-      const now = new Date();
-      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-      const year = pstTime.getFullYear();
-      const month = String(pstTime.getMonth() + 1).padStart(2, '0');
-      const day = String(pstTime.getDate()).padStart(2, '0');
-      let hours = pstTime.getHours();
-      const minutes = String(pstTime.getMinutes()).padStart(2, '0');
-      const seconds = String(pstTime.getSeconds()).padStart(2, '0');
-      const ampm = hours >= 12 ? 'PM' : 'AM';
-      hours = hours % 12 || 12;
-      const hoursStr = String(hours).padStart(2, '0');
-
-      const timestamp = `${year}-${month}-${day}-${hoursStr}-${minutes}-${seconds}-${ampm}`;
-      const filename = `recording-${timestamp}.${fileExtension}`;
-
-      // Create daily folder
-      const dailyFolder = `${year}-${month}-${day}-pst-recordings`;
-      const filePath = `audio-recordings/${user.uid}/${dailyFolder}/${filename}`;
-
-      // Upload to Firebase Storage
-      debugLog(`[CallCoordinator] Uploading ${fileExtension.toUpperCase()} to ${filePath}`);
-      const fileRef = storageRef(storage, filePath);
-      await uploadBytes(fileRef, blob);
-
-      // Get download URL
-      const downloadUrl = await getDownloadURL(fileRef);
-      debugLog('[CallCoordinator] Upload successful:', downloadUrl);
-
-      return downloadUrl;
-    } catch (error) {
-      console.error('[CallCoordinator] Upload failed:', error);
-      throw error;
-    }
-  }, [user]);
-
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
 
@@ -2973,36 +3157,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // This ensures the UI responds instantly and audio is being captured
     startCapture(inputDevice);
 
-    // 🚀 NEW CALL COORDINATOR SYSTEM: Initialize if enabled
-    if (USE_NEW_CALL_SYSTEM && monitoringStream) {
-      debugLog('[CallCoordinator] Initializing new call coordinator system');
-
-      // Get the first selected paging device (type 8301)
-      const pagingDevices = devices.filter(d =>
-        d.type === "8301" && selectedDevices.includes(d.id)
-      );
-      const pagingDevice = pagingDevices.length > 0
-        ? { id: pagingDevices[0].id, name: pagingDevices[0].name, ip: pagingDevices[0].ip }
-        : null;
-
-      const config = {
-        audioThreshold,
-        sustainDuration,
-        playbackEnabled,
-        playbackDelay: playbackDelay, // Already in milliseconds
-        disableDelay: disableDelay, // Already in milliseconds
-        pagingDevice,
-        setPagingZone,
-        waitForPagingZoneReady,
-        onLog: addLog,
-        onUpload: uploadRecordingToFirebase,
-      };
-
-      callCoordinatorRef.current = new CallCoordinator(config);
-      await callCoordinatorRef.current.start(monitoringStream);
-
-      debugLog('[CallCoordinator] Call coordinator started');
+    // 🚀 NEW CALL COORDINATOR SYSTEM: Initialization happens in useEffect when stream is ready
+    // Skip legacy speaker setup if using new system
+    if (USE_NEW_CALL_SYSTEM) {
+      debugLog('[CallCoordinator] Using new call coordinator system - skipping legacy speaker setup');
+      return; // CallCoordinator will handle everything
     }
+
+    // LEGACY SYSTEM BELOW:
 
     // Check speaker connectivity first (in background)
     checkSpeakerConnectivity();

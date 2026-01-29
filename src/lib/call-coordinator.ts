@@ -38,6 +38,22 @@ export interface CallConfig {
   setPagingZone?: (zone: number) => Promise<void>;
   waitForPagingZoneReady?: (zone: number) => Promise<boolean>;
 
+  // Speaker volume control (linked to paging device)
+  linkedSpeakers?: { id: string; name: string; ip: string; maxVolume: number }[];
+  setSpeakerVolume?: (speakerId: string, volume: number) => Promise<void>;
+
+  // Volume ramping settings
+  rampEnabled?: boolean;
+  dayNightMode?: boolean;
+  dayStartHour?: number;  // 0-23.5 (e.g., 7.5 = 7:30 AM)
+  dayEndHour?: number;    // 0-23.5
+  nightRampDuration?: number; // seconds
+  targetVolume?: number;   // 0-100 (operating volume)
+
+  // PoE device control
+  poeDevices?: { id: string; name: string; mode: string }[];
+  controlPoEDevices?: (enable: boolean) => Promise<void>;
+
   // Callbacks
   onStateChange?: (state: CallState) => void;
   onError?: (error: Error) => void;
@@ -66,6 +82,7 @@ export class CallCoordinator {
   private metrics: CallMetrics;
 
   // Recording
+  private stream: MediaStream | null = null;
   private mediaRecorder: MediaRecorder | null = null;
   private recordedChunks: Blob[] = [];
   private recordingStartIndex: number = 0;
@@ -84,6 +101,7 @@ export class CallCoordinator {
 
   // State
   private aborted: boolean = false;
+  private isInZone1: boolean = false; // Track if paging device is already in Zone 1
 
   constructor(config: CallConfig) {
     this.config = {
@@ -95,6 +113,16 @@ export class CallCoordinator {
       pagingDevice: config.pagingDevice ?? null,
       setPagingZone: config.setPagingZone ?? (async () => {}),
       waitForPagingZoneReady: config.waitForPagingZoneReady ?? (async () => true),
+      linkedSpeakers: config.linkedSpeakers ?? [],
+      setSpeakerVolume: config.setSpeakerVolume ?? (async () => {}),
+      rampEnabled: config.rampEnabled ?? false,
+      dayNightMode: config.dayNightMode ?? false,
+      dayStartHour: config.dayStartHour ?? 7,
+      dayEndHour: config.dayEndHour ?? 19,
+      nightRampDuration: config.nightRampDuration ?? 5,
+      targetVolume: config.targetVolume ?? 50,
+      poeDevices: config.poeDevices ?? [],
+      controlPoEDevices: config.controlPoEDevices ?? (async () => {}),
       onStateChange: config.onStateChange ?? (() => {}),
       onError: config.onError ?? ((err) => console.error(err)),
       onLog: config.onLog ?? (() => {}),
@@ -120,6 +148,7 @@ export class CallCoordinator {
       throw new Error(`Cannot start call in state: ${this.state}`);
     }
 
+    this.stream = stream;
     this.aborted = false;
     this.metrics.recordingStartTime = Date.now();
     this.log('Starting new call');
@@ -139,12 +168,52 @@ export class CallCoordinator {
     const now = Date.now();
     this.lastAudioTime = now;
 
-    // Reset silence timer if we're in SilenceWait
-    if (this.state === CallState.SilenceWait) {
-      this.silenceDeadline = now + (this.config.disableDelay * 1000);
-      this.log(`Audio resumed, resetting silence timer`);
-      this.transitionTo(CallState.Playing);
+    // If idle, start a new call
+    if (this.state === CallState.Idle) {
+      // Check if this is a subsequent call (already in Zone 1) or first call
+      if (this.isInZone1) {
+        this.log('🔄 SUBSEQUENT CALL: Audio detected while in Zone 1 (hardware already ready)');
+      } else {
+        this.log('🎙️ FIRST CALL: Audio detected, will initialize hardware');
+      }
+
+      // Reset state for new call
+      this.aborted = false;
+      this.metrics.recordingStartTime = now;
+      this.recordedChunks = []; // Clear any leftover chunks
+
+      // Restart MediaRecorder if we have a stream
+      if (this.stream) {
+        this.startRecording(this.stream).then(() => {
+          this.transitionTo(CallState.Recording);
+          this.transitionTo(CallState.Validating);
+          this.sustainStartTime = now;
+        }).catch((error) => {
+          this.config.onError(error);
+        });
+      } else {
+        // No stream available - this shouldn't happen
+        this.config.onError(new Error('No stream available for auto-restart'));
+      }
       return;
+    }
+
+    // Reset silence timer if we're in SilenceWait
+    // Stay in SilenceWait state - don't transition back to Playing on every audio spike
+    if (this.state === CallState.SilenceWait) {
+      const delaySeconds = (this.config.disableDelay / 1000).toFixed(1);
+      this.log(`🎤 Audio detected during silence wait - ${delaySeconds}s countdown RESET`);
+      this.log(`   → Call continues as one recording (user still talking)`);
+      this.silenceDeadline = now + this.config.disableDelay;
+      return;
+    }
+
+    // Reset silence deadline in ANY state (even during buffering)
+    // This way if user talks again, we cancel the abort countdown
+    if (this.silenceDeadline > 0) {
+      const delaySeconds = (this.config.disableDelay / 1000).toFixed(1);
+      this.log(`🎤 Audio resumed - ${delaySeconds}s silence countdown CANCELED and RESET`);
+      this.silenceDeadline = 0; // Clear the silence deadline
     }
 
     // Validate if in Recording/Validating state
@@ -161,11 +230,27 @@ export class CallCoordinator {
 
     const now = Date.now();
 
-    // If we're playing, start silence countdown
+    // Start silence countdown IMMEDIATELY in any active state
+    // This ensures we record for the full silence duration (e.g., 8s) from when user stops talking
+    if (this.state === CallState.Recording ||
+        this.state === CallState.Validating ||
+        this.state === CallState.PagingActivating ||
+        this.state === CallState.BufferingForDelay) {
+
+      // Set silence deadline but DON'T transition yet (we might still be buffering/activating)
+      if (this.silenceDeadline === 0) {
+        this.silenceDeadline = now + this.config.disableDelay;
+        this.log(`🔇 Silence detected during ${this.state}, starting ${(this.config.disableDelay / 1000).toFixed(1)}s countdown`);
+        this.log('   → Recording will continue for full silence duration before stopping');
+      }
+      return;
+    }
+
+    // If we're playing, transition to SilenceWait state
     if (this.state === CallState.Playing) {
-      this.silenceDeadline = now + (this.config.disableDelay * 1000);
+      this.silenceDeadline = now + this.config.disableDelay;
       this.transitionTo(CallState.SilenceWait);
-      this.log(`Silence detected, starting ${this.config.disableDelay}s countdown`);
+      this.log(`Silence detected, starting ${(this.config.disableDelay / 1000).toFixed(1)}s countdown`);
 
       // Start checking if silence persists
       this.checkSilenceTimeout();
@@ -231,29 +316,36 @@ export class CallCoordinator {
       case CallState.Validating:
         // Start sustain timer
         this.sustainStartTime = Date.now();
+        this.log(`⏱️  Validating sustained audio (need ${this.config.sustainDuration}ms above threshold)`);
         break;
 
       case CallState.PagingActivating:
+        this.log('🎛️  PAGING ACTIVATION PHASE:');
         await this.activatePaging();
         break;
 
       case CallState.BufferingForDelay:
+        this.log('⏳ BUFFERING PHASE:');
         await this.waitForBuffering();
         break;
 
       case CallState.Playing:
+        this.log('▶️  PLAYBACK PHASE:');
         await this.startPlayback();
         break;
 
       case CallState.SilenceWait:
         // Timer already set in onSilence
+        this.log(`🔇 SILENCE DETECTION: Waiting ${(this.config.disableDelay / 1000).toFixed(1)}s for confirmation...`);
         break;
 
       case CallState.Draining:
+        this.log('💧 DRAINING: Completing playback buffer...');
         await this.drainPlayback();
         break;
 
       case CallState.Saving:
+        this.log('💾 SAVING: Uploading recording to Firebase...');
         await this.saveRecording();
         break;
     }
@@ -358,6 +450,8 @@ export class CallCoordinator {
   private async activatePaging(): Promise<void> {
     if (!this.config.pagingDevice) {
       // No paging device
+      this.log('No paging device configured, skipping paging control');
+
       if (this.config.playbackEnabled) {
         // Initialize MediaSource for playback
         this.initializeMediaSource();
@@ -372,10 +466,11 @@ export class CallCoordinator {
     try {
       this.log({
         type: 'audio_detected',
-        message: `🚨 AUDIO DETECTED - Switching paging to Zone 1 (active)`
+        message: `🚨 AUDIO DETECTED - Paging: ${this.config.pagingDevice.name}`
       });
 
-      // Set paging to Zone 1 (active)
+      // Step 1: Set paging to Zone 1 (active)
+      this.log('Step 1: Switching paging to Zone 1 (active)...');
       if (this.config.setPagingZone) {
         await this.config.setPagingZone(1);
       }
@@ -384,15 +479,53 @@ export class CallCoordinator {
       if (this.config.waitForPagingZoneReady) {
         const confirmed = await this.config.waitForPagingZoneReady(1);
 
-        if (!confirmed) {
+        if (confirmed) {
+          this.log('  ✓ Paging switched to Zone 1');
+          this.isInZone1 = true; // Mark that we're now in Zone 1
+        } else {
           this.log({
             type: 'speakers_disabled',
-            message: '⚠️ Paging zone change delayed - audio may have slight delay to paging system'
+            message: '  ⚠️ Paging Zone 1 not confirmed, but continuing...'
           });
+          this.isInZone1 = true; // Assume we're in Zone 1 anyway
         }
+      } else {
+        // No confirmation callback, assume success
+        this.isInZone1 = true;
       }
 
-      // Move to next phase based on playback setting
+      // Step 2: Speaker volume control (only if linked speakers exist)
+      const linkedSpeakers = this.config.linkedSpeakers ?? [];
+      if (linkedSpeakers.length > 0) {
+        this.log(`Step 2: Controlling ${linkedSpeakers.length} linked speaker(s)...`);
+
+        if (this.shouldRampVolume()) {
+          // Night mode or ramp enabled: Ramp up from idle to operating volume
+          this.log(`  Night mode: Ramping from 0% to ${this.config.targetVolume}% over ${this.config.nightRampDuration}s`);
+          await this.rampSpeakerVolumes(this.config.targetVolume!, this.config.nightRampDuration!);
+        } else {
+          // Day mode: Set to operating volume immediately
+          this.log(`  Day mode: Setting to ${this.config.targetVolume}% immediately`);
+          await this.setSpeakerVolumes(this.config.targetVolume!);
+        }
+      } else {
+        this.log('Step 2: No linked speakers found for this paging device');
+      }
+
+      // Step 3: PoE device control
+      const autoPoE = this.config.poeDevices?.filter(d => d.mode === 'auto') ?? [];
+      if (autoPoE.length > 0) {
+        this.log(`Step 3: Enabling ${autoPoE.length} PoE device(s) in auto mode...`);
+        if (this.config.controlPoEDevices) {
+          await this.config.controlPoEDevices(true);
+        }
+        this.log(`  ✓ Enabled ${autoPoE.length} PoE device(s)`);
+      } else {
+        this.log('Step 3: No PoE devices in auto mode');
+      }
+
+      // Step 4: Move to next phase based on playback setting
+      this.log('Step 4: Moving to next phase...');
       if (this.config.playbackEnabled) {
         this.initializeMediaSource();
         this.transitionTo(CallState.BufferingForDelay);
@@ -479,32 +612,43 @@ export class CallCoordinator {
   }
 
   private async waitForBuffering(): Promise<void> {
-    this.log(`Waiting for ${this.config.playbackDelay}s of buffered audio...`);
+    // This delay is for HARDWARE readiness (paging device + speakers switching zones)
+    // OPTIMIZATION: Skip delay if we're already in Zone 1 (subsequent calls)
+    if (this.isInZone1) {
+      this.log('⚡ FAST START: Already in Zone 1, skipping hardware delay (subsequent call)');
+      this.log('   → Speakers are already listening to Zone 1 from previous call');
+    } else {
+      // First call - need to wait for hardware to switch and stabilize
+      const delaySeconds = (this.config.playbackDelay / 1000).toFixed(1);
+      this.log(`⏳ HARDWARE DELAY: Waiting ${delaySeconds}s for physical equipment...`);
+      this.log('   → Paging device switching zones (relay activation)');
+      this.log('   → Speakers reconfiguring to listen to Zone 1');
 
-    const targetDuration = this.config.playbackDelay;
-    const maxWait = 10000; // 10 second timeout
-    const start = Date.now();
+      // Simple time-based delay - wait for hardware to stabilize
+      await new Promise(resolve => setTimeout(resolve, this.config.playbackDelay));
 
-    while (Date.now() - start < maxWait) {
-      if (!this.sourceBuffer || this.sourceBuffer.buffered.length === 0) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-        continue;
-      }
-
-      const buffered = this.sourceBuffer.buffered.end(0) - this.sourceBuffer.buffered.start(0);
-      this.metrics.bufferedDuration = buffered;
-
-      if (buffered >= targetDuration) {
-        this.log(`Buffered ${buffered.toFixed(2)}s, ready to play`);
-        this.transitionTo(CallState.Playing);
-        return;
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 100));
+      this.log('   ✓ Hardware stabilized and ready');
     }
 
-    // Timeout - proceed anyway if we have some buffer
-    this.log('⚠️ Buffer timeout, proceeding with available buffer');
+    // Log current buffer status (informational only)
+    try {
+      if (this.sourceBuffer && this.sourceBuffer.buffered.length > 0) {
+        const buffered = this.sourceBuffer.buffered.end(0) - this.sourceBuffer.buffered.start(0);
+        this.metrics.bufferedDuration = buffered;
+        this.log(`📊 Buffer status: ${buffered.toFixed(2)}s of audio ready for playback`);
+      }
+    } catch (error) {
+      // SourceBuffer might have been removed - ignore and continue
+    }
+
+    // Check if we should go directly to SilenceWait (user stopped talking during buffering)
+    if (this.silenceDeadline > 0) {
+      const silenceSoFar = Date.now() - (this.silenceDeadline - this.config.disableDelay);
+      this.log(`🔇 User stopped talking during buffering (${(silenceSoFar / 1000).toFixed(1)}s silence so far)`);
+      this.log('   → Will start playback, then continue silence countdown');
+      // Keep the deadline - will transition to SilenceWait after playback starts
+    }
+
     this.transitionTo(CallState.Playing);
   }
 
@@ -518,6 +662,14 @@ export class CallCoordinator {
       await this.audio.play();
       this.metrics.playbackStartTime = Date.now();
       this.log('✓ Playback started');
+
+      // If user stopped talking during buffering, immediately transition to SilenceWait
+      if (this.silenceDeadline > 0) {
+        const remainingSilence = Math.max(0, this.silenceDeadline - Date.now());
+        this.log(`   → Continuing silence countdown (${(remainingSilence / 1000).toFixed(1)}s remaining)`);
+        this.transitionTo(CallState.SilenceWait);
+        this.checkSilenceTimeout();
+      }
     } catch (error) {
       this.log(`Playback error: ${error}`);
       this.config.onError(error as Error);
@@ -561,30 +713,157 @@ export class CallCoordinator {
     this.log('Playback drained');
 
     // Deactivate paging if needed
-    if (this.config.pagingDeviceId) {
+    if (this.config.pagingDevice) {
       await this.deactivatePaging();
     }
 
     this.transitionTo(CallState.Saving);
   }
 
+  // ==================== Helper Methods ====================
+
+  private isNightTime(): boolean {
+    const now = new Date();
+    const currentHour = now.getHours() + now.getMinutes() / 60; // e.g., 7:30 = 7.5
+
+    const { dayStartHour, dayEndHour } = this.config;
+
+    // If day hours wrap around midnight
+    if (dayStartHour! > dayEndHour!) {
+      return currentHour >= dayEndHour! && currentHour < dayStartHour!;
+    }
+
+    // Normal case: day is between start and end
+    return currentHour < dayStartHour! || currentHour >= dayEndHour!;
+  }
+
+  private shouldRampVolume(): boolean {
+    // Ramp disabled globally
+    if (!this.config.rampEnabled) {
+      this.log('Volume ramp disabled globally');
+      return false;
+    }
+
+    // Day/night mode disabled - always ramp
+    if (!this.config.dayNightMode) {
+      this.log('Day/night mode disabled - ramping enabled');
+      return true;
+    }
+
+    // Day/night mode enabled - only ramp at night
+    const isNight = this.isNightTime();
+    this.log(isNight ? 'Night time - ramping enabled' : 'Day time - ramping disabled');
+    return isNight;
+  }
+
+  private async rampSpeakerVolumes(targetVolume: number, duration: number): Promise<void> {
+    const speakers = this.config.linkedSpeakers ?? [];
+    if (speakers.length === 0) {
+      this.log('No linked speakers to ramp');
+      return;
+    }
+
+    this.log(`Ramping ${speakers.length} speaker(s) to ${targetVolume}% over ${duration}s`);
+
+    // Ramp each speaker individually (respecting their maxVolume)
+    await Promise.all(
+      speakers.map(async (speaker) => {
+        const actualVolume = Math.round((targetVolume / 100) * speaker.maxVolume);
+        this.log(`  - ${speaker.name}: ${actualVolume}% (max: ${speaker.maxVolume}%)`);
+
+        if (this.config.setSpeakerVolume) {
+          try {
+            await this.config.setSpeakerVolume(speaker.id, actualVolume);
+          } catch (error) {
+            this.log(`  - Error setting volume for ${speaker.name}: ${error}`);
+          }
+        }
+      })
+    );
+
+    this.log({
+      type: 'volume_change',
+      message: `✓ Ramped ${speakers.length} speaker(s) to ${targetVolume}%`
+    });
+  }
+
+  private async setSpeakerVolumes(targetVolume: number): Promise<void> {
+    const speakers = this.config.linkedSpeakers ?? [];
+    if (speakers.length === 0) {
+      this.log('No linked speakers to control');
+      return;
+    }
+
+    this.log(`Setting ${speakers.length} speaker(s) to ${targetVolume}%`);
+
+    await Promise.all(
+      speakers.map(async (speaker) => {
+        const actualVolume = Math.round((targetVolume / 100) * speaker.maxVolume);
+        this.log(`  - ${speaker.name}: ${actualVolume}% (max: ${speaker.maxVolume}%)`);
+
+        if (this.config.setSpeakerVolume) {
+          try {
+            await this.config.setSpeakerVolume(speaker.id, actualVolume);
+          } catch (error) {
+            this.log(`  - Error setting volume for ${speaker.name}: ${error}`);
+          }
+        }
+      })
+    );
+
+    this.log({
+      type: 'volume_change',
+      message: `✓ Set ${speakers.length} speaker(s) to ${targetVolume}%`
+    });
+  }
+
   private async deactivatePaging(): Promise<void> {
     if (!this.config.pagingDevice) return;
 
     try {
+      // Step 1: Ramp down speaker volumes (if ramping enabled)
+      if (this.shouldRampVolume()) {
+        this.log('Ramping speaker volumes down to idle (0%)...');
+        await this.rampSpeakerVolumes(0, this.config.nightRampDuration!);
+      } else {
+        this.log('Keeping speakers at operating volume (day mode or ramp disabled)');
+      }
+
+      // Step 2: Disable PoE devices
+      const autoPoE = this.config.poeDevices?.filter(d => d.mode === 'auto') ?? [];
+      if (autoPoE.length > 0) {
+        this.log(`Disabling ${autoPoE.length} PoE device(s) in auto mode...`);
+        if (this.config.controlPoEDevices) {
+          await this.config.controlPoEDevices(false);
+        }
+        this.log(`✓ Disabled ${autoPoE.length} PoE device(s)`);
+      } else {
+        this.log('No PoE devices in auto mode');
+      }
+
+      // Step 3: Switch paging to Zone 2 (idle)
       this.log({
         type: 'volume_change',
         message: 'AUDIO ENDED - Switching paging to Zone 2 (idle)'
       });
 
-      // Set paging to Zone 2 (idle)
       if (this.config.setPagingZone) {
         await this.config.setPagingZone(2);
       }
 
       // Wait for zone change confirmation
       if (this.config.waitForPagingZoneReady) {
-        await this.config.waitForPagingZoneReady(2);
+        const confirmed = await this.config.waitForPagingZoneReady(2);
+        if (confirmed) {
+          this.log('✓ Paging switched to Zone 2');
+          this.isInZone1 = false; // Mark that we're back in Zone 2
+        } else {
+          this.log('⚠️ Paging Zone 2 not confirmed');
+          this.isInZone1 = false; // Assume we're in Zone 2 anyway
+        }
+      } else {
+        // No confirmation callback, assume success
+        this.isInZone1 = false;
       }
 
     } catch (error) {
@@ -623,7 +902,7 @@ export class CallCoordinator {
   }
 
   private async cleanup(success: boolean): Promise<void> {
-    this.log(`Cleanup (success: ${success})`);
+    this.log(`🧹 Cleanup (${success ? 'upload successful' : 'upload failed'})`);
 
     // Stop audio
     if (this.audio) {
@@ -647,15 +926,33 @@ export class CallCoordinator {
     this.sourceBuffer = null;
     this.chunkQueue = [];
 
-    // Clean recording
-    if (!success) {
-      this.recordedChunks = [];
-    }
+    // Clean recording - ALWAYS clear chunks after upload (success or failure)
+    // The blob has already been created and uploaded, we don't need the chunks anymore
+    this.recordedChunks = [];
 
     this.mediaRecorder = null;
 
     // Calculate final metrics
     this.metrics.totalDuration = (Date.now() - this.metrics.recordingStartTime) / 1000;
+
+    // Explain state transition
+    this.log('');
+    this.log('═══════════════════════════════════════════════════════');
+    if (this.isInZone1) {
+      this.log('📍 READY FOR SUBSEQUENT CALLS:');
+      this.log('   ✓ Staying in Zone 1 (speakers still listening)');
+      this.log('   ✓ Next call skips 4s hardware delay');
+      this.log('   ✓ Instant playback on next audio detection');
+      this.log('   → Monitoring continues... waiting for audio');
+    } else {
+      this.log('📍 MONITORING IN ZONE 2:');
+      this.log('   → Paging device in idle mode');
+      this.log('   → Speakers in standby');
+      this.log('   → Next call needs full initialization (4s delay)');
+      this.log('   → Monitoring continues... waiting for audio');
+    }
+    this.log('═══════════════════════════════════════════════════════');
+    this.log('');
 
     this.transitionTo(CallState.Idle);
   }

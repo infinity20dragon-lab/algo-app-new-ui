@@ -723,23 +723,25 @@ export default function LiveBroadcastPage() {
                   </p>
                 </div>
 
-                {/* Disable Delay */}
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <Label>Disable Delay</Label>
-                    <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedDisableDelay / 1000).toFixed(0)}s</span>
+                {/* Disable Delay - Only show when playback is DISABLED */}
+                {!displayedPlaybackEnabled && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Disable Delay</Label>
+                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedDisableDelay / 1000).toFixed(0)}s</span>
+                    </div>
+                    <Slider
+                      min={1000}
+                      max={30000}
+                      step={1000}
+                      value={displayedDisableDelay}
+                      onChange={(e) => setDisableDelay(parseInt(e.target.value))}
+                    />
+                    <p className="text-xs text-[var(--text-muted)]">
+                      Wait before disabling speakers after silence
+                    </p>
                   </div>
-                  <Slider
-                    min={1000}
-                    max={30000}
-                    step={1000}
-                    value={displayedDisableDelay}
-                    onChange={(e) => setDisableDelay(parseInt(e.target.value))}
-                  />
-                  <p className="text-xs text-[var(--text-muted)]">
-                    Wait before disabling speakers after silence {displayedPlaybackEnabled && '(not used when playback enabled)'}
-                  </p>
-                </div>
+                )}
 
                 {/* Playback Delay - Only show when playback is enabled */}
                 {displayedPlaybackEnabled && (
