@@ -1485,6 +1485,9 @@ export class BatchCoordinator {
     await this.cleanup(true);
 
     this.log('✓ Session complete (upload queued for background processing)');
+
+    // Clear console after session complete for clean slate
+    console.clear();
   }
 
   /**
