@@ -136,6 +136,7 @@ export class BatchCoordinator {
   // Validation
   private audioValidated: boolean = false;
   private validationStartTime: number = 0;
+  private isPreBuffering: boolean = false; // Recording during validation
 
   // Session ID gate (prevents late playback after session invalidation)
   private sessionId: number = 0;
@@ -207,15 +208,19 @@ export class BatchCoordinator {
       if (!this.validationStartTime) {
         this.validationStartTime = Date.now();
         this.log(`Audio detected (${(level * 100).toFixed(0)}%), validating...`);
+
+        // 🎙️ Start recording IMMEDIATELY (pre-buffer mode)
+        // This captures audio from the very first syllable
+        this.isPreBuffering = true;
+        this.startBatchRecording();
+        this.log('📼 Pre-buffering started (capturing audio during validation)');
       }
 
       const elapsed = Date.now() - this.validationStartTime;
       if (elapsed >= this.sustainDuration) {
         this.audioValidated = true;
-        this.log(`✓ Audio validated (${elapsed}ms above threshold)`);
-
-        // Start first batch recording
-        this.startBatchRecording();
+        this.isPreBuffering = false;
+        this.log(`✓ Audio validated (${elapsed}ms above threshold) - pre-buffer committed`);
 
         // Trigger hardware activation
         if (!this.pagingActive && !this.hardwareReady) {
@@ -242,6 +247,26 @@ export class BatchCoordinator {
    * Handle silence event
    */
   onSilence(): void {
+    // If in pre-buffer mode and silence detected, validation failed
+    if (this.isPreBuffering && !this.audioValidated) {
+      this.log('⚠️ Validation failed (silence during validation) - discarding pre-buffer');
+
+      // Stop and discard the pre-buffer recording
+      if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+        this.mediaRecorder.ondataavailable = null;
+        this.mediaRecorder.onerror = null;
+        this.mediaRecorder.stop();
+        this.mediaRecorder = null;
+      }
+
+      // Discard the batch
+      this.currentBatch = null;
+      this.batches = [];
+      this.isPreBuffering = false;
+      this.validationStartTime = 0;
+      return;
+    }
+
     // Only start silence check if audio has been validated
     if (!this.audioValidated) {
       this.validationStartTime = 0; // Reset validation
@@ -898,6 +923,7 @@ export class BatchCoordinator {
     this.isPlaying = false;
     this.audioValidated = false;
     this.validationStartTime = 0;
+    this.isPreBuffering = false; // Reset pre-buffer flag
     this.hardwareReady = false;
     this.pagingActive = false;
     this.isFinishing = false; // Reset finish guard
