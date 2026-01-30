@@ -1927,7 +1927,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   // Active: 224.0.2.60:5002 (speakers listen here)
   // Idle: 224.0.2.60:50022 (different port, speakers don't receive)
   const setPagingMulticastIP = useCallback(async (active: boolean) => {
-    const multicastIP = active ? "224.0.2.60:5002" : "224.0.2.60:50022";
+    const multicastIP = active ? "224.0.2.60:50002" : "224.0.2.60:50022";
     const mode = active ? "active" : "idle";
     const pagingDevices = devices.filter(d =>
       d.type === "8301" && selectedDevices.includes(d.id)
