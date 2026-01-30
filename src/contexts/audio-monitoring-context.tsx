@@ -1923,9 +1923,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     );
   }, [devices, selectedDevices, addLog]);
 
-  // NEW: Set paging device zone (1-50) - avoids stuck device issues!
-  // Zone switching is more reliable than mode toggling (0/1)
-  const setPagingZone = useCallback(async (zone: number) => {
+  // NEW: Set paging multicast IP for zone 1 - MUCH simpler than changing zones!
+  // Active: 224.0.2.60:5002 (speakers listen here)
+  // Idle: 224.0.2.60:50022 (different port, speakers don't receive)
+  const setPagingMulticastIP = useCallback(async (active: boolean) => {
+    const multicastIP = active ? "224.0.2.60:5003" : "224.0.2.60:50033";
+    const mode = active ? "active" : "idle";
     const pagingDevices = devices.filter(d =>
       d.type === "8301" && selectedDevices.includes(d.id)
     );
@@ -1935,12 +1938,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       return;
     }
 
-    debugLog(`[AudioMonitoring] Setting ${pagingDevices.length} paging device(s) to zone ${zone}...`);
+    debugLog(`[AudioMonitoring] Setting ${pagingDevices.length} paging device(s) to ${mode} mode (${multicastIP})...`);
 
     await Promise.allSettled(
       pagingDevices.map(async (paging) => {
         try {
-          // Check current zone first to avoid redundant calls
+          // Check current multicast IP first to avoid redundant calls
           try {
             const checkAbort = new AbortController();
             const checkTimeout = setTimeout(() => checkAbort.abort(), 3000); // 3s timeout
@@ -1952,7 +1955,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                 ipAddress: paging.ipAddress,
                 password: paging.apiPassword,
                 authMethod: paging.authMethod,
-                setting: "mcast.tx.fixed",
+                setting: "mcast.zone1",
               }),
               signal: checkAbort.signal,
             });
@@ -1961,39 +1964,35 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
             if (checkResponse.ok) {
               const checkData = await checkResponse.json();
-              const currentZone = checkData.value;
+              const currentIP = checkData.value;
 
-              if (currentZone === zone.toString()) {
-                debugLog(`[AudioMonitoring] ⏭️  ${paging.name} already at zone ${zone}, skipping`);
+              if (currentIP === multicastIP) {
+                debugLog(`[AudioMonitoring] ⏭️  ${paging.name} already at ${mode} IP (${multicastIP}), skipping`);
                 return;
               }
 
-              debugLog(`[AudioMonitoring] ${paging.name} is zone ${currentZone}, changing to ${zone}...`);
+              debugLog(`[AudioMonitoring] ${paging.name} is at ${currentIP}, changing to ${multicastIP}...`);
             }
           } catch (checkError) {
-            console.warn(`[AudioMonitoring] Failed to check ${paging.name} zone (timeout or error), proceeding with zone change...`);
+            console.warn(`[AudioMonitoring] Failed to check ${paging.name} multicast IP (timeout or error), proceeding with change...`);
           }
 
-          // Change the zone
-          const zoneAbort = new AbortController();
-          const zoneTimeout = setTimeout(() => zoneAbort.abort(), 5000); // 5s timeout
-
-          const response = await fetch("/api/algo/speakers/zone", {
+          // Change the multicast IP for zone 1
+          const response = await fetch("/api/algo/settings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               ipAddress: paging.ipAddress,
               password: paging.apiPassword,
               authMethod: paging.authMethod,
-              zone,
+              settings: {
+                "mcast.zone1": multicastIP,
+              },
             }),
-            signal: zoneAbort.signal,
           });
 
-          clearTimeout(zoneTimeout);
-
           if (response.ok) {
-            debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to zone ${zone}`);
+            debugLog(`[AudioMonitoring] ✓ Set ${paging.name} multicast IP to ${multicastIP}`);
 
             // Reload device after zone change to prevent desync
             try {
@@ -2017,13 +2016,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               console.warn(`[AudioMonitoring] ⚠️ Error reloading ${paging.name}:`, reloadError);
             }
 
-            // Poll zone status to verify change (device needs ~2-5s to reload)
-            debugLog(`[AudioMonitoring] Polling ${paging.name} zone status...`);
+            // Poll multicast IP to verify change (device needs ~2-5s to reload)
+            debugLog(`[AudioMonitoring] Polling ${paging.name} multicast IP status...`);
             const maxPollAttempts = 20; // 20 attempts × 500ms = 10s max
             let pollAttempt = 0;
-            let zoneVerified = false;
+            let ipVerified = false;
 
-            while (pollAttempt < maxPollAttempts && !zoneVerified) {
+            while (pollAttempt < maxPollAttempts && !ipVerified) {
               await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms between polls
               pollAttempt++;
 
@@ -2035,20 +2034,20 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                     ipAddress: paging.ipAddress,
                     password: paging.apiPassword,
                     authMethod: paging.authMethod,
-                    setting: "mcast.tx.fixed",
+                    setting: "mcast.zone1",
                   }),
                 });
 
                 if (pollResponse.ok) {
                   const pollData = await pollResponse.json();
-                  const currentZone = pollData.value;
+                  const currentIP = pollData.value;
 
-                  if (currentZone === zone.toString()) {
-                    zoneVerified = true;
-                    debugLog(`[AudioMonitoring] ✓ ${paging.name} zone verified as ${zone} (attempt ${pollAttempt})`);
+                  if (currentIP === multicastIP) {
+                    ipVerified = true;
+                    debugLog(`[AudioMonitoring] ✓ ${paging.name} multicast IP verified as ${multicastIP} (attempt ${pollAttempt})`);
                     break;
                   } else {
-                    debugLog(`[AudioMonitoring] Polling ${paging.name}: zone is ${currentZone}, waiting for ${zone}... (${pollAttempt}/${maxPollAttempts})`);
+                    debugLog(`[AudioMonitoring] Polling ${paging.name}: IP is ${currentIP}, waiting for ${multicastIP}... (${pollAttempt}/${maxPollAttempts})`);
                   }
                 }
               } catch (pollError) {
@@ -2057,19 +2056,19 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
               }
             }
 
-            if (!zoneVerified) {
-              console.warn(`[AudioMonitoring] ⚠️ Could not verify ${paging.name} zone change after ${maxPollAttempts} attempts`);
+            if (!ipVerified) {
+              console.warn(`[AudioMonitoring] ⚠️ Could not verify ${paging.name} multicast IP change after ${maxPollAttempts} attempts`);
             }
 
             addLog({
               type: "speakers_enabled",
-              message: `Paging ${paging.name} zone ${zone} activated${zoneVerified ? ' (verified)' : ' (unverified)'}`,
+              message: `Paging ${paging.name} ${mode} mode activated (${multicastIP})${ipVerified ? ' (verified)' : ' (unverified)'}`,
             });
           } else {
-            console.error(`[AudioMonitoring] Failed to set ${paging.name} zone: HTTP ${response.status}`);
+            console.error(`[AudioMonitoring] Failed to set ${paging.name} multicast IP: HTTP ${response.status}`);
           }
         } catch (error) {
-          console.error(`Failed to set ${paging.name} zone:`, error);
+          console.error(`Failed to set ${paging.name} multicast IP:`, error);
         }
       })
     );
@@ -2865,8 +2864,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Use playbackDisableDelay when playback is enabled, otherwise use legacy disableDelay
       disableDelay: playbackEnabled ? playbackDisableDelay : disableDelay,
       pagingDevice,
-      setPagingZone,
-      waitForPagingZoneReady,
+      setPagingMulticastIP,
       onUpload: uploadRecordingToFirebase,
       // Speaker volume control
       linkedSpeakers,
@@ -2959,8 +2957,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     playbackDisableDelay,
     devices,
     selectedDevices,
-    setPagingZone,
-    waitForPagingZoneReady,
+    setPagingMulticastIP,
     addLog,
     uploadRecordingToFirebase,
     rampEnabled,
@@ -3110,20 +3107,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
             await controlPoEDevices(true);
 
             // NEW APPROACH: Switch paging to Zone 1 (speakers listening)
-            // Paging is already in mode 1 (transmitter), just switch channel
-            debugLog('[AudioMonitoring] AUDIO DETECTED - Switching paging to Zone 1 (active)');
-            await setPagingZone(1);
+            // Paging is already in mode 1 (transmitter), just switch multicast IP to active
+            debugLog('[AudioMonitoring] AUDIO DETECTED - Switching paging to active mode');
+            await setPagingMulticastIP(true); // Includes reload + polling internally
             pagingWasEnabledRef.current = true; // Track that paging is active
-
-            // Wait for zone change to confirm (poll until zone = 1)
-            const zoneReady = await waitForPagingZoneReady(1);
-            if (!zoneReady) {
-              console.warn('[AudioMonitoring] ⚠️ Zone 1 not confirmed, but continuing with audio capture...');
-              addLog({
-                type: "speakers_disabled",
-                message: "⚠️ Paging zone change delayed - audio may have slight delay to paging system",
-              });
-            }
 
             // CRITICAL: Start volume ramp BEFORE playback!
             // This ensures speakers are audible when audio starts playing
@@ -3281,13 +3268,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
                   return; // Exit shutdown immediately - paging stays ON
                 }
 
-                // NEW APPROACH: Switch paging back to Zone 2 (idle)
-                // Speakers stay in mode 2 (listening to Zone 1), ready for next audio
-                debugLog('[AudioMonitoring] AUDIO ENDED - Switching paging to Zone 2 (idle)');
-                await setPagingZone(2);
-
-                // Wait for zone change to confirm
-                await waitForPagingZoneReady(2);
+                // NEW APPROACH: Switch paging multicast IP to idle mode
+                // Speakers stay listening, but paging is on different IP/port
+                debugLog('[AudioMonitoring] AUDIO ENDED - Switching paging to idle mode');
+                await setPagingMulticastIP(false); // Includes reload + polling internally
 
                 pagingWasEnabledRef.current = false; // Mark paging as idle
 
@@ -3334,7 +3318,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         }
       }
     }
-  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingZone, waitForPagingZoneReady, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, recordingEnabled, shouldSkipRamping]);
+  }, [audioLevel, isCapturing, audioDetected, speakersEnabled, audioThreshold, sustainDuration, disableDelay, controlSpeakers, setDevicesVolume, startVolumeRamp, stopVolumeRamp, targetVolume, addLog, startRecording, stopRecordingAndUpload, setPagingMulticastIP, controlPoEDevices, playbackEnabled, playbackDelay, playbackDisableDelay, startPlayback, stopPlayback, rampEnabled, recordingEnabled, shouldSkipRamping]);
 
   const startMonitoring = useCallback(async (inputDevice?: string) => {
     debugLog('[AudioMonitoring] Starting monitoring', inputDevice);
@@ -3388,17 +3372,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
         // Step 2: Set paging to Zone 2 (idle - speakers only listen to Zone 1)
         // NOTE: We don't change mcast mode here - only change zones!
-        debugLog('[AudioMonitoring] Step 2: Setting paging to Zone 2 (idle state)');
-        await setPagingZone(2);
+        debugLog('[AudioMonitoring] Step 2: Setting paging to idle mode');
+        await setPagingMulticastIP(false); // Includes reload + polling internally
 
-        // Wait for zone change to confirm
-        debugLog('[AudioMonitoring] Step 2.6: Waiting for paging zone to confirm Zone 2...');
-        const zoneReady = await waitForPagingZoneReady(2);
-        if (!zoneReady) {
-          console.warn('[AudioMonitoring] ⚠️ Zone 2 not confirmed, but continuing...');
-        }
-
-        pagingWasEnabledRef.current = false; // Paging is in idle zone, not active
+        pagingWasEnabledRef.current = false; // Paging is in idle mode, not active
 
         // Step 3: REMOVED - We NEVER change speaker multicast mode!
         // Speakers should ALWAYS be pre-configured to mode 2 (receiver) and left alone
@@ -3426,7 +3403,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setSpeakersEnabled(true);
       }
     })();
-  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingZone, waitForPagingZoneReady, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping, sustainDuration, playbackEnabled, playbackDelay, disableDelay, devices, selectedDevices, uploadRecordingToFirebase, monitoringStream]);
+  }, [startCapture, audioThreshold, addLog, setDevicesVolume, setPagingMulticastIP, setSpeakersMulticast, checkSpeakerConnectivity, shouldSkipRamping, sustainDuration, playbackEnabled, playbackDelay, disableDelay, devices, selectedDevices, uploadRecordingToFirebase, monitoringStream]);
 
   const stopMonitoring = useCallback(async () => {
     debugLog('[AudioMonitoring] Stopping monitoring');

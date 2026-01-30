@@ -109,8 +109,7 @@ export interface BatchCoordinatorConfig {
     password: string;
     authMethod: string;
   } | null;
-  setPagingZone?: (zone: number) => Promise<void>;
-  waitForPagingZoneReady?: (zone: number) => Promise<boolean>;
+  setPagingMulticastIP?: (active: boolean) => Promise<void>; // Set multicast IP (active=224.0.2.60:5002, idle=224.0.2.60:50022)
 
   // Speaker control
   linkedSpeakers: Array<{
@@ -1055,38 +1054,18 @@ export class BatchCoordinator {
     this.log('🎛️  HARDWARE ACTIVATION:');
 
     try {
-      // Step 1: Set paging to Zone 1 (active)
-      if (this.config.pagingDevice && this.config.setPagingZone) {
-        // Check if already in Zone 1 to avoid redundant zone changes
-        let needsZoneChange = true;
+      // Step 1: Set paging multicast IP to active (224.0.2.60:5002)
+      // Much simpler than zone switching - just change the IP/port!
+      if (this.config.pagingDevice && this.config.setPagingMulticastIP) {
         if (this.isInZone1) {
-          this.log('Step 1: Already in Zone 1, verifying readiness...');
-          needsZoneChange = false;
+          this.log('Step 1: Paging already in active mode');
         } else {
-          this.log('Step 1: Switching paging to Zone 1 (active)...');
-          await this.config.setPagingZone(1);
-          this.log('  ✓ Zone change command sent (reload triggered on device)');
-        }
-
-        // CRITICAL: Always poll to confirm device is ready, even if zone didn't change
-        // This ensures hardware is truly ready before playback starts
-        if (this.config.waitForPagingZoneReady) {
-          this.log(`  Polling paging device until ready (mcast.mode = 1)...`);
-          const ready = await this.config.waitForPagingZoneReady(1);
-          if (ready) {
-            this.log('  ✓ Paging device confirmed ready (Zone 1, Mode 1)');
-            this.pagingActive = true;
-            this.isInZone1 = true;
-          } else {
-            this.log('  ⚠️ Paging device polling timeout - proceeding anyway');
-            this.pagingActive = true;
-            this.isInZone1 = true;
-          }
-        } else {
-          // No polling available, assume ready
-          this.pagingActive = true;
+          this.log('Step 1: Switching paging to active mode (224.0.2.60:5002)...');
+          await this.config.setPagingMulticastIP(true);
+          this.log('  ✓ Multicast IP change sent (includes reload + polling)');
           this.isInZone1 = true;
         }
+        this.pagingActive = true;
       }
 
       // Step 2: Set speaker volumes instantly (no ramp, no repeated network requests!)
@@ -1157,35 +1136,18 @@ export class BatchCoordinator {
         this.log(`  ✓ Disabled ${autoPoEDevices.length} PoE device(s)`);
       }
 
-      // Step 3: Set paging back to Zone 2 (idle)
-      if (this.config.pagingDevice && this.config.setPagingZone) {
-        // Only change zone if currently in Zone 1
+      // Step 3: Set paging multicast IP to idle (224.0.2.60:50022)
+      // Different port = speakers don't receive audio
+      if (this.config.pagingDevice && this.config.setPagingMulticastIP) {
         if (this.isInZone1) {
-          this.log('Step 3: Switching paging to Zone 2 (idle)...');
-          await this.config.setPagingZone(2);
-          this.log('  ✓ Zone change command sent (reload triggered on device)');
-
-          if (this.config.waitForPagingZoneReady) {
-            this.log('  Polling paging device until ready (Zone 2)...');
-            const ready = await this.config.waitForPagingZoneReady(2);
-            if (ready) {
-              this.log('  ✓ Paging device confirmed in Zone 2');
-              this.pagingActive = false;
-              this.isInZone1 = false;
-            } else {
-              this.log('  ⚠️ Paging device polling timeout - marking inactive anyway');
-              this.pagingActive = false;
-              this.isInZone1 = false;
-            }
-          } else {
-            // No polling available, assume ready
-            this.pagingActive = false;
-            this.isInZone1 = false;
-          }
-        } else {
-          this.log('Step 3: Already in Zone 2, skipping zone change');
+          this.log('Step 3: Switching paging to idle mode (224.0.2.60:50022)...');
+          await this.config.setPagingMulticastIP(false);
+          this.log('  ✓ Multicast IP change sent (includes reload + polling)');
           this.pagingActive = false;
           this.isInZone1 = false;
+        } else {
+          this.log('Step 3: Paging already in idle mode');
+          this.pagingActive = false;
         }
       }
 
