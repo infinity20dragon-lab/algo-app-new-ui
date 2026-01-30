@@ -1994,9 +1994,76 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
           if (response.ok) {
             debugLog(`[AudioMonitoring] ✓ Set ${paging.name} to zone ${zone}`);
+
+            // Reload device after zone change to prevent desync
+            try {
+              debugLog(`[AudioMonitoring] Reloading ${paging.name}...`);
+              const reloadResponse = await fetch("/api/algo/reload", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  ipAddress: paging.ipAddress,
+                  password: paging.apiPassword,
+                  authMethod: paging.authMethod || "standard",
+                }),
+              });
+
+              if (!reloadResponse.ok) {
+                console.warn(`[AudioMonitoring] ⚠️ Failed to reload ${paging.name}: HTTP ${reloadResponse.status}`);
+              } else {
+                debugLog(`[AudioMonitoring] ✓ Reload command sent to ${paging.name}`);
+              }
+            } catch (reloadError) {
+              console.warn(`[AudioMonitoring] ⚠️ Error reloading ${paging.name}:`, reloadError);
+            }
+
+            // Poll zone status to verify change (device needs ~2-5s to reload)
+            debugLog(`[AudioMonitoring] Polling ${paging.name} zone status...`);
+            const maxPollAttempts = 20; // 20 attempts × 500ms = 10s max
+            let pollAttempt = 0;
+            let zoneVerified = false;
+
+            while (pollAttempt < maxPollAttempts && !zoneVerified) {
+              await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms between polls
+              pollAttempt++;
+
+              try {
+                const pollResponse = await fetch("/api/algo/settings/get", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    ipAddress: paging.ipAddress,
+                    password: paging.apiPassword,
+                    authMethod: paging.authMethod,
+                    setting: "mcast.tx.fixed",
+                  }),
+                });
+
+                if (pollResponse.ok) {
+                  const pollData = await pollResponse.json();
+                  const currentZone = pollData.value;
+
+                  if (currentZone === zone.toString()) {
+                    zoneVerified = true;
+                    debugLog(`[AudioMonitoring] ✓ ${paging.name} zone verified as ${zone} (attempt ${pollAttempt})`);
+                    break;
+                  } else {
+                    debugLog(`[AudioMonitoring] Polling ${paging.name}: zone is ${currentZone}, waiting for ${zone}... (${pollAttempt}/${maxPollAttempts})`);
+                  }
+                }
+              } catch (pollError) {
+                // Device might be reloading, continue polling
+                debugLog(`[AudioMonitoring] Poll ${pollAttempt}: ${paging.name} not responding (reloading...)`);
+              }
+            }
+
+            if (!zoneVerified) {
+              console.warn(`[AudioMonitoring] ⚠️ Could not verify ${paging.name} zone change after ${maxPollAttempts} attempts`);
+            }
+
             addLog({
               type: "speakers_enabled",
-              message: `Paging ${paging.name} zone ${zone} activated`,
+              message: `Paging ${paging.name} zone ${zone} activated${zoneVerified ? ' (verified)' : ' (unverified)'}`,
             });
           } else {
             console.error(`[AudioMonitoring] Failed to set ${paging.name} zone: HTTP ${response.status}`);
