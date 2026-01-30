@@ -54,9 +54,6 @@ export interface SessionState {
   selectedInputDevice: string;
   availableInputDevices: Array<{ deviceId: string; label: string }>; // User's available audio inputs
 
-  // Volume mode
-  useGlobalVolume: boolean;
-
   // Day/Night mode
   dayNightMode: boolean;
   dayStartHour: number;
@@ -69,6 +66,15 @@ export interface SessionState {
   playbackEnabled: boolean;
   playbackDelay: number;
   playbackDisableDelay: number;
+
+  // Grace period settings
+  tailGuardDuration: number;
+  postPlaybackGraceDuration: number;
+
+  // Playback volume ramp settings
+  playbackRampDuration: number;
+  playbackStartVolume: number;
+  playbackMaxVolume: number;
 
   // Real-time audio state (for display only)
   audioLevel: number;

@@ -102,10 +102,6 @@ interface AudioMonitoringContextType {
   audioDetected: boolean;
   speakersEnabled: boolean;
 
-  // Volume mode
-  useGlobalVolume: boolean;
-  setUseGlobalVolume: (useGlobal: boolean) => void;
-
   // Ramp settings
   rampEnabled: boolean;
   rampDuration: number;
@@ -162,6 +158,20 @@ interface AudioMonitoringContextType {
   setPlaybackDelay: (delay: number) => void;
   playbackDisableDelay: number;
   setPlaybackDisableDelay: (delay: number) => void;
+
+  // Grace period settings
+  tailGuardDuration: number;
+  setTailGuardDuration: (duration: number) => void;
+  postPlaybackGraceDuration: number;
+  setPostPlaybackGraceDuration: (duration: number) => void;
+
+  // Playback volume ramp settings
+  playbackRampDuration: number;
+  setPlaybackRampDuration: (duration: number) => void;
+  playbackStartVolume: number;
+  setPlaybackStartVolume: (volume: number) => void;
+  playbackMaxVolume: number;
+  setPlaybackMaxVolume: (volume: number) => void;
 
   // Emergency Controls
   emergencyKillAll: () => Promise<void>;
@@ -264,7 +274,6 @@ const STORAGE_KEYS = {
   TARGET_VOLUME: 'algo_live_target_volume',
   INPUT_GAIN: 'algo_live_input_gain',
   AUDIO_THRESHOLD: 'algo_live_audio_threshold',
-  USE_GLOBAL_VOLUME: 'algo_use_global_volume',
   RAMP_ENABLED: 'algo_live_ramp_enabled',
   RAMP_DURATION: 'algo_live_ramp_duration',
   DAY_NIGHT_MODE: 'algo_live_day_night_mode',
@@ -278,6 +287,11 @@ const STORAGE_KEYS = {
   PLAYBACK_ENABLED: 'algo_live_playback_enabled',
   PLAYBACK_DELAY: 'algo_live_playback_delay',
   PLAYBACK_DISABLE_DELAY: 'algo_live_playback_disable_delay',
+  TAIL_GUARD_DURATION: 'algo_live_tail_guard_duration',
+  POST_PLAYBACK_GRACE_DURATION: 'algo_live_post_playback_grace_duration',
+  PLAYBACK_RAMP_DURATION: 'algo_live_playback_ramp_duration',
+  PLAYBACK_START_VOLUME: 'algo_live_playback_start_volume',
+  PLAYBACK_MAX_VOLUME: 'algo_live_playback_max_volume',
   LAST_CONSOLE_CLEAR: 'algo_live_last_console_clear',
 };
 
@@ -302,8 +316,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [playbackDelay, setPlaybackDelayState] = useState(500); // 500ms default (wait after paging ready before playback)
   const [playbackDisableDelay, setPlaybackDisableDelayState] = useState(5000); // 5s default (wait after playback finishes before shutdown)
 
-  // Volume mode
-  const [useGlobalVolume, setUseGlobalVolumeState] = useState(false);
+  // Grace period settings (in milliseconds)
+  const [tailGuardDuration, setTailGuardDuration] = useState(3000); // 3s default (window after silence timeout)
+  const [postPlaybackGraceDuration, setPostPlaybackGraceDuration] = useState(750); // 750ms default (window after playback ends)
+
+  // Playback volume ramp settings
+  const [playbackRampDuration, setPlaybackRampDuration] = useState(2000); // 2s default (was nightRampDuration in ms)
+  const [playbackStartVolume, setPlaybackStartVolume] = useState(0); // 0 = silent start
+  const [playbackMaxVolume, setPlaybackMaxVolume] = useState(1.0); // 1.0 = 100% volume
 
   // Speaker status tracking
   const [speakerStatuses, setSpeakerStatuses] = useState<SpeakerStatus[]>([]);
@@ -1081,7 +1101,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const savedDisableDelay = localStorage.getItem(STORAGE_KEYS.DISABLE_DELAY);
       const savedLoggingEnabled = localStorage.getItem(STORAGE_KEYS.LOGGING_ENABLED);
       const savedRecordingEnabled = localStorage.getItem(STORAGE_KEYS.RECORDING_ENABLED);
-      const savedUseGlobalVolume = localStorage.getItem(STORAGE_KEYS.USE_GLOBAL_VOLUME);
       const wasMonitoring = localStorage.getItem(STORAGE_KEYS.IS_MONITORING) === 'true';
 
       debugLog('[AudioMonitoring] Saved state:', {
@@ -1152,9 +1171,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       if (savedRecordingEnabled !== null) {
         setRecordingEnabledState(savedRecordingEnabled === 'true');
       }
-      if (savedUseGlobalVolume !== null) {
-        setUseGlobalVolumeState(savedUseGlobalVolume === 'true');
-      }
       const savedPlaybackEnabled = localStorage.getItem(STORAGE_KEYS.PLAYBACK_ENABLED);
       if (savedPlaybackEnabled !== null) {
         setPlaybackEnabledState(savedPlaybackEnabled === 'true');
@@ -1167,6 +1183,31 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const savedPlaybackDisableDelay = localStorage.getItem(STORAGE_KEYS.PLAYBACK_DISABLE_DELAY);
       if (savedPlaybackDisableDelay !== null) {
         setPlaybackDisableDelayState(parseInt(savedPlaybackDisableDelay));
+      }
+
+      const savedTailGuardDuration = localStorage.getItem(STORAGE_KEYS.TAIL_GUARD_DURATION);
+      if (savedTailGuardDuration !== null) {
+        setTailGuardDuration(parseInt(savedTailGuardDuration));
+      }
+
+      const savedPostPlaybackGraceDuration = localStorage.getItem(STORAGE_KEYS.POST_PLAYBACK_GRACE_DURATION);
+      if (savedPostPlaybackGraceDuration !== null) {
+        setPostPlaybackGraceDuration(parseInt(savedPostPlaybackGraceDuration));
+      }
+
+      const savedPlaybackRampDuration = localStorage.getItem(STORAGE_KEYS.PLAYBACK_RAMP_DURATION);
+      if (savedPlaybackRampDuration !== null) {
+        setPlaybackRampDuration(parseInt(savedPlaybackRampDuration));
+      }
+
+      const savedPlaybackStartVolume = localStorage.getItem(STORAGE_KEYS.PLAYBACK_START_VOLUME);
+      if (savedPlaybackStartVolume !== null) {
+        setPlaybackStartVolume(parseFloat(savedPlaybackStartVolume));
+      }
+
+      const savedPlaybackMaxVolume = localStorage.getItem(STORAGE_KEYS.PLAYBACK_MAX_VOLUME);
+      if (savedPlaybackMaxVolume !== null) {
+        setPlaybackMaxVolume(parseFloat(savedPlaybackMaxVolume));
       }
 
       // Mark as restored
@@ -1287,12 +1328,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   useEffect(() => {
     if (!hasRestoredStateRef.current) return;
-    debugLog('[AudioMonitoring] Saving global volume mode:', useGlobalVolume);
-    localStorage.setItem(STORAGE_KEYS.USE_GLOBAL_VOLUME, useGlobalVolume.toString());
-  }, [useGlobalVolume]);
-
-  useEffect(() => {
-    if (!hasRestoredStateRef.current) return;
     debugLog('[AudioMonitoring] Saving playback enabled:', playbackEnabled);
     localStorage.setItem(STORAGE_KEYS.PLAYBACK_ENABLED, playbackEnabled.toString());
   }, [playbackEnabled]);
@@ -1309,6 +1344,38 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Saving playback disable delay:', playbackDisableDelay);
     localStorage.setItem(STORAGE_KEYS.PLAYBACK_DISABLE_DELAY, playbackDisableDelay.toString());
   }, [playbackDisableDelay]);
+
+  // Persist grace periods to localStorage
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving TailGuard duration:', tailGuardDuration);
+    localStorage.setItem(STORAGE_KEYS.TAIL_GUARD_DURATION, tailGuardDuration.toString());
+  }, [tailGuardDuration]);
+
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving post-playback grace duration:', postPlaybackGraceDuration);
+    localStorage.setItem(STORAGE_KEYS.POST_PLAYBACK_GRACE_DURATION, postPlaybackGraceDuration.toString());
+  }, [postPlaybackGraceDuration]);
+
+  // Persist playback ramp settings to localStorage
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving playback ramp duration:', playbackRampDuration);
+    localStorage.setItem(STORAGE_KEYS.PLAYBACK_RAMP_DURATION, playbackRampDuration.toString());
+  }, [playbackRampDuration]);
+
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving playback start volume:', playbackStartVolume);
+    localStorage.setItem(STORAGE_KEYS.PLAYBACK_START_VOLUME, playbackStartVolume.toString());
+  }, [playbackStartVolume]);
+
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving playback max volume:', playbackMaxVolume);
+    localStorage.setItem(STORAGE_KEYS.PLAYBACK_MAX_VOLUME, playbackMaxVolume.toString());
+  }, [playbackMaxVolume]);
 
   // Daily console clear for long-running sessions (clears at midnight PST)
   useEffect(() => {
@@ -1418,8 +1485,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // Set volume on all linked speakers (8180s)
   // volumePercent is the "ramp percentage" (0-100)
-  // If useGlobalVolume=true: all speakers use volumePercent directly
-  // If useGlobalVolume=false: volumePercent is scaled by each speaker's maxVolume
+  // Each speaker is scaled by its own maxVolume setting
   const setDevicesVolume = useCallback(async (volumePercent: number) => {
     const linkedSpeakerIds = new Set<string>();
 
@@ -1450,21 +1516,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
-      // Calculate actual volume based on mode
-      let actualVolume: number;
-      if (useGlobalVolume) {
-        // Global mode: all speakers use targetVolume (with ramping if enabled)
-        // volumePercent comes from the ramp (0-100% of targetVolume)
-        actualVolume = volumePercent;
-        debugLog(`[AudioMonitoring] GLOBAL MODE - Setting ${speaker.name} to ${actualVolume.toFixed(0)}%`);
-      } else {
-        // Individual mode: each speaker ramps to its own maxVolume
-        // volumePercent represents the ramp progress (0-100%)
-        // At 0%: speaker is at 0%, at 100%: speaker is at its maxVolume
-        const speakerMaxVolume = speaker.maxVolume ?? 100;
-        actualVolume = (volumePercent / 100) * speakerMaxVolume;
-        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Setting ${speaker.name} to ${volumePercent.toFixed(0)}% of its max ${speakerMaxVolume}% = ${actualVolume.toFixed(0)}% (Level ${Math.round(actualVolume/10)})`);
-      }
+      // Calculate actual volume: each speaker ramps to its own maxVolume
+      // volumePercent represents the ramp progress (0-100%)
+      // At 0%: speaker is at 0%, at 100%: speaker is at its maxVolume
+      const speakerMaxVolume = speaker.maxVolume ?? 100;
+      const actualVolume = (volumePercent / 100) * speakerMaxVolume;
+      debugLog(`[AudioMonitoring] Setting ${speaker.name} to ${volumePercent.toFixed(0)}% of its max ${speakerMaxVolume}% = ${actualVolume.toFixed(0)}% (Level ${Math.round(actualVolume/10)})`);
+
 
       // Convert 0-100% to dB
       // SPECIAL CASE: 0% = idle volume (IDLE state - quietest before needing multicast control)
@@ -1511,7 +1569,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Use allSettled to continue even if some speakers fail
     await Promise.allSettled(volumePromises);
     debugLog(`[AudioMonitoring] setDevicesVolume(${volumePercent}%) - completed`);
-  }, [selectedDevices, devices, useGlobalVolume]);
+  }, [selectedDevices, devices]);
 
   // Helper function to determine if it's currently daytime (supports half-hour intervals)
   const isDaytime = useCallback(() => {
@@ -1610,16 +1668,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     const effectiveRampDuration = getEffectiveRampDuration();
 
     // Individual mode: Ramp to 100% (each speaker will scale to its maxVolume)
-    // Global mode: Ramp to targetVolume (all speakers use same volume)
-    const rampTarget = useGlobalVolume ? targetVolume : 100;
+    const rampTarget = 100;
 
     // If ramp duration is 0 (instant), jump directly from idle volume to target volume
     if (effectiveRampDuration === 0) {
-      if (useGlobalVolume) {
-        debugLog(`[AudioMonitoring] GLOBAL MODE - Instant jump: ${getIdleVolumeString()} → ${targetVolume}%`);
-      } else {
-        debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Instant jump: ${getIdleVolumeString()} → each speaker to its max`);
-      }
+      debugLog(`[AudioMonitoring] Instant jump: ${getIdleVolumeString()} → each speaker to its max`);
       currentVolumeRef.current = rampTarget;
       setDevicesVolume(rampTarget);
       return;
@@ -1636,11 +1689,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     const volumeDiff = rampTarget - rampStart;
     const volumeIncrement = volumeDiff / steps;
 
-    if (useGlobalVolume) {
-      debugLog(`[AudioMonitoring] GLOBAL MODE - Optimized ramp: ${getIdleVolumeString()} → ${rampStart}% → ${targetVolume}% over ${effectiveRampDuration/1000}s`);
-    } else {
-      debugLog(`[AudioMonitoring] INDIVIDUAL MODE - Optimized ramp: ${getIdleVolumeString()} → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
-    }
+    debugLog(`[AudioMonitoring] Optimized ramp: ${getIdleVolumeString()} → ${rampStart}% → 100% (each speaker to its max) over ${effectiveRampDuration/1000}s`);
 
     // Set initial volume to level 1 (10%) - skip inaudible levels!
     setDevicesVolume(rampStart);
@@ -1670,7 +1719,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setDevicesVolume(currentVolumeRef.current);
       }
     }, stepInterval);
-  }, [targetVolume, useGlobalVolume, setDevicesVolume, getEffectiveRampDuration]);
+  }, [setDevicesVolume, getEffectiveRampDuration]);
 
   const stopVolumeRamp = useCallback(() => {
     if (volumeRampIntervalRef.current) {
@@ -2693,17 +2742,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         return;
       }
 
-      // Calculate actual volume based on useGlobalVolume mode
-      let actualVolume: number;
-      if (useGlobalVolume) {
-        // Global mode: use volumePercent directly
-        actualVolume = volumePercent;
-      } else {
-        // Individual mode: volumePercent represents ramp progress (0-100%)
-        // Scale by speaker's maxVolume
-        const speakerMaxVolume = speaker.maxVolume ?? 100;
-        actualVolume = (volumePercent / 100) * speakerMaxVolume;
-      }
+      // Calculate actual volume: volumePercent represents ramp progress (0-100%)
+      // Scale by speaker's maxVolume
+      const speakerMaxVolume = speaker.maxVolume ?? 100;
+      const actualVolume = (volumePercent / 100) * speakerMaxVolume;
 
       // Convert 0-100% to dB for Algo API
       let volumeDbString: string;
@@ -2744,11 +2786,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       id: d.id,
       name: d.name,
       mode: d.mode,
-      linkedPagingDevices: d.linkedPagingDevices || [],
+      linkedPagingDevices: d.linkedPagingDeviceIds || [],
     }));
 
-    // Create config object (shared by both coordinators)
-    const baseConfig = {
+    // Create shared config properties
+    const sharedConfig = {
       audioThreshold,
       sustainDuration,
       playbackEnabled,
@@ -2758,7 +2800,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       pagingDevice,
       setPagingZone,
       waitForPagingZoneReady,
-      onLog: addLog,
       onUpload: uploadRecordingToFirebase,
       // Speaker volume control
       linkedSpeakers,
@@ -2771,17 +2812,30 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       targetVolume,
       // PoE device control
       poeDevices: poeDevicesForCoordinator,
-      controlPoEDevices,
     };
 
     // Instantiate the appropriate coordinator based on feature flag
     if (USE_BATCH_SYSTEM) {
       // BatchCoordinator config (includes batch-specific settings)
       const batchConfig: BatchCoordinatorConfig = {
-        ...baseConfig,
+        ...sharedConfig,
+        onLog: (entry: { type: string; message: string; audioLevel?: number }) => {
+          // Wrapper to cast string type to AudioLogEntry type union
+          addLog(entry as Omit<AudioLogEntry, "timestamp">);
+        },
+        controlPoEDevices: async (deviceIds: string[], action: 'on' | 'off') => {
+          // Wrapper to match BatchCoordinator interface signature
+          await controlPoEDevices(action === 'on');
+        },
         batchDuration: 5000, // 5 seconds per batch
         minBatchDuration: 1000, // 1 second minimum
         maxBatchDuration: 10000, // 10 seconds maximum
+        tailGuardDuration, // User-configurable TailGuard window
+        postPlaybackGraceDuration, // User-configurable post-playback grace window
+        playbackRampDuration, // User-configurable ramp duration
+        playbackStartVolume, // User-configurable start volume (0-2.0)
+        playbackMaxVolume, // User-configurable max volume (0-2.0)
+        onPlaybackLevelUpdate: setPlaybackAudioLevel, // Real-time playback audio monitoring
       };
 
       batchCoordinatorRef.current = new BatchCoordinator(batchConfig);
@@ -2793,8 +2847,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         console.error('[BatchCoordinator] Failed to start:', error);
       });
     } else if (USE_NEW_CALL_SYSTEM) {
+      // CallCoordinator config (legacy streaming with original signatures)
+      const callConfig = {
+        ...sharedConfig,
+        onLog: addLog,
+        controlPoEDevices: controlPoEDevices,
+      };
+
       // CallCoordinator (legacy streaming)
-      callCoordinatorRef.current = new CallCoordinator(baseConfig);
+      callCoordinatorRef.current = new CallCoordinator(callConfig);
 
       // Start the coordinator with the monitoring stream
       callCoordinatorRef.current.start(monitoringStream).then(() => {
@@ -2835,7 +2896,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     waitForPagingZoneReady,
     addLog,
     uploadRecordingToFirebase,
-    useGlobalVolume,
     rampEnabled,
     dayNightMode,
     dayStartHour,
@@ -3447,6 +3507,31 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Playback disable delay set to:', `${delay}ms`);
   }, []);
 
+  const setTailGuardDurationCallback = useCallback((duration: number) => {
+    setTailGuardDuration(duration);
+    debugLog('[AudioMonitoring] TailGuard duration set to:', `${duration}ms`);
+  }, []);
+
+  const setPostPlaybackGraceDurationCallback = useCallback((duration: number) => {
+    setPostPlaybackGraceDuration(duration);
+    debugLog('[AudioMonitoring] Post-playback grace duration set to:', `${duration}ms`);
+  }, []);
+
+  const setPlaybackRampDurationCallback = useCallback((duration: number) => {
+    setPlaybackRampDuration(duration);
+    debugLog('[AudioMonitoring] Playback ramp duration set to:', `${duration}ms`);
+  }, []);
+
+  const setPlaybackStartVolumeCallback = useCallback((volume: number) => {
+    setPlaybackStartVolume(volume);
+    debugLog('[AudioMonitoring] Playback start volume set to:', volume.toFixed(2));
+  }, []);
+
+  const setPlaybackMaxVolumeCallback = useCallback((volume: number) => {
+    setPlaybackMaxVolume(volume);
+    debugLog('[AudioMonitoring] Playback max volume set to:', volume.toFixed(2));
+  }, []);
+
   const clearLogs = useCallback(() => {
     setLogs([]);
     debugLog('[AudioLog] Logs cleared');
@@ -3462,11 +3547,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     return header + rows;
   }, [logs]);
 
-  const setUseGlobalVolume = useCallback((useGlobal: boolean) => {
-    setUseGlobalVolumeState(useGlobal);
-    debugLog(`[AudioMonitoring] Volume mode changed to: ${useGlobal ? 'GLOBAL' : 'INDIVIDUAL'}`);
-  }, []);
-
   return (
     <AudioMonitoringContext.Provider
       value={{
@@ -3479,8 +3559,6 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         audioThreshold,
         audioDetected,
         speakersEnabled,
-        useGlobalVolume,
-        setUseGlobalVolume,
         rampEnabled,
         rampDuration,
         dayNightMode,
@@ -3522,6 +3600,16 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setPlaybackDelay,
         playbackDisableDelay,
         setPlaybackDisableDelay,
+        tailGuardDuration,
+        setTailGuardDuration: setTailGuardDurationCallback,
+        postPlaybackGraceDuration,
+        setPostPlaybackGraceDuration: setPostPlaybackGraceDurationCallback,
+        playbackRampDuration,
+        setPlaybackRampDuration: setPlaybackRampDurationCallback,
+        playbackStartVolume,
+        setPlaybackStartVolume: setPlaybackStartVolumeCallback,
+        playbackMaxVolume,
+        setPlaybackMaxVolume: setPlaybackMaxVolumeCallback,
         emergencyKillAll,
         emergencyEnableAll,
         controlSingleSpeaker,

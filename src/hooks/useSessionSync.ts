@@ -25,7 +25,6 @@ export function useSessionSync() {
     sustainDuration,
     disableDelay,
     selectedInputDevice,
-    useGlobalVolume,
     dayNightMode,
     dayStartHour,
     dayEndHour,
@@ -35,6 +34,11 @@ export function useSessionSync() {
     playbackEnabled,
     playbackDelay,
     playbackDisableDelay,
+    tailGuardDuration,
+    postPlaybackGraceDuration,
+    playbackRampDuration,
+    playbackStartVolume,
+    playbackMaxVolume,
     audioLevel,
     audioDetected,
     speakersEnabled,
@@ -49,7 +53,6 @@ export function useSessionSync() {
     setSustainDuration,
     setDisableDelay,
     setInputDevice,
-    setUseGlobalVolume,
     setDayNightMode,
     setDayStartHour,
     setDayEndHour,
@@ -59,6 +62,11 @@ export function useSessionSync() {
     setPlaybackEnabled,
     setPlaybackDelay,
     setPlaybackDisableDelay,
+    setTailGuardDuration,
+    setPostPlaybackGraceDuration,
+    setPlaybackRampDuration,
+    setPlaybackStartVolume,
+    setPlaybackMaxVolume,
   } = useAudioMonitoring();
 
   const isApplyingRemoteUpdate = useRef(false);
@@ -85,7 +93,6 @@ export function useSessionSync() {
     if (sustainDuration !== undefined) stateToSync.sustainDuration = sustainDuration;
     if (disableDelay !== undefined) stateToSync.disableDelay = disableDelay;
     if (selectedInputDevice !== undefined) stateToSync.selectedInputDevice = selectedInputDevice;
-    if (useGlobalVolume !== undefined) stateToSync.useGlobalVolume = useGlobalVolume;
     if (dayNightMode !== undefined) stateToSync.dayNightMode = dayNightMode;
     if (dayStartHour !== undefined) stateToSync.dayStartHour = dayStartHour;
     if (dayEndHour !== undefined) stateToSync.dayEndHour = dayEndHour;
@@ -95,6 +102,11 @@ export function useSessionSync() {
     if (playbackEnabled !== undefined) stateToSync.playbackEnabled = playbackEnabled;
     if (playbackDelay !== undefined) stateToSync.playbackDelay = playbackDelay;
     if (playbackDisableDelay !== undefined) stateToSync.playbackDisableDelay = playbackDisableDelay;
+    if (tailGuardDuration !== undefined) stateToSync.tailGuardDuration = tailGuardDuration;
+    if (postPlaybackGraceDuration !== undefined) stateToSync.postPlaybackGraceDuration = postPlaybackGraceDuration;
+    if (playbackRampDuration !== undefined) stateToSync.playbackRampDuration = playbackRampDuration;
+    if (playbackStartVolume !== undefined) stateToSync.playbackStartVolume = playbackStartVolume;
+    if (playbackMaxVolume !== undefined) stateToSync.playbackMaxVolume = playbackMaxVolume;
     if (audioLevel !== undefined) stateToSync.audioLevel = audioLevel;
     if (audioDetected !== undefined) stateToSync.audioDetected = audioDetected;
     if (speakersEnabled !== undefined) stateToSync.speakersEnabled = speakersEnabled;
@@ -111,7 +123,6 @@ export function useSessionSync() {
     sustainDuration,
     disableDelay,
     selectedInputDevice,
-    useGlobalVolume,
     dayNightMode,
     dayStartHour,
     dayEndHour,
@@ -121,6 +132,11 @@ export function useSessionSync() {
     playbackEnabled,
     playbackDelay,
     playbackDisableDelay,
+    tailGuardDuration,
+    postPlaybackGraceDuration,
+    playbackRampDuration,
+    playbackStartVolume,
+    playbackMaxVolume,
     audioLevel,
     audioDetected,
     speakersEnabled,
@@ -198,11 +214,6 @@ export function useSessionSync() {
       setInputDevice(sessionState.selectedInputDevice);
     }
 
-    // Apply volume mode
-    if (sessionState.useGlobalVolume !== undefined && sessionState.useGlobalVolume !== useGlobalVolume) {
-      setUseGlobalVolume(sessionState.useGlobalVolume);
-    }
-
     // Apply day/night mode settings
     if (sessionState.dayNightMode !== undefined && sessionState.dayNightMode !== dayNightMode) {
       setDayNightMode(sessionState.dayNightMode);
@@ -239,6 +250,26 @@ export function useSessionSync() {
 
     if (sessionState.playbackDisableDelay !== undefined && sessionState.playbackDisableDelay !== playbackDisableDelay) {
       setPlaybackDisableDelay(sessionState.playbackDisableDelay);
+    }
+
+    if (sessionState.tailGuardDuration !== undefined && sessionState.tailGuardDuration !== tailGuardDuration) {
+      setTailGuardDuration(sessionState.tailGuardDuration);
+    }
+
+    if (sessionState.postPlaybackGraceDuration !== undefined && sessionState.postPlaybackGraceDuration !== postPlaybackGraceDuration) {
+      setPostPlaybackGraceDuration(sessionState.postPlaybackGraceDuration);
+    }
+
+    if (sessionState.playbackRampDuration !== undefined && sessionState.playbackRampDuration !== playbackRampDuration) {
+      setPlaybackRampDuration(sessionState.playbackRampDuration);
+    }
+
+    if (sessionState.playbackStartVolume !== undefined && sessionState.playbackStartVolume !== playbackStartVolume) {
+      setPlaybackStartVolume(sessionState.playbackStartVolume);
+    }
+
+    if (sessionState.playbackMaxVolume !== undefined && sessionState.playbackMaxVolume !== playbackMaxVolume) {
+      setPlaybackMaxVolume(sessionState.playbackMaxVolume);
     }
 
     // Reset flag after applying updates - increased to 200ms to avoid race conditions

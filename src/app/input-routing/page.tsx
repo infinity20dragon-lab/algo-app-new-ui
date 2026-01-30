@@ -32,7 +32,7 @@ interface InputChannel {
 }
 
 export default function InputRoutingPage() {
-  const { devices, isCapturing, volume, useGlobalVolume } = useAudioMonitoring();
+  const { devices, isCapturing, volume } = useAudioMonitoring();
   const { user } = useAuth();
   const { sessionState, syncSessionState } = useRealtimeSync();
 
@@ -359,10 +359,9 @@ export default function InputRoutingPage() {
       }),
     });
 
-    // Ramp volume
-    const targetVolume = useGlobalVolume ? volume : null;
+    // Ramp volume (use individual speaker max volumes)
     for (const speaker of speakers) {
-      const vol = targetVolume !== null ? targetVolume : (speaker.maxVolume || 100);
+      const vol = speaker.maxVolume || 100;
       await fetch("/api/algo/speakers/volume", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -378,7 +377,7 @@ export default function InputRoutingPage() {
     }
 
     console.log(`[InputRouting] ✅ Activated ${speakers.length} speakers for ${channelType}`);
-  }, [devices, getSpeakersForInput, useGlobalVolume, volume, addLog]);
+  }, [devices, getSpeakersForInput, addLog]);
 
   // Deactivate speakers for a specific channel
   const deactivateSpeakersForChannel = useCallback(async (channelType: InputChannelType) => {

@@ -57,8 +57,6 @@ export default function LiveBroadcastPage() {
     audioThreshold,
     audioDetected,
     speakersEnabled,
-    useGlobalVolume,
-    setUseGlobalVolume,
     rampEnabled,
     rampDuration,
     dayNightMode,
@@ -92,6 +90,16 @@ export default function LiveBroadcastPage() {
     setPlaybackDelay,
     playbackDisableDelay,
     setPlaybackDisableDelay,
+    tailGuardDuration,
+    setTailGuardDuration,
+    postPlaybackGraceDuration,
+    setPostPlaybackGraceDuration,
+    playbackRampDuration,
+    setPlaybackRampDuration,
+    playbackStartVolume,
+    setPlaybackStartVolume,
+    playbackMaxVolume,
+    setPlaybackMaxVolume,
     devices: contextDevices,
     setDevices: setContextDevices,
     setPoeDevices,
@@ -115,7 +123,6 @@ export default function LiveBroadcastPage() {
   const displayedAudioThreshold = displayState?.audioThreshold ?? audioThreshold;
   const displayedAudioDetected = displayState?.audioDetected ?? audioDetected;
   const displayedSpeakersEnabled = displayState?.speakersEnabled ?? speakersEnabled;
-  const displayedUseGlobalVolume = displayState?.useGlobalVolume ?? useGlobalVolume;
   const displayedRampEnabled = displayState?.rampEnabled ?? rampEnabled;
   const displayedRampDuration = displayState?.rampDuration ?? rampDuration;
   const displayedDayNightMode = displayState?.dayNightMode ?? dayNightMode;
@@ -126,6 +133,11 @@ export default function LiveBroadcastPage() {
   const displayedDisableDelay = displayState?.disableDelay ?? disableDelay;
   const displayedPlaybackDelay = displayState?.playbackDelay ?? playbackDelay;
   const displayedPlaybackDisableDelay = displayState?.playbackDisableDelay ?? playbackDisableDelay;
+  const displayedTailGuardDuration = displayState?.tailGuardDuration ?? tailGuardDuration;
+  const displayedPostPlaybackGraceDuration = displayState?.postPlaybackGraceDuration ?? postPlaybackGraceDuration;
+  const displayedPlaybackRampDuration = displayState?.playbackRampDuration ?? playbackRampDuration;
+  const displayedPlaybackStartVolume = displayState?.playbackStartVolume ?? playbackStartVolume;
+  const displayedPlaybackMaxVolume = displayState?.playbackMaxVolume ?? playbackMaxVolume;
   const displayedSelectedDevices = displayState?.selectedDevices ?? (selectedDevices || []);
   const displayedLoggingEnabled = displayState?.loggingEnabled ?? loggingEnabled;
   const displayedRecordingEnabled = displayState?.recordingEnabled ?? recordingEnabled;
@@ -158,13 +170,6 @@ export default function LiveBroadcastPage() {
       loadInputDevices();
     }
   }, [user?.email, viewingAsUserEmail]); // Reload when user changes or admin switches viewing target
-
-  // Close any open volume editor when global mode is enabled
-  useEffect(() => {
-    if (useGlobalVolume && editingSpeakerId) {
-      setEditingSpeakerId(null);
-    }
-  }, [useGlobalVolume, editingSpeakerId]);
 
   const loadData = async () => {
     if (!user) return;
@@ -522,17 +527,12 @@ export default function LiveBroadcastPage() {
                           </span>
                         )}
                       </div>
-                      {displayedUseGlobalVolume && (
-                        <span className="text-xs text-[var(--accent-orange)] bg-[var(--accent-orange)]/10 px-2 py-1 rounded">
-                          Overridden by Global Mode
-                        </span>
-                      )}
                     </div>
-                    <div className={`grid gap-3 max-h-[400px] overflow-y-auto transition-opacity ${displayedUseGlobalVolume ? 'opacity-50 pointer-events-none' : 'opacity-100'}`}>
+                    <div className="grid gap-3 max-h-[400px] overflow-y-auto">
                       {contextDevices
                         .filter(d => d.type !== "8301")
                         .map((speaker) => {
-                          const isEditing = editingSpeakerId === speaker.id && !displayedUseGlobalVolume;
+                          const isEditing = editingSpeakerId === speaker.id;
                           // Display as 0-10 level, store as 0-100%
                           const storedMaxVolume = speaker.maxVolume ?? 100;
                           const displayLevel = Math.round(storedMaxVolume / 10);
@@ -545,17 +545,13 @@ export default function LiveBroadcastPage() {
                           return (
                             <div
                               key={speaker.id}
-                              className={`p-3 rounded-xl bg-[var(--bg-secondary)] border space-y-3 transition-all ${
-                                displayedUseGlobalVolume
-                                  ? 'border-[var(--border-color)]/50 cursor-not-allowed'
-                                  : 'border-[var(--border-color)]'
-                              }`}
+                              className="p-3 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)] space-y-3 transition-all"
                             >
                               <div className="flex items-center justify-between">
                                 <div className="flex items-center gap-3">
-                                  <Speaker className={`h-4 w-4 ${displayedUseGlobalVolume ? 'text-[var(--text-muted)]/50' : 'text-[var(--text-muted)]'}`} />
+                                  <Speaker className="h-4 w-4 text-[var(--text-muted)]" />
                                   <div>
-                                    <p className={`text-sm font-medium flex items-center gap-2 ${displayedUseGlobalVolume ? 'text-[var(--text-primary)]/60' : 'text-[var(--text-primary)]'}`}>
+                                    <p className="text-sm font-medium flex items-center gap-2 text-[var(--text-primary)]">
                                       {speaker.name}
                                       {speakerStatus && (
                                         speakerStatus.isOnline
@@ -565,7 +561,7 @@ export default function LiveBroadcastPage() {
                                     </p>
                                     <button
                                       onClick={() => {
-                                        if (!isEditing && !displayedUseGlobalVolume) {
+                                        if (!isEditing) {
                                           setLocalMaxVolumes(prev => ({
                                             ...prev,
                                             [speaker.id]: storedMaxVolume
@@ -573,15 +569,10 @@ export default function LiveBroadcastPage() {
                                           setEditingSpeakerId(speaker.id);
                                         }
                                       }}
-                                      disabled={displayedUseGlobalVolume}
-                                      className={`text-xs ${
-                                        displayedUseGlobalVolume
-                                          ? 'text-[var(--text-muted)]/50 cursor-not-allowed line-through'
-                                          : 'text-[var(--accent-blue)] hover:underline cursor-pointer'
-                                      }`}
-                                      title={displayedUseGlobalVolume ? "Disabled - Global volume mode is active" : "Click to edit"}
+                                      className="text-xs text-[var(--accent-blue)] hover:underline cursor-pointer"
+                                      title="Click to edit"
                                     >
-                                      Max: Level {displayLevel}/10 {!displayedUseGlobalVolume && '(click to edit)'}
+                                      Max: Level {displayLevel}/10 (click to edit)
                                     </button>
                                   </div>
                                 </div>
@@ -591,7 +582,6 @@ export default function LiveBroadcastPage() {
                                     variant="outline"
                                     className="text-[var(--accent-green)] border-[var(--accent-green)]/50 hover:bg-[var(--accent-green)]/10"
                                     onClick={() => controlSingleSpeaker(speaker.id, true)}
-                                    disabled={displayedUseGlobalVolume}
                                   >
                                     <Power className="h-3 w-3" />
                                   </Button>
@@ -600,14 +590,13 @@ export default function LiveBroadcastPage() {
                                     variant="outline"
                                     className="text-[var(--accent-red)] border-[var(--accent-red)]/50 hover:bg-[var(--accent-red)]/10"
                                     onClick={() => controlSingleSpeaker(speaker.id, false)}
-                                    disabled={displayedUseGlobalVolume}
                                   >
                                     <PowerOff className="h-3 w-3" />
                                   </Button>
                                 </div>
                               </div>
 
-                              {isEditing && !displayedUseGlobalVolume && (
+                              {isEditing && (
                                 <div className="space-y-2 pt-2 border-t border-[var(--border-color)]">
                                   <div className="flex items-center justify-between">
                                     <Label className="text-xs">Max Volume Level</Label>
@@ -794,6 +783,55 @@ export default function LiveBroadcastPage() {
                     </div>
                   </div>
                 )}
+
+                {/* Grace Period Settings - Only show when playback is enabled */}
+                {displayedPlaybackEnabled && (
+                  <div className="space-y-6 pt-6 border-t border-[var(--border-color)]">
+                    <div className="text-sm font-semibold text-[var(--text-secondary)]">Grace Period Settings</div>
+
+                    {/* TailGuard Duration */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <Label>TailGuard Duration</Label>
+                        <span className="text-sm font-mono text-[var(--accent-purple)]">{displayedTailGuardDuration}ms</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={10000}
+                        step={100}
+                        value={displayedTailGuardDuration}
+                        onChange={(e) => setTailGuardDuration(parseInt(e.target.value))}
+                      />
+                      <p className="text-xs text-[var(--text-muted)]">
+                        Grace window after silence timeout to catch late audio (e.g., "...HELP!")
+                      </p>
+                    </div>
+
+                    {/* Post-Playback Grace Duration */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <Label>Post-Playback Grace</Label>
+                        <span className="text-sm font-mono text-[var(--accent-orange)]">{displayedPostPlaybackGraceDuration}ms</span>
+                      </div>
+                      <Slider
+                        min={0}
+                        max={5000}
+                        step={50}
+                        value={displayedPostPlaybackGraceDuration}
+                        onChange={(e) => setPostPlaybackGraceDuration(parseInt(e.target.value))}
+                      />
+                      <p className="text-xs text-[var(--text-muted)]">
+                        Grace window after playback ends to catch quick responses (e.g., "Hello?")
+                      </p>
+                      <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-purple)]/10 border border-[var(--accent-purple)]/30">
+                        <span className="text-xs">🛡️</span>
+                        <p className="text-xs text-[var(--text-secondary)]">
+                          <strong>Extended Grace:</strong> Both grace periods stay active during hardware deactivation to catch audio spoken during shutdown.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </CardContent>
             </Card>
 
@@ -813,48 +851,6 @@ export default function LiveBroadcastPage() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-6">
-                {/* Volume Mode Selection */}
-                <div className="p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)] space-y-4">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <Label className="!text-[var(--text-primary)]">Use Global Volume</Label>
-                      <p className="text-xs text-[var(--text-muted)] mt-1">
-                        {displayedUseGlobalVolume
-                          ? "All speakers use same volume (individual settings ignored)"
-                          : "Each speaker uses its own max volume setting"}
-                      </p>
-                    </div>
-                    <Switch
-                      checked={displayedUseGlobalVolume}
-                      onCheckedChange={setUseGlobalVolume}
-                    />
-                  </div>
-
-                  {displayedUseGlobalVolume ? (
-                    <div className="space-y-2 pt-2 border-t border-[var(--border-color)]">
-                      <div className="flex items-center justify-between">
-                        <Label className="text-xs">Global Volume Level</Label>
-                        <span className="text-xs font-mono text-[var(--accent-blue)]">{displayedTargetVolume}% (Lv. {Math.round(displayedTargetVolume / 10)}/10)</span>
-                      </div>
-                      <Slider
-                        min={0}
-                        max={100}
-                        value={displayedTargetVolume}
-                        onChange={(e) => setTargetVolume(parseInt(e.target.value))}
-                      />
-                      <p className="text-xs text-[var(--text-muted)]">
-                        All speakers will play at this volume level
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="pt-2 border-t border-[var(--border-color)]">
-                      <p className="text-xs text-[var(--accent-blue)]">
-                        ✓ Using individual speaker max volumes (editable in Emergency Controls below)
-                      </p>
-                    </div>
-                  )}
-                </div>
-
                 {/* Volume Ramp */}
                 <div className="p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)] space-y-4">
                   <div className="flex items-center justify-between">
@@ -907,32 +903,82 @@ export default function LiveBroadcastPage() {
                               })}
                             </Select>
                           </div>
-                          <div className="space-y-2">
-                            <div className="flex items-center justify-between">
-                              <Label className="text-xs">Night Ramp: {displayedNightRampDuration}s</Label>
-                              <Badge variant={isDaytime ? "secondary" : "default"} className="text-xs">
-                                {isDaytime ? "Day (Instant)" : "Night (Ramp)"}
-                              </Badge>
-                            </div>
-                            <Slider
-                              min={0}
-                              max={30}
-                              value={displayedNightRampDuration}
-                              onChange={(e) => setNightRampDuration(parseInt(e.target.value))}
-                            />
+                          <div className="pt-2 border-t border-[var(--border-color)]">
+                            <Badge variant={isDaytime ? "secondary" : "default"} className="text-xs">
+                              {isDaytime ? "Day (No Ramp)" : "Night (Ramp Active)"}
+                            </Badge>
+                            <p className="text-xs text-[var(--text-muted)] mt-2">
+                              Volume ramp only applies during night hours
+                            </p>
                           </div>
                         </div>
-                      ) : (
+                      ) : null}
+
+                      {/* Playback Volume Ramp Settings */}
+                      <div className="space-y-4 pt-4 border-t border-[var(--border-color)]">
+                        <div className="text-sm font-semibold text-[var(--text-secondary)]">Playback Volume Ramp</div>
+
+                        {/* Ramp Duration */}
                         <div className="space-y-2">
-                          <Label className="text-xs">Ramp Duration: {displayedRampDuration}s</Label>
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Ramp Duration</Label>
+                            <span className="text-xs font-mono text-[var(--accent-blue)]">{displayedPlaybackRampDuration}ms</span>
+                          </div>
                           <Slider
                             min={0}
-                            max={30}
-                            value={displayedRampDuration}
-                            onChange={(e) => setRampDuration(parseInt(e.target.value))}
+                            max={5000}
+                            step={100}
+                            value={displayedPlaybackRampDuration}
+                            onChange={(e) => setPlaybackRampDuration(parseInt(e.target.value))}
                           />
+                          <p className="text-xs text-[var(--text-muted)]">
+                            Time to fade from start to max volume (0ms = instant)
+                          </p>
                         </div>
-                      )}
+
+                        {/* Start Volume */}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Start Volume</Label>
+                            <span className="text-xs font-mono text-[var(--accent-green)]">{(displayedPlaybackStartVolume * 100).toFixed(0)}%</span>
+                          </div>
+                          <Slider
+                            min={0}
+                            max={2}
+                            step={0.05}
+                            value={displayedPlaybackStartVolume}
+                            onChange={(e) => setPlaybackStartVolume(parseFloat(e.target.value))}
+                          />
+                          <p className="text-xs text-[var(--text-muted)]">
+                            Initial playback volume (0% = silent, 100% = normal, 200% = max)
+                          </p>
+                        </div>
+
+                        {/* Max Volume */}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between">
+                            <Label className="text-xs">Max Volume</Label>
+                            <span className="text-xs font-mono text-[var(--accent-red)]">{(displayedPlaybackMaxVolume * 100).toFixed(0)}%</span>
+                          </div>
+                          <Slider
+                            min={0}
+                            max={2}
+                            step={0.05}
+                            value={displayedPlaybackMaxVolume}
+                            onChange={(e) => setPlaybackMaxVolume(parseFloat(e.target.value))}
+                          />
+                          <p className="text-xs text-[var(--text-muted)]">
+                            Target volume after ramp (0% = silent, 100% = normal, 200% = loud)
+                          </p>
+                        </div>
+
+                        <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-green)]/10 border border-[var(--accent-green)]/30">
+                          <span className="text-xs">🎚️</span>
+                          <p className="text-xs text-[var(--text-secondary)]">
+                            <strong>Local Playback:</strong> Volume ramp applied instantly via Web Audio API. Zero network requests!
+                          </p>
+                        </div>
+                      </div>
                     </>
                   )}
                 </div>

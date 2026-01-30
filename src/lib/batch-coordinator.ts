@@ -45,6 +45,16 @@ export enum BatchState {
   Failed = 'Failed'
 }
 
+export enum SystemState {
+  IDLE = 'IDLE',                     // No activity, paging Zone 2
+  ARMED = 'ARMED',                   // Audio detected, validating
+  RECORDING = 'RECORDING',           // Active session, paging Zone 1
+  PLAYING = 'PLAYING',               // Playback in progress
+  TAILGUARD = 'TAILGUARD',           // 3s grace after silence
+  GRACE = 'GRACE',                   // Post-playback grace window
+  DEACTIVATING = 'DEACTIVATING'      // Shutting down hardware
+}
+
 export interface AudioBatch {
   id: string;                              // Unique identifier
   chunks: Blob[];                          // MediaRecorder chunks
@@ -83,6 +93,13 @@ export interface BatchCoordinatorConfig {
   playbackEnabled: boolean;                // Enable/disable live playback
   playbackDelay: number;                   // Hardware stabilization delay (ms)
   disableDelay: number;                    // Silence timeout before stopping (ms)
+  tailGuardDuration?: number;              // TailGuard window duration (ms, default: 3000)
+  postPlaybackGraceDuration?: number;      // Post-playback grace window (ms, default: 750)
+
+  // Playback volume ramp
+  playbackRampDuration?: number;           // Ramp duration in ms (default: 2000)
+  playbackStartVolume?: number;            // Start volume 0-2.0 (default: 0 = silent)
+  playbackMaxVolume?: number;              // Max volume 0-2.0 (default: 1.0 = 100%)
 
   // Hardware control
   pagingDevice?: {
@@ -91,7 +108,7 @@ export interface BatchCoordinatorConfig {
     ipAddress: string;
     password: string;
     authMethod: string;
-  };
+  } | null;
   setPagingZone?: (zone: number) => Promise<void>;
   waitForPagingZoneReady?: (zone: number) => Promise<boolean>;
 
@@ -124,6 +141,7 @@ export interface BatchCoordinatorConfig {
   onUpload: (blob: Blob, mimeType: string) => Promise<string>;
   onError?: (error: Error) => void;
   onStateChange?: (state: string) => void;
+  onPlaybackLevelUpdate?: (level: number) => void;  // Playback audio level monitoring
 }
 
 // ============================================================================
@@ -154,6 +172,10 @@ export class BatchCoordinator {
   // Web Audio API for playback
   private audioContext: AudioContext | null = null;
   private nextPlaybackTime: number = 0; // Timeline position for scheduling
+  private playbackAnalyser: AnalyserNode | null = null;
+  private playbackMonitoringInterval: number | null = null;
+  private currentPlaybackSource: AudioBufferSourceNode | null = null;
+  private playbackGainNode: GainNode | null = null; // For volume ramping (no network requests!)
 
   // Hardware state
   private pagingActive: boolean = false;      // Zone 1 active
@@ -180,12 +202,33 @@ export class BatchCoordinator {
 
   // TailGuard: Always-on buffer after last batch queued
   private tailGuardActive: boolean = false;
-  private tailGuardDuration: number = 3000; // 3 seconds after silence timeout
+  private tailGuardDuration: number; // Configured duration (default: 3000ms)
   private tailGuardStartTime: number = 0;
 
   // Background upload queue (non-blocking)
   private completedSessions: CompletedSession[] = [];
   private uploadInProgress: boolean = false;
+
+  // System state machine (for debugging and race condition prevention)
+  private systemState: SystemState = SystemState.IDLE;
+
+  // Idle memory cap (rolling ring buffer)
+  private idleBufferMaxDuration: number = 3000; // 3 seconds max for idle batch
+
+  // Post-playback grace window (catch "hello" right after playback)
+  private postPlaybackGraceDuration: number; // Configured duration (default: 750ms)
+  private postPlaybackGraceActive: boolean = false;
+  private postPlaybackGraceTimeout: number | null = null;
+  private postPlaybackGraceResolve: (() => void) | null = null; // Resolve function to cancel grace
+
+  // Playback volume ramp settings
+  private playbackRampDuration: number; // Ramp duration in ms
+  private playbackStartVolume: number; // Start volume (0-2.0)
+  private playbackMaxVolume: number; // Max volume (0-2.0)
+
+  // Hardware thrash protection (prevent infinite reactivation loops)
+  private reactivationAttempts: number = 0;
+  private maxReactivationAttempts: number = 1; // Allow 1 re-activation per finish cycle
 
   constructor(config: BatchCoordinatorConfig) {
     this.config = config;
@@ -193,7 +236,12 @@ export class BatchCoordinator {
     this.minBatchDuration = config.minBatchDuration || 1000;
     this.maxBatchDuration = config.maxBatchDuration || 10000;
     this.sustainDuration = config.sustainDuration || 500;
-    this.silenceTimeout = config.disableDelay || 8000;
+    this.silenceTimeout = config.disableDelay; // Respect user setting, no fallback
+    this.tailGuardDuration = config.tailGuardDuration ?? 3000; // Default: 3s
+    this.postPlaybackGraceDuration = config.postPlaybackGraceDuration ?? 750; // Default: 750ms
+    this.playbackRampDuration = config.playbackRampDuration ?? 2000; // Default: 2s
+    this.playbackStartVolume = config.playbackStartVolume ?? 0; // Default: silent start
+    this.playbackMaxVolume = config.playbackMaxVolume ?? 1.0; // Default: 100% volume
   }
 
   // ============================================================================
@@ -224,6 +272,23 @@ export class BatchCoordinator {
       this.audioContext = new AudioContext();
       this.nextPlaybackTime = 0;
       this.log(`🎵 Web Audio API initialized (sample rate: ${this.audioContext.sampleRate}Hz)`);
+
+      // Create gain node for volume ramping (fast, no network requests!)
+      this.playbackGainNode = this.audioContext.createGain();
+      this.playbackGainNode.gain.value = this.playbackStartVolume; // Start at configured volume
+      this.log(`🎵 Playback gain node created (start: ${this.playbackStartVolume.toFixed(2)}, max: ${this.playbackMaxVolume.toFixed(2)})`);
+
+      // Create analyser for playback monitoring
+      this.playbackAnalyser = this.audioContext.createAnalyser();
+      this.playbackAnalyser.fftSize = 256;
+
+      // Connect: GainNode → Analyser → Destination
+      this.playbackGainNode.connect(this.playbackAnalyser);
+      this.playbackAnalyser.connect(this.audioContext.destination);
+      this.log('🎵 Audio chain: Source → Gain (ramp) → Analyser (monitor) → Destination (speakers)');
+
+      // Start playback level monitoring
+      this.startPlaybackMonitoring();
     } else {
       // Reset timeline for new session
       this.nextPlaybackTime = this.audioContext.currentTime;
@@ -247,9 +312,44 @@ export class BatchCoordinator {
   onAudioDetected(level: number): void {
     this.lastAudioTime = Date.now();
 
+    // 🔒 POST-PLAYBACK GRACE: Audio detected right after playback!
+    // This is the "hello" we were waiting for - promote standby batch
+    if (this.postPlaybackGraceActive) {
+      // Validate sustained audio during grace period
+      if (!this.audioValidated && !this.validationStartTime) {
+        this.validationStartTime = Date.now();
+        this.log(`🔒 Grace: Emergency audio detected (${(level * 100).toFixed(0)}%) right after playback, validating...`);
+      }
+
+      if (!this.audioValidated && this.validationStartTime) {
+        const elapsed = Date.now() - this.validationStartTime;
+        if (elapsed >= this.sustainDuration) {
+          this.audioValidated = true;
+          this.log(`🔒 Grace: Audio validated (${elapsed}ms) - PROMOTING standby batch to new session`);
+
+          // Cancel grace timer - we're promoting
+          this.cancelPostPlaybackGrace();
+
+          // 🔥 CRITICAL: Restart silence monitoring for the promoted session
+          // This ensures the promoted session has a fresh 8s silence countdown
+          if (this.silenceCheckInterval) {
+            clearInterval(this.silenceCheckInterval);
+            this.silenceCheckInterval = null;
+          }
+          this.onSilence(); // Start fresh silence monitoring with updated lastAudioTime
+
+          // finishSession will detect audioValidated and abort deactivation
+          // The standby batch will be promoted in cleanup()
+          this.log(`🔒 Grace promotion: Hardware will stay active, session continues`);
+        }
+      }
+
+      return; // Grace is handling this audio
+    }
+
     // 🎯 BLOCK: Don't start new session while previous session is finishing
     // This prevents overlapping sessions during upload/cleanup
-    if (this.isFinishing && !this.tailGuardActive) {
+    if (this.isFinishing && !this.tailGuardActive && !this.postPlaybackGraceActive) {
       // Session is finishing, audio will be captured in standby batch
       // and validated/promoted in cleanup() if sustained
       return;
@@ -272,6 +372,14 @@ export class BatchCoordinator {
           // Deactivate TailGuard - it's now a full session
           this.tailGuardActive = false;
           this.tailGuardStartTime = 0;
+
+          // 🔥 CRITICAL: Restart silence monitoring for the promoted session
+          // This ensures the promoted session has a fresh 8s silence countdown
+          if (this.silenceCheckInterval) {
+            clearInterval(this.silenceCheckInterval);
+            this.silenceCheckInterval = null;
+          }
+          this.onSilence(); // Start fresh silence monitoring with updated lastAudioTime
 
           // Start new batch for the promoted session
           // MediaRecorder is already running, just continue batching
@@ -539,6 +647,9 @@ export class BatchCoordinator {
     if (this.silenceCheckInterval) {
       clearInterval(this.silenceCheckInterval);
     }
+
+    // Stop playback monitoring
+    this.stopPlaybackMonitoring();
 
     // Stop playback - close AudioContext (monitoring is stopping)
     if (this.audioContext && this.audioContext.state !== 'closed') {
@@ -813,7 +924,15 @@ export class BatchCoordinator {
       // 🎵 Step 2: Create AudioBufferSourceNode
       const source = this.audioContext.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(this.audioContext.destination);
+      this.currentPlaybackSource = source;
+
+      // Connect to gain node (for volume ramping)
+      if (this.playbackGainNode) {
+        source.connect(this.playbackGainNode);
+      } else {
+        // Fallback: direct connection if gain node not available
+        source.connect(this.audioContext.destination);
+      }
 
       // 🎵 Step 3: Calculate playback time (sample-accurate scheduling)
       const now = this.audioContext.currentTime;
@@ -890,6 +1009,42 @@ export class BatchCoordinator {
     });
   }
 
+  /**
+   * 🔒 POST-PLAYBACK GRACE: Wait 750ms after playback for "hello" responses
+   * This catches firefighters responding immediately after hearing the page
+   * If audio validated during grace → cancelPostPlaybackGrace() resolves early
+   */
+  private async waitForPostPlaybackGrace(): Promise<void> {
+    return new Promise((resolve) => {
+      // Store resolve function so cancelPostPlaybackGrace() can call it
+      this.postPlaybackGraceResolve = resolve;
+
+      this.postPlaybackGraceTimeout = window.setTimeout(() => {
+        this.postPlaybackGraceTimeout = null;
+        this.postPlaybackGraceResolve = null;
+        resolve();
+      }, this.postPlaybackGraceDuration);
+    });
+  }
+
+  /**
+   * Cancel post-playback grace (called when audio validates during grace)
+   * Immediately resolves the waitForPostPlaybackGrace() promise
+   */
+  private cancelPostPlaybackGrace(): void {
+    if (this.postPlaybackGraceTimeout) {
+      clearTimeout(this.postPlaybackGraceTimeout);
+      this.postPlaybackGraceTimeout = null;
+      this.log('🚨 Post-playback grace cancelled (emergency audio validated)');
+    }
+
+    // Immediately resolve the promise so finishSession() can check audioValidated and return early
+    if (this.postPlaybackGraceResolve) {
+      this.postPlaybackGraceResolve();
+      this.postPlaybackGraceResolve = null;
+    }
+  }
+
   // ============================================================================
   // Hardware Control
   // ============================================================================
@@ -902,24 +1057,66 @@ export class BatchCoordinator {
     try {
       // Step 1: Set paging to Zone 1 (active)
       if (this.config.pagingDevice && this.config.setPagingZone) {
-        this.log('Step 1: Switching paging to Zone 1 (active)...');
-        await this.config.setPagingZone(1);
+        // Check if already in Zone 1 to avoid redundant zone changes
+        let needsZoneChange = true;
+        if (this.isInZone1) {
+          this.log('Step 1: Already in Zone 1, verifying readiness...');
+          needsZoneChange = false;
+        } else {
+          this.log('Step 1: Switching paging to Zone 1 (active)...');
+          await this.config.setPagingZone(1);
+          this.log('  ✓ Zone change command sent (reload triggered on device)');
+        }
 
+        // CRITICAL: Always poll to confirm device is ready, even if zone didn't change
+        // This ensures hardware is truly ready before playback starts
         if (this.config.waitForPagingZoneReady) {
+          this.log(`  Polling paging device until ready (mcast.mode = 1)...`);
           const ready = await this.config.waitForPagingZoneReady(1);
           if (ready) {
-            this.log('  ✓ Paging switched to Zone 1');
+            this.log('  ✓ Paging device confirmed ready (Zone 1, Mode 1)');
+            this.pagingActive = true;
+            this.isInZone1 = true;
+          } else {
+            this.log('  ⚠️ Paging device polling timeout - proceeding anyway');
             this.pagingActive = true;
             this.isInZone1 = true;
           }
+        } else {
+          // No polling available, assume ready
+          this.pagingActive = true;
+          this.isInZone1 = true;
         }
       }
 
-      // Step 2: Ramp speaker volumes
+      // Step 2: Set speaker volumes instantly (no ramp, no repeated network requests!)
       if (this.config.linkedSpeakers.length > 0 && this.config.playbackEnabled) {
-        this.log('Step 2: Ramping speaker volumes...');
-        await this.rampSpeakerVolumes(this.config.targetVolume);
-        this.log('  ✓ Speakers ready');
+        this.log('Step 2: Setting speaker volumes to target...');
+        await this.setSpeakersToTargetVolume();
+        this.log('  ✓ Speakers set to target volume');
+      }
+
+      // Step 2.5: Ramp playback gain node (fast, smooth, no network!)
+      if (this.config.playbackEnabled && this.config.rampEnabled) {
+        // Check day/night mode: if enabled, only ramp during night hours
+        const shouldRamp = !this.config.dayNightMode || this.shouldUseNightRamp();
+
+        if (shouldRamp) {
+          this.log(`Step 2.5: Ramping playback gain (${this.playbackStartVolume.toFixed(2)} → ${this.playbackMaxVolume.toFixed(2)} over ${this.playbackRampDuration}ms)...`);
+          this.rampPlaybackGain(this.playbackMaxVolume, this.playbackRampDuration); // Non-blocking, starts immediately
+          this.log('  ✓ Playback gain ramping started');
+        } else {
+          // Day mode with day/night enabled: instant (no ramp)
+          if (this.playbackGainNode) {
+            this.playbackGainNode.gain.value = this.playbackMaxVolume;
+            this.log('Step 2.5: Day mode - instant volume (no ramp)');
+          }
+        }
+      } else {
+        // Ramp disabled, set gain to max immediately
+        if (this.playbackGainNode) {
+          this.playbackGainNode.gain.value = this.playbackMaxVolume;
+        }
       }
 
       // Step 3: Enable PoE devices in auto mode
@@ -945,10 +1142,11 @@ export class BatchCoordinator {
     this.log('🎛️  HARDWARE DEACTIVATION:');
 
     try {
-      // Step 1: Ramp down speaker volumes
-      if (this.config.linkedSpeakers.length > 0 && this.config.playbackEnabled) {
-        this.log('Step 1: Ramping speaker volumes down...');
-        await this.rampSpeakerVolumes(0);
+      // Step 1: Ramp down playback gain (fast, no network requests!)
+      if (this.config.playbackEnabled && this.config.rampEnabled && this.playbackGainNode) {
+        this.log('Step 1: Ramping playback gain down...');
+        await this.rampPlaybackGain(this.playbackStartVolume, 1000); // Quick fade down (1s)
+        this.log('  ✓ Playback gain ramped down');
       }
 
       // Step 2: Disable PoE devices in auto mode
@@ -961,16 +1159,33 @@ export class BatchCoordinator {
 
       // Step 3: Set paging back to Zone 2 (idle)
       if (this.config.pagingDevice && this.config.setPagingZone) {
-        this.log('Step 3: Switching paging to Zone 2 (idle)...');
-        await this.config.setPagingZone(2);
+        // Only change zone if currently in Zone 1
+        if (this.isInZone1) {
+          this.log('Step 3: Switching paging to Zone 2 (idle)...');
+          await this.config.setPagingZone(2);
+          this.log('  ✓ Zone change command sent (reload triggered on device)');
 
-        if (this.config.waitForPagingZoneReady) {
-          const ready = await this.config.waitForPagingZoneReady(2);
-          if (ready) {
-            this.log('  ✓ Paging switched to Zone 2');
+          if (this.config.waitForPagingZoneReady) {
+            this.log('  Polling paging device until ready (Zone 2)...');
+            const ready = await this.config.waitForPagingZoneReady(2);
+            if (ready) {
+              this.log('  ✓ Paging device confirmed in Zone 2');
+              this.pagingActive = false;
+              this.isInZone1 = false;
+            } else {
+              this.log('  ⚠️ Paging device polling timeout - marking inactive anyway');
+              this.pagingActive = false;
+              this.isInZone1 = false;
+            }
+          } else {
+            // No polling available, assume ready
             this.pagingActive = false;
             this.isInZone1 = false;
           }
+        } else {
+          this.log('Step 3: Already in Zone 2, skipping zone change');
+          this.pagingActive = false;
+          this.isInZone1 = false;
         }
       }
 
@@ -980,6 +1195,121 @@ export class BatchCoordinator {
     } catch (error) {
       this.log(`Hardware deactivation error: ${error}`);
       // Continue anyway - best effort
+    }
+  }
+
+  /**
+   * Ramp playback gain node (fast, no network requests!)
+   * Applies volume ramp to playback audio in real-time
+   */
+  private async rampPlaybackGain(targetGain: number, duration: number): Promise<void> {
+    if (!this.playbackGainNode || !this.audioContext) {
+      return;
+    }
+
+    const currentTime = this.audioContext.currentTime;
+    const currentGain = this.playbackGainNode.gain.value;
+
+    this.log(`🎚️  Ramping playback gain: ${currentGain.toFixed(2)} → ${targetGain.toFixed(2)} over ${duration}ms`);
+
+    // Cancel any previous ramps
+    this.playbackGainNode.gain.cancelScheduledValues(currentTime);
+
+    // Set current value (in case it was ramping)
+    this.playbackGainNode.gain.setValueAtTime(currentGain, currentTime);
+
+    // Ramp to target value
+    this.playbackGainNode.gain.linearRampToValueAtTime(
+      targetGain,
+      currentTime + (duration / 1000)
+    );
+
+    // Wait for ramp to complete
+    await new Promise(resolve => setTimeout(resolve, duration));
+  }
+
+  /**
+   * Set speakers to target volume instantly (no ramping, just set once)
+   */
+  private async setSpeakersToTargetVolume(): Promise<void> {
+    if (this.config.linkedSpeakers.length === 0 || !this.config.setSpeakerVolume) {
+      return;
+    }
+
+    const targetVolume = this.config.targetVolume;
+    this.log(`🔊 Setting ${this.config.linkedSpeakers.length} speakers to ${targetVolume}% (instant, no ramp)`);
+
+    await Promise.all(
+      this.config.linkedSpeakers.map(async (speaker) => {
+        try {
+          await this.config.setSpeakerVolume!(speaker.id, targetVolume);
+        } catch (error) {
+          this.log(`Failed to set ${speaker.name} volume: ${error}`);
+        }
+      })
+    );
+  }
+
+  /**
+   * Start monitoring playback audio levels
+   */
+  private startPlaybackMonitoring(): void {
+    if (this.playbackMonitoringInterval) return; // Already monitoring
+
+    this.playbackMonitoringInterval = window.setInterval(() => {
+      if (!this.playbackAnalyser || !this.isPlaying) {
+        // No playback active, reset level to 0
+        if (this.config.onPlaybackLevelUpdate) {
+          this.config.onPlaybackLevelUpdate(0);
+        }
+        return;
+      }
+
+      const analyser = this.playbackAnalyser;
+
+      // Get frequency data
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(freqData);
+
+      // Get time domain data
+      const timeData = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(timeData);
+
+      // Calculate average from frequency data
+      const freqAverage = freqData.reduce((a, b) => a + b, 0) / freqData.length;
+      const freqLevel = Math.round((freqAverage / 255) * 100);
+
+      // Calculate RMS from time domain data
+      let sum = 0;
+      for (let i = 0; i < timeData.length; i++) {
+        const normalized = (timeData[i] - 128) / 128;
+        sum += normalized * normalized;
+      }
+      const rms = Math.sqrt(sum / timeData.length);
+      const timeLevel = Math.round(rms * 100);
+
+      // Use the higher of the two
+      const level = Math.max(freqLevel, timeLevel);
+
+      // Report level to callback
+      if (this.config.onPlaybackLevelUpdate) {
+        this.config.onPlaybackLevelUpdate(level);
+      }
+    }, 50); // Update every 50ms for smooth visualization
+  }
+
+  /**
+   * Stop monitoring playback audio levels
+   */
+  private stopPlaybackMonitoring(): void {
+    if (this.playbackMonitoringInterval) {
+      clearInterval(this.playbackMonitoringInterval);
+      this.playbackMonitoringInterval = null;
+    }
+
+    // Reset level to 0
+    if (this.config.onPlaybackLevelUpdate) {
+      this.config.onPlaybackLevelUpdate(0);
     }
   }
 
@@ -1027,6 +1357,18 @@ export class BatchCoordinator {
     return hour < this.config.dayStartHour || hour >= this.config.dayEndHour;
   }
 
+  /**
+   * Check if current time is within "night" hours
+   * Used for playback volume ramping
+   */
+  private shouldUseNightRamp(): boolean {
+    const now = new Date();
+    const hour = now.getHours();
+
+    // Night time is before dayStartHour OR after/equal to dayEndHour
+    return hour < this.config.dayStartHour || hour >= this.config.dayEndHour;
+  }
+
   // ============================================================================
   // Session Completion & Upload
   // ============================================================================
@@ -1048,6 +1390,10 @@ export class BatchCoordinator {
     this.validationStartTime = 0;
     this.log('🎯 Validation state reset - standby batch will only promote if NEW audio validated during finish');
 
+    // 🛡️ HARDWARE THRASH PROTECTION: Counter persists across finish cycles
+    // Only reset when we successfully reach idle (see cleanup)
+    // This prevents rapid oscillation: finish→detect→activate→finish→detect→activate...
+
     // 🔥 CRITICAL: Invalidate session IMMEDIATELY to prevent ANY new playback
     this.sessionId++;
     this.log(`Session invalidated (now ${this.sessionId}) - no more playback allowed`);
@@ -1055,8 +1401,81 @@ export class BatchCoordinator {
     // Wait for playback to complete if enabled
     await this.waitForPlaybackComplete();
 
-    // Deactivate hardware
+    // 🔒 POST-PLAYBACK GRACE: Give 750ms window for "hello" right after playback
+    // This catches firefighters responding immediately after hearing the page
+    this.postPlaybackGraceActive = true;
+    this.log(`⏳ Post-playback grace started (${this.postPlaybackGraceDuration}ms window for emergency audio)`);
+
+    await this.waitForPostPlaybackGrace();
+
+    // Check if audio validated during grace window
+    if (this.audioValidated) {
+      this.postPlaybackGraceActive = false;
+      this.log('🚨 Grace period audio validated - session promoted, hardware stays active');
+      // Don't finish - audio promoted standby batch to new session
+      this.isFinishing = false;
+      return;
+    }
+
+    this.log('✓ Post-playback grace window complete (no emergency audio detected)');
+
+    // 🔒 EXTENDED GRACE: Keep grace active DURING hardware deactivation
+    // This catches audio spoken during the deactivation process (ramp down, PoE off, zone switch)
+    this.log('🔒 Extended grace: Monitoring during hardware deactivation...');
+
+    // Deactivate hardware (but grace stays active!)
     await this.deactivateHardware();
+
+    // Check again after deactivation - audio might have been detected during deactivation
+    if (this.audioValidated) {
+      this.postPlaybackGraceActive = false;
+
+      // 🛡️ HARDWARE THRASH PROTECTION: Limit re-activations to prevent infinite loops
+      if (this.reactivationAttempts >= this.maxReactivationAttempts) {
+        this.log('⚠️ Max re-activation attempts reached - allowing deactivation to complete');
+        this.log('   Next audio will trigger fresh session (predictable failure mode)');
+
+        // Let deactivation complete - don't re-activate
+        // Any future audio will be a fresh session with full activation cycle
+        this.postPlaybackGraceActive = false;
+        // Continue to cleanup below (don't return early)
+      } else {
+        this.reactivationAttempts++;
+        this.log(`🚨 Audio detected during hardware deactivation - RE-ACTIVATING (attempt ${this.reactivationAttempts}/${this.maxReactivationAttempts})`);
+
+        // 🚀 CRITICAL: Enqueue old session for upload BEFORE re-activating
+        // The old session is complete - save it to upload queue (non-blocking)
+        this.log('📦 Enqueueing completed session before re-activation');
+        this.enqueueSessionUpload();
+
+        // Hardware was just deactivated, need to re-activate
+        await this.activateHardware();
+
+        // 🔥 CRITICAL: Restart silence monitoring for the re-activated session
+        // This ensures the re-activated session has a fresh 8s silence countdown
+        if (this.silenceCheckInterval) {
+          clearInterval(this.silenceCheckInterval);
+          this.silenceCheckInterval = null;
+        }
+        this.onSilence(); // Start fresh silence monitoring with updated lastAudioTime
+
+        // 🎯 Prepare for new session: Clear old batches, keep standby batch
+        // The standby batch will be promoted to batch 1 of the new session
+        const standbyBatch = this.currentBatch; // Save standby batch
+        this.batches = standbyBatch ? [standbyBatch] : [];
+        this.playbackQueue = [];
+        this.isPlaying = false;
+        this.finishingSessionBatches = [];
+
+        // Don't finish - audio promoted standby batch to new session
+        this.isFinishing = false;
+        return;
+      }
+    }
+
+    // All clear - no audio during grace or deactivation
+    this.postPlaybackGraceActive = false;
+    this.log('✓ Extended grace complete - no emergency audio during deactivation');
 
     // 🚀 NON-BLOCKING UPLOAD: Enqueue for background processing
     // This allows immediate return to idle standby without waiting for Firebase
@@ -1204,7 +1623,7 @@ export class BatchCoordinator {
 
       // Keep current batch (it's the first batch of the new session)
       // Clear old batches from finished session
-      this.batches = [this.currentBatch];
+      this.batches = [this.currentBatch!]; // Non-null assertion: hasStandbyBatch ensures currentBatch exists
 
       // Increment session ID for new session
       this.sessionId++;
@@ -1265,6 +1684,10 @@ export class BatchCoordinator {
       this.startBatchRecording();
       this.log('🎯 Idle standby batch started (capturing chunks silently)');
     }
+
+    // 🛡️ HARDWARE THRASH PROTECTION: Reset counter when reaching idle
+    // This allows re-activation on the NEXT session cycle
+    this.reactivationAttempts = 0;
 
     this.log('🎯 System in idle standby state (ready for next session)');
   }
@@ -1341,12 +1764,24 @@ export class BatchCoordinator {
   }
 
   private log(message: string): void {
-    // 🎨 Color idle standby messages in green
-    if (message.includes('System in idle standby state') ||
+    // 🎨 Color-coded logs for different system states
+
+    // 🛡️ TailGuard: Orange (watching for emergency audio after silence)
+    if (message.includes('TailGuard') || message.includes('🛡️')) {
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #ff9500; font-weight: bold');
+    }
+    // 🔒 Grace Period: Cyan (post-playback window for "hello" responses)
+    else if (message.includes('Grace') || message.includes('grace') || message.includes('🔒')) {
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #00d4ff; font-weight: bold');
+    }
+    // 🟢 Idle Standby: Green (system ready, listening)
+    else if (message.includes('System in idle standby state') ||
         message.includes('Idle standby batch started') ||
         message.includes('Session complete')) {
       console.log(`%c[BatchCoordinator] ${message}`, 'color: #00ff00; font-weight: bold');
-    } else {
+    }
+    // Default: White
+    else {
       console.log(`[BatchCoordinator] ${message}`);
     }
   }
