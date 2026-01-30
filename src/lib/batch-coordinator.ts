@@ -419,15 +419,16 @@ export class BatchCoordinator {
       }
     }
 
+    // Clear reference to completed batch before starting new one
+    this.currentBatch = null;
+
     // Check if more audio is coming
     const silenceElapsed = Date.now() - this.lastAudioTime;
     if (silenceElapsed < this.silenceTimeout && this.mediaRecorder?.state === 'recording') {
       // More audio expected, start next batch
       this.log('More audio expected, starting next batch');
-      this.startBatchRecording();
+      this.startBatchRecording(); // This will set this.currentBatch to new batch
     }
-
-    this.currentBatch = null;
   }
 
   // ============================================================================
