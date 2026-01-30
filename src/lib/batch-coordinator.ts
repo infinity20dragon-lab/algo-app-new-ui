@@ -122,6 +122,7 @@ export class BatchCoordinator {
   private lastAudioTime: number = 0;
   private silenceCheckInterval: number | null = null;
   private sessionStartTime: number = 0;
+  private initSegment: Blob | null = null; // First chunk with headers for playback
 
   // Hardware state
   private pagingActive: boolean = false;      // Zone 1 active
@@ -131,6 +132,15 @@ export class BatchCoordinator {
   // Validation
   private audioValidated: boolean = false;
   private validationStartTime: number = 0;
+
+  // Session ID gate (prevents late playback after session invalidation)
+  private sessionId: number = 0;
+
+  // Playback generation counter (prevents race conditions between sessions)
+  private playbackGeneration: number = 0;
+
+  // Session completion guard (prevents double finish)
+  private isFinishing: boolean = false;
 
   constructor(config: BatchCoordinatorConfig) {
     this.config = config;
@@ -154,8 +164,18 @@ export class BatchCoordinator {
     this.lastAudioTime = Date.now();
     this.audioValidated = false;
     this.validationStartTime = 0;
+    this.sessionId++; // 🔥 New session, increment ID
+    this.playbackGeneration++; // New session, increment generation
+    this.isFinishing = false; // Reset finish guard
 
-    this.log('BatchCoordinator started');
+    this.log(`BatchCoordinator started (session ${this.sessionId})`);
+
+    // 🔥 Capture silent pre-roll for init segment (if not already captured)
+    if (!this.initSegment) {
+      await this.captureSilentPreRoll();
+    } else {
+      this.log('Using existing silent pre-roll from previous session');
+    }
 
     // Don't start recording yet - wait for audio validation
     // Recording will start when onAudioDetected validates sustained audio
@@ -230,8 +250,14 @@ export class BatchCoordinator {
           }
 
           // Stop MediaRecorder
-          if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-            this.mediaRecorder.stop();
+          if (this.mediaRecorder) {
+            // Clear callbacks to prevent zombie events
+            this.mediaRecorder.ondataavailable = null;
+            this.mediaRecorder.onerror = null;
+
+            if (this.mediaRecorder.state !== 'inactive') {
+              this.mediaRecorder.stop();
+            }
             this.mediaRecorder = null;
           }
 
@@ -261,8 +287,14 @@ export class BatchCoordinator {
     }
 
     // Stop MediaRecorder
-    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-      this.mediaRecorder.stop();
+    if (this.mediaRecorder) {
+      // Clear callbacks to prevent zombie events
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onerror = null;
+
+      if (this.mediaRecorder.state !== 'inactive') {
+        this.mediaRecorder.stop();
+      }
       this.mediaRecorder = null;
     }
 
@@ -275,7 +307,7 @@ export class BatchCoordinator {
     // Wait for all batches to complete playback
     await this.waitForPlaybackComplete();
 
-    // Finish session
+    // Finish session (this will invalidate sessionId)
     await this.finishSession();
   }
 
@@ -284,6 +316,10 @@ export class BatchCoordinator {
    */
   async abort(): Promise<void> {
     this.log('Aborting batch coordinator');
+
+    // 🔥 CRITICAL: Invalidate session IMMEDIATELY to prevent ANY new playback
+    this.sessionId++;
+    this.log(`Session invalidated (now ${this.sessionId}) - no more playback allowed`);
 
     // Stop everything
     if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
@@ -298,6 +334,10 @@ export class BatchCoordinator {
     if (this.currentBatch?.audioElement) {
       this.currentBatch.audioElement.pause();
     }
+
+    // Clear init segment (monitoring is stopping completely)
+    this.initSegment = null;
+    this.log('Cleared silent pre-roll init segment');
 
     // Cleanup without uploading
     await this.cleanup(false);
@@ -369,7 +409,15 @@ export class BatchCoordinator {
   }
 
   private onChunkRecorded(chunk: Blob): void {
-    if (!this.currentBatch) return;
+    // 🔥 CRITICAL: Guard against zombie chunks from old sessions
+    // MediaRecorder.stop() fires final ondataavailable AFTER cleanup
+    if (!this.currentBatch) {
+      this.log('⚠️ Chunk received but no active batch (likely final chunk after stop)');
+      return;
+    }
+
+    // NOTE: We no longer capture init segment from first chunk
+    // Instead, we'll extract it from batch 1's completed blob
 
     this.currentBatch.chunks.push(chunk);
     this.currentBatch.duration += 100; // Approximate (100ms per chunk)
@@ -381,7 +429,7 @@ export class BatchCoordinator {
     }
 
     // Safety: Force complete if max duration exceeded
-    if (this.currentBatch.duration >= this.maxBatchDuration) {
+    if (this.currentBatch && this.currentBatch.duration >= this.maxBatchDuration) {
       this.log(`Batch ${this.batches.length} exceeded max duration, force completing`);
       this.completeBatch();
     }
@@ -389,6 +437,12 @@ export class BatchCoordinator {
 
   private completeBatch(): void {
     if (!this.currentBatch) return;
+
+    // Don't complete batches if session is finishing
+    if (this.isFinishing) {
+      this.log('⚠️ completeBatch called during session finish, skipping');
+      return;
+    }
 
     const batch = this.currentBatch;
 
@@ -403,7 +457,21 @@ export class BatchCoordinator {
 
     // Create blob from chunks
     const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
-    batch.blob = new Blob(batch.chunks, { type: mimeType });
+    const batchIndex = this.batches.indexOf(batch) + 1;
+
+    if (batchIndex === 1) {
+      // Batch 1: Use chunks as-is (already has init segment in first chunk)
+      batch.blob = new Blob(batch.chunks, { type: mimeType });
+    } else if (this.initSegment) {
+      // Batch 2+: Prepend silent pre-roll as init segment
+      // This ensures batch 2+ can play standalone without audio contamination
+      batch.blob = new Blob([this.initSegment, ...batch.chunks], { type: mimeType });
+      this.log(`Batch ${batchIndex}: Added silent pre-roll (${this.initSegment.size} bytes) for standalone playback`);
+    } else {
+      // Fallback: No init segment available (shouldn't happen)
+      batch.blob = new Blob(batch.chunks, { type: mimeType });
+      this.log(`⚠️ Batch ${batchIndex}: No init segment available, using chunks only`);
+    }
 
     this.log(`Batch ${this.batches.length} complete: ${batch.duration}ms, ${batch.blob.size} bytes`);
 
@@ -459,10 +527,20 @@ export class BatchCoordinator {
     const batchIndex = this.batches.indexOf(batch) + 1;
     this.log(`Playing batch ${batchIndex} of ${this.batches.length}`);
 
+    // 🔥 Capture session ID and generation to guard against race conditions
+    const mySessionId = this.sessionId;
+    const generation = this.playbackGeneration;
+
     try {
       // Ensure hardware is active before first playback
       if (!this.hardwareReady) {
         await this.activateHardware();
+      }
+
+      // 🔥 Gate: Check session is still valid before proceeding
+      if (mySessionId !== this.sessionId) {
+        this.log(`Playback aborted: session ${mySessionId} invalidated (now ${this.sessionId})`);
+        return;
       }
 
       // Create audio element
@@ -473,12 +551,29 @@ export class BatchCoordinator {
       batch.blobUrl = URL.createObjectURL(batch.blob!);
       audio.src = batch.blobUrl;
 
-      // Set up completion handler
+      // Set up completion handler with generation guard
       audio.onended = () => {
+        // 🔥 Guard: Only proceed if this is still the current session
+        if (generation !== this.playbackGeneration) {
+          this.log(`Batch ${batchIndex} onended from old session (gen ${generation}), ignoring`);
+          return;
+        }
+
         this.log(`Batch ${batchIndex} playback complete`);
         batch.state = BatchState.Complete;
 
-        // Cleanup
+        // 🔥 CRITICAL: Remove event listeners BEFORE cleanup to prevent race
+        if (batch.audioElement) {
+          batch.audioElement.onended = null;
+          batch.audioElement.onerror = null;
+        }
+
+        // Cleanup - flush decoder buffer and free blob URL
+        if (batch.audioElement) {
+          batch.audioElement.pause();
+          batch.audioElement.src = '';
+          batch.audioElement.load(); // 🔥 Flush decoder buffer
+        }
         if (batch.blobUrl) {
           URL.revokeObjectURL(batch.blobUrl);
         }
@@ -490,11 +585,28 @@ export class BatchCoordinator {
       };
 
       audio.onerror = (error) => {
+        // 🔥 Guard: Only proceed if this is still the current session
+        if (generation !== this.playbackGeneration) {
+          this.log(`Batch ${batchIndex} onerror from old session (gen ${generation}), ignoring`);
+          return;
+        }
+
         this.log(`Batch ${batchIndex} playback error: ${error}`);
         batch.state = BatchState.Failed;
         batch.error = new Error(`Playback failed: ${error}`);
 
+        // 🔥 CRITICAL: Remove event listeners BEFORE cleanup to prevent race
+        if (batch.audioElement) {
+          batch.audioElement.onended = null;
+          batch.audioElement.onerror = null;
+        }
+
         // Cleanup
+        if (batch.audioElement) {
+          batch.audioElement.pause();
+          batch.audioElement.src = '';
+          batch.audioElement.load(); // 🔥 Flush decoder buffer
+        }
         if (batch.blobUrl) {
           URL.revokeObjectURL(batch.blobUrl);
         }
@@ -506,6 +618,18 @@ export class BatchCoordinator {
         // Try next batch anyway
         this.playNextBatch();
       };
+
+      // 🔥 Final gate: Check session is STILL valid before play
+      if (mySessionId !== this.sessionId) {
+        this.log(`Playback aborted right before play(): session ${mySessionId} invalidated`);
+        // Clean up the audio element we just created
+        if (batch.blobUrl) {
+          URL.revokeObjectURL(batch.blobUrl);
+        }
+        batch.audioElement = null;
+        batch.blobUrl = null;
+        return;
+      }
 
       // Start playback
       await audio.play();
@@ -695,7 +819,18 @@ export class BatchCoordinator {
   // ============================================================================
 
   private async finishSession(): Promise<void> {
+    // 🔥 Guard: Prevent double finish
+    if (this.isFinishing) {
+      this.log('⚠️ finishSession already in progress, skipping duplicate call');
+      return;
+    }
+    this.isFinishing = true;
+
     this.log('💾 FINISHING SESSION:');
+
+    // 🔥 CRITICAL: Invalidate session IMMEDIATELY to prevent ANY new playback
+    this.sessionId++;
+    this.log(`Session invalidated (now ${this.sessionId}) - no more playback allowed`);
 
     // Wait for playback to complete if enabled
     await this.waitForPlaybackComplete();
@@ -750,20 +885,30 @@ export class BatchCoordinator {
   private async cleanup(success: boolean): Promise<void> {
     this.log(`Cleanup (success: ${success})`);
 
-    // Stop MediaRecorder
-    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-      this.mediaRecorder.stop();
+    // 🔥 CRITICAL: Clear MediaRecorder callbacks BEFORE stopping
+    // This prevents zombie ondataavailable events from firing after cleanup
+    if (this.mediaRecorder) {
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onerror = null;
+
+      if (this.mediaRecorder.state !== 'inactive') {
+        this.mediaRecorder.stop();
+      }
     }
     this.mediaRecorder = null;
 
-    // Stop playback
+    // Stop playback - properly cleanup audio elements
     for (const batch of this.batches) {
       if (batch.audioElement) {
         batch.audioElement.pause();
+        batch.audioElement.src = ''; // Clear source
+        batch.audioElement.load(); // 🔥 CRITICAL: Flush decoder buffer
+        batch.audioElement.onended = null; // Remove event listener
+        batch.audioElement.onerror = null; // Remove event listener
         batch.audioElement = null;
       }
       if (batch.blobUrl) {
-        URL.revokeObjectURL(batch.blobUrl);
+        URL.revokeObjectURL(batch.blobUrl); // 🔥 CRITICAL: Free blob URL
         batch.blobUrl = null;
       }
     }
@@ -777,11 +922,66 @@ export class BatchCoordinator {
     this.validationStartTime = 0;
     this.hardwareReady = false;
     this.pagingActive = false;
+    this.isFinishing = false; // Reset finish guard
+
+    // NOTE: We keep this.initSegment for reuse across sessions
+    // Only cleared on abort() when monitoring stops completely
 
     if (this.silenceCheckInterval) {
       clearInterval(this.silenceCheckInterval);
       this.silenceCheckInterval = null;
     }
+  }
+
+  // ============================================================================
+  // Silent Pre-roll Init Segment
+  // ============================================================================
+
+  /**
+   * Capture a silent pre-roll to use as clean init segment
+   * Records 200ms of silence when monitoring starts
+   * This init segment is reused for ALL batches in ALL sessions
+   * Eliminates ghost audio from header contamination
+   */
+  private async captureSilentPreRoll(): Promise<void> {
+    this.log('📼 Capturing silent pre-roll for init segment...');
+
+    return new Promise((resolve, reject) => {
+      const mimeType = this.getBestMimeType();
+      const preRollRecorder = new MediaRecorder(this.stream!, { mimeType });
+      const chunks: Blob[] = [];
+
+      preRollRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+
+      preRollRecorder.onstop = () => {
+        // Create blob from silent recording
+        const silentBlob = new Blob(chunks, { type: mimeType });
+
+        // Use this entire silent blob as the init segment
+        this.initSegment = silentBlob;
+
+        this.log(`✓ Silent pre-roll captured: ${this.initSegment.size} bytes (${chunks.length} chunks)`);
+        resolve();
+      };
+
+      preRollRecorder.onerror = (error) => {
+        this.log(`⚠️ Silent pre-roll capture failed: ${error}`);
+        reject(error);
+      };
+
+      // Record for 200ms
+      preRollRecorder.start(100); // 100ms chunks
+
+      setTimeout(() => {
+        if (preRollRecorder.state !== 'inactive') {
+          preRollRecorder.stop();
+        }
+      }, 200); // 200ms total
+    });
   }
 
   // ============================================================================
