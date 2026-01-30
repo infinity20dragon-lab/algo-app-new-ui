@@ -13,6 +13,23 @@
  *
  * State Machine per Batch:
  * Recording → Ready → Queued → Playing → Complete
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔒 THE NO-LOST-SYLLABLES INVARIANT (Purist Mode)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Once audio energy crosses the detection threshold, there MUST exist an active
+ * capture buffer until the system has definitively decided whether that audio
+ * belongs to a session.
+ *
+ * ENFORCEMENT:
+ * - MediaRecorder starts when monitoring begins
+ * - MediaRecorder NEVER stops until monitoring ends (abort() only)
+ * - No gaps during: playback, upload, hardware transitions, session finishing
+ * - Capture first, decide later - NEVER the reverse
+ *
+ * This guarantees zero lost syllables in emergency situations (e.g., "HELP!")
+ * ═══════════════════════════════════════════════════════════════════════════
  */
 
 // ============================================================================
@@ -40,6 +57,16 @@ export interface AudioBatch {
   endTime: number | null;                  // Recording end timestamp
   playbackStartTime: number | null;        // When playback began
   error: Error | null;                     // Any errors encountered
+}
+
+export interface CompletedSession {
+  id: string;
+  sessionNumber: number;
+  blob: Blob;
+  mimeType: string;
+  timestamp: number;
+  uploaded: boolean;
+  uploadUrl?: string;
 }
 
 export interface BatchCoordinatorConfig {
@@ -147,6 +174,19 @@ export class BatchCoordinator {
   // Session completion guard (prevents double finish)
   private isFinishing: boolean = false;
 
+  // Deferred start (audio detected during finish phase) - DEPRECATED, replaced by TailGuard
+  private pendingStart: boolean = false;
+  private finishingSessionBatches: AudioBatch[] = []; // Saved batches from session being finished
+
+  // TailGuard: Always-on buffer after last batch queued
+  private tailGuardActive: boolean = false;
+  private tailGuardDuration: number = 3000; // 3 seconds after silence timeout
+  private tailGuardStartTime: number = 0;
+
+  // Background upload queue (non-blocking)
+  private completedSessions: CompletedSession[] = [];
+  private uploadInProgress: boolean = false;
+
   constructor(config: BatchCoordinatorConfig) {
     this.config = config;
     this.batchDuration = config.batchDuration || 5000;
@@ -172,6 +212,10 @@ export class BatchCoordinator {
     this.sessionId++; // 🔥 New session, increment ID
     this.playbackGeneration++; // New session, increment generation
     this.isFinishing = false; // Reset finish guard
+    this.pendingStart = false; // Reset deferred start flag (deprecated, replaced by TailGuard)
+    this.finishingSessionBatches = []; // Reset finishing session batches
+    this.tailGuardActive = false; // Reset TailGuard state
+    this.tailGuardStartTime = 0;
 
     this.log(`BatchCoordinator started (session ${this.sessionId})`);
 
@@ -203,6 +247,73 @@ export class BatchCoordinator {
   onAudioDetected(level: number): void {
     this.lastAudioTime = Date.now();
 
+    // 🎯 BLOCK: Don't start new session while previous session is finishing
+    // This prevents overlapping sessions during upload/cleanup
+    if (this.isFinishing && !this.tailGuardActive) {
+      // Session is finishing, audio will be captured in standby batch
+      // and validated/promoted in cleanup() if sustained
+      return;
+    }
+
+    // 🛡️ TAILGUARD PROMOTION: If TailGuard is active, promote to new session
+    if (this.tailGuardActive) {
+      // Validate sustained audio during TailGuard
+      if (!this.audioValidated && !this.validationStartTime) {
+        this.validationStartTime = Date.now();
+        this.log(`🛡️ TailGuard: Emergency audio detected (${(level * 100).toFixed(0)}%), validating...`);
+      }
+
+      if (!this.audioValidated && this.validationStartTime) {
+        const elapsed = Date.now() - this.validationStartTime;
+        if (elapsed >= this.sustainDuration) {
+          this.audioValidated = true;
+          this.log(`🛡️ TailGuard: Audio validated (${elapsed}ms) - PROMOTING to new session`);
+
+          // Deactivate TailGuard - it's now a full session
+          this.tailGuardActive = false;
+          this.tailGuardStartTime = 0;
+
+          // Start new batch for the promoted session
+          // MediaRecorder is already running, just continue batching
+          this.log(`🛡️ TailGuard promoted - MediaRecorder continues seamlessly`);
+
+          // Trigger hardware activation if not already active
+          if (!this.pagingActive && !this.hardwareReady) {
+            this.activateHardware().catch((error) => {
+              this.log(`Hardware activation failed: ${error}`);
+              if (this.config.onError) {
+                this.config.onError(error);
+              }
+            });
+          }
+        }
+      }
+
+      return; // TailGuard is handling this audio
+    }
+
+    // 🎯 PURIST MODE: Audio during finish phase
+    // MediaRecorder is already running into standby batch - just validate
+    if (this.isFinishing) {
+      // Start validation if not already started
+      if (!this.validationStartTime) {
+        this.validationStartTime = Date.now();
+        this.log(`🎯 Audio detected during finish phase (${(level * 100).toFixed(0)}%) - validating standby batch`);
+        this.log('   MediaRecorder already capturing - no restart needed (purist mode)');
+      }
+
+      // Continue validation
+      if (!this.audioValidated && this.validationStartTime) {
+        const elapsed = Date.now() - this.validationStartTime;
+        if (elapsed >= this.sustainDuration) {
+          this.audioValidated = true;
+          this.log(`✓ Standby batch validated (${elapsed}ms) - will promote to new session in cleanup()`);
+        }
+      }
+
+      return; // Let cleanup() handle promotion
+    }
+
     // Validate sustained audio
     if (!this.audioValidated) {
       if (!this.validationStartTime) {
@@ -210,8 +321,14 @@ export class BatchCoordinator {
         this.log(`Audio detected (${(level * 100).toFixed(0)}%), validating...`);
 
         // 🎙️ Start recording IMMEDIATELY (pre-buffer mode)
-        // This captures audio from the very first syllable
+        // Discard idle standby batch (if exists) and start fresh
+        // Idle batch may have corrupted audio (no valid init segment)
         this.isPreBuffering = true;
+        if (this.currentBatch) {
+          this.log('🎯 Discarding idle batch (may have corrupted audio), starting fresh pre-buffer');
+          this.currentBatch = null;
+          this.batches = [];
+        }
         this.startBatchRecording();
         this.log('📼 Pre-buffering started (capturing audio during validation)');
       }
@@ -251,19 +368,41 @@ export class BatchCoordinator {
     if (this.isPreBuffering && !this.audioValidated) {
       this.log('⚠️ Validation failed (silence during validation) - discarding pre-buffer');
 
-      // Stop and discard the pre-buffer recording
-      if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-        this.mediaRecorder.ondataavailable = null;
-        this.mediaRecorder.onerror = null;
-        this.mediaRecorder.stop();
-        this.mediaRecorder = null;
-      }
+      // 🎯 PURIST MODE: Don't stop MediaRecorder - keep it running
+      // Just discard the pre-buffer batch and start a new standby batch
+      this.log('🎯 MediaRecorder continues running (purist mode - always listening)');
 
       // Discard the batch
       this.currentBatch = null;
       this.batches = [];
       this.isPreBuffering = false;
       this.validationStartTime = 0;
+
+      // If this was a finish-phase prebuffer, clear the pending start flag
+      if (this.pendingStart) {
+        this.pendingStart = false;
+        this.log('⚠️ Finish-phase prebuffer validation failed - clearing pending start');
+      }
+
+      // 🎯 CRITICAL: Start new standby batch immediately
+      // MediaRecorder is still firing ondataavailable events - chunks need a home!
+      if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+        this.startBatchRecording();
+        this.log('🎯 Standby batch started after validation failure (MediaRecorder chunks continue flowing)');
+      }
+
+      return;
+    }
+
+    // 🛡️ If TailGuard is validating and silence detected, validation failed
+    if (this.tailGuardActive && this.validationStartTime > 0 && !this.audioValidated) {
+      this.log('🛡️ TailGuard validation failed (silence during validation) - continuing TailGuard');
+
+      // Reset validation attempt
+      this.validationStartTime = 0;
+
+      // TailGuard continues - will expire on its own timer
+      // Don't stop MediaRecorder, let TailGuard expiration handle it
       return;
     }
 
@@ -280,7 +419,11 @@ export class BatchCoordinator {
       this.silenceCheckInterval = window.setInterval(() => {
         const silenceElapsed = Date.now() - this.lastAudioTime;
 
-        if (silenceElapsed >= this.silenceTimeout) {
+        // 🎯 Check if we should activate TailGuard or expire it
+        if (silenceElapsed >= this.silenceTimeout && !this.tailGuardActive) {
+          // ============================================================
+          // SILENCE TIMEOUT REACHED → ACTIVATE TAILGUARD
+          // ============================================================
           this.log(`Silence timeout (${this.silenceTimeout}ms) reached`);
 
           // Complete current batch if recording
@@ -289,25 +432,56 @@ export class BatchCoordinator {
             this.completeBatch();
           }
 
-          // Stop MediaRecorder
-          if (this.mediaRecorder) {
-            // Clear callbacks to prevent zombie events
-            this.mediaRecorder.ondataavailable = null;
-            this.mediaRecorder.onerror = null;
+          // 🛡️ ACTIVATE TAILGUARD: Keep MediaRecorder running for emergency audio
+          this.tailGuardActive = true;
+          this.tailGuardStartTime = Date.now();
+          this.log(`🛡️ TailGuard ACTIVATED (${this.tailGuardDuration}ms window)`);
+          this.log('   MediaRecorder stays active - listening for emergency audio');
 
-            if (this.mediaRecorder.state !== 'inactive') {
-              this.mediaRecorder.stop();
+          // Start TailGuard batch to capture any emergency audio
+          // This will be discarded if no audio detected, or promoted if audio validated
+          this.startBatchRecording();
+          this.log('🛡️ TailGuard batch started (will discard if no audio, promote if validated)');
+
+          // Don't clear interval - keep checking for TailGuard expiration
+          // Don't finish session yet - TailGuard is active
+
+        } else if (this.tailGuardActive) {
+          // ============================================================
+          // TAILGUARD ACTIVE → CHECK FOR EXPIRATION
+          // ============================================================
+          const tailGuardElapsed = Date.now() - this.tailGuardStartTime;
+
+          if (tailGuardElapsed >= this.tailGuardDuration) {
+            this.log(`🛡️ TailGuard expired (${tailGuardElapsed}ms) - no emergency audio detected`);
+
+            // 🎯 PURIST APPROACH: Don't stop MediaRecorder - keep it running
+            // Complete the TailGuard batch and start a new standby batch immediately
+            // This ensures chunks always have somewhere to go
+            this.log('🎯 MediaRecorder continues running (purist mode - always listening)');
+
+            // Complete TailGuard batch (no longer needed)
+            if (this.currentBatch && this.currentBatch.state === BatchState.Recording) {
+              this.log('🎯 Completing TailGuard batch (no emergency audio)');
+              this.completeBatch();
             }
-            this.mediaRecorder = null;
-          }
 
-          // Clear interval
-          clearInterval(this.silenceCheckInterval!);
-          this.silenceCheckInterval = null;
+            // 🎯 CRITICAL: Start new standby batch immediately
+            // MediaRecorder is still firing ondataavailable events - chunks need a home!
+            this.startBatchRecording();
+            this.log('🎯 Standby batch started (MediaRecorder chunks continue flowing)');
 
-          // If all batches played, wrap up session
-          if (this.playbackQueue.length === 0 && !this.isPlaying) {
-            this.log('All batches complete, finishing session');
+            // Clear interval
+            clearInterval(this.silenceCheckInterval!);
+            this.silenceCheckInterval = null;
+
+            // Reset TailGuard (but MediaRecorder keeps running!)
+            this.tailGuardActive = false;
+            this.tailGuardStartTime = 0;
+
+            // 🎯 CRITICAL FIX: Always finish session after TailGuard expires
+            // finishSession() will wait for playback to complete internally
+            this.log('TailGuard expired, finishing session');
             this.finishSession();
           }
         }
@@ -316,27 +490,20 @@ export class BatchCoordinator {
   }
 
   /**
-   * Manually stop the coordinator
+   * Manually stop the current session (but keep monitoring active)
+   * MediaRecorder continues running in purist mode
    */
   async stop(): Promise<void> {
-    this.log('Stopping batch coordinator');
+    this.log('Stopping current session (monitoring continues in purist mode)');
 
     // Complete current batch if recording
     if (this.currentBatch && this.currentBatch.state === BatchState.Recording) {
       this.completeBatch();
     }
 
-    // Stop MediaRecorder
-    if (this.mediaRecorder) {
-      // Clear callbacks to prevent zombie events
-      this.mediaRecorder.ondataavailable = null;
-      this.mediaRecorder.onerror = null;
-
-      if (this.mediaRecorder.state !== 'inactive') {
-        this.mediaRecorder.stop();
-      }
-      this.mediaRecorder = null;
-    }
+    // 🎯 PURIST MODE: Don't stop MediaRecorder - keep monitoring active
+    // MediaRecorder will continue into standby batch, ready for next session
+    this.log('🎯 MediaRecorder continues running (ready for next session)');
 
     // Clear silence check
     if (this.silenceCheckInterval) {
@@ -352,17 +519,20 @@ export class BatchCoordinator {
   }
 
   /**
-   * Abort without saving
+   * Abort without saving - ONLY place MediaRecorder stops
+   * This enforces the No-Lost-Syllables Invariant
    */
   async abort(): Promise<void> {
-    this.log('Aborting batch coordinator');
+    this.log('Aborting batch coordinator (monitoring stopping completely)');
 
     // 🔥 CRITICAL: Invalidate session IMMEDIATELY to prevent ANY new playback
     this.sessionId++;
     this.log(`Session invalidated (now ${this.sessionId}) - no more playback allowed`);
 
-    // Stop everything
+    // 🔒 INVARIANT: This is the ONLY place MediaRecorder stops
+    // MediaRecorder runs continuously from start() → abort() with zero gaps
     if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      this.log('🎯 Stopping MediaRecorder (monitoring ending - invariant preserved)');
       this.mediaRecorder.stop();
     }
 
@@ -385,6 +555,10 @@ export class BatchCoordinator {
     // Clear init segment (monitoring is stopping completely)
     this.initSegment = null;
     this.log('Cleared silent pre-roll init segment');
+
+    // Reset TailGuard state
+    this.tailGuardActive = false;
+    this.tailGuardStartTime = 0;
 
     // Cleanup without uploading
     await this.cleanup(false);
@@ -469,25 +643,49 @@ export class BatchCoordinator {
     this.currentBatch.chunks.push(chunk);
     this.currentBatch.duration += 100; // Approximate (100ms per chunk)
 
+    // 🎯 PURIST MODE: During finish phase, let standby batch grow unbounded
+    // It will be promoted/discarded in cleanup()
+    if (this.isFinishing) {
+      return; // Don't complete batch during finish - let it accumulate
+    }
+
+    // 🎯 PURIST MODE: During idle standby, let idle batch grow unbounded
+    // It will become pre-buffer when audio is detected, or be discarded/reused
+    if (!this.audioValidated && !this.isPreBuffering) {
+      return; // Don't complete batch during idle - let it accumulate
+    }
+
     // Check if batch duration reached
     if (this.currentBatch.duration >= this.batchDuration) {
       this.log(`Batch ${this.batches.length} reached target duration (${this.currentBatch.duration}ms)`);
       this.completeBatch();
     }
 
-    // Safety: Force complete if max duration exceeded
+    // Safety: Force complete if max duration exceeded (but not during idle standby)
     if (this.currentBatch && this.currentBatch.duration >= this.maxBatchDuration) {
-      this.log(`Batch ${this.batches.length} exceeded max duration, force completing`);
-      this.completeBatch();
+      if (!this.audioValidated && !this.isPreBuffering && !this.isFinishing) {
+        // Idle batch getting too large - discard and start fresh to prevent memory issues
+        this.log(`⚠️ Idle batch exceeded max duration (${this.currentBatch.duration}ms), discarding and restarting`);
+        this.currentBatch = null;
+        this.batches = [];
+        if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+          this.startBatchRecording();
+          this.log('🎯 New idle standby batch started (old one was too large)');
+        }
+      } else {
+        this.log(`Batch ${this.batches.length} exceeded max duration, force completing`);
+        this.completeBatch();
+      }
     }
   }
 
   private completeBatch(): void {
     if (!this.currentBatch) return;
 
-    // Don't complete batches if session is finishing
+    // 🎯 PURIST MODE: This should never be called during finish
+    // (onChunkRecorded now blocks completeBatch during finish phase)
     if (this.isFinishing) {
-      this.log('⚠️ completeBatch called during session finish, skipping');
+      this.log('⚠️ UNEXPECTED: completeBatch called during session finish');
       return;
     }
 
@@ -506,12 +704,9 @@ export class BatchCoordinator {
     const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
     const batchIndex = this.batches.indexOf(batch) + 1;
 
-    if (batchIndex === 1) {
-      // Batch 1: Use chunks as-is (already has init segment in first chunk)
-      batch.blob = new Blob(batch.chunks, { type: mimeType });
-    } else if (this.initSegment) {
-      // Batch 2+: Prepend silent pre-roll as init segment
-      // This ensures batch 2+ can play standalone without audio contamination
+    // 🔥 ALWAYS prepend init segment for ALL batches (including batch 1)
+    // This ensures every batch can play standalone, even if idle batches were discarded
+    if (this.initSegment) {
       batch.blob = new Blob([this.initSegment, ...batch.chunks], { type: mimeType });
       this.log(`Batch ${batchIndex}: Added silent pre-roll (${this.initSegment.size} bytes) for standalone playback`);
     } else {
@@ -537,11 +732,15 @@ export class BatchCoordinator {
     // Clear reference to completed batch before starting new one
     this.currentBatch = null;
 
-    // Check if more audio is coming
-    const silenceElapsed = Date.now() - this.lastAudioTime;
-    if (silenceElapsed < this.silenceTimeout && this.mediaRecorder?.state === 'recording') {
-      // More audio expected, start next batch
-      this.log('More audio expected, starting next batch');
+    // 🎯 PURIST MODE: ALWAYS start a new standby batch
+    // MediaRecorder is always running - chunks need somewhere to go!
+    if (this.mediaRecorder?.state === 'recording') {
+      const silenceElapsed = Date.now() - this.lastAudioTime;
+      if (silenceElapsed < this.silenceTimeout) {
+        this.log('More audio expected, starting next batch');
+      } else {
+        this.log('🎯 Starting standby batch (purist mode - always listening)');
+      }
       this.startBatchRecording(); // This will set this.currentBatch to new batch
     }
   }
@@ -578,8 +777,10 @@ export class BatchCoordinator {
     const batchIndex = this.batches.indexOf(batch) + 1;
     this.log(`Playing batch ${batchIndex} of ${this.batches.length}`);
 
-    // 🔥 Capture session ID to guard against race conditions
-    const mySessionId = this.sessionId;
+    // 🔥 Capture playback generation to guard against race conditions
+    // Use playbackGeneration (not sessionId) because sessionId gets invalidated
+    // during finishSession, but we still want current playback to complete
+    const myGeneration = this.playbackGeneration;
 
     try {
       // Ensure hardware is active before first playback
@@ -587,9 +788,9 @@ export class BatchCoordinator {
         await this.activateHardware();
       }
 
-      // 🔥 Gate: Check session is still valid before proceeding
-      if (mySessionId !== this.sessionId) {
-        this.log(`Playback aborted: session ${mySessionId} invalidated (now ${this.sessionId})`);
+      // 🔥 Gate: Check playback generation is still valid before proceeding
+      if (myGeneration !== this.playbackGeneration) {
+        this.log(`Playback aborted: generation ${myGeneration} invalidated (now ${this.playbackGeneration})`);
         return;
       }
 
@@ -603,9 +804,9 @@ export class BatchCoordinator {
 
       this.log(`Decoded batch ${batchIndex}: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.numberOfChannels}ch`);
 
-      // 🔥 Gate: Check session STILL valid after async decode
-      if (mySessionId !== this.sessionId) {
-        this.log(`Playback aborted after decode: session ${mySessionId} invalidated`);
+      // 🔥 Gate: Check playback generation STILL valid after async decode
+      if (myGeneration !== this.playbackGeneration) {
+        this.log(`Playback aborted after decode: generation ${myGeneration} invalidated`);
         return;
       }
 
@@ -620,9 +821,9 @@ export class BatchCoordinator {
 
       // 🎵 Step 4: Set up completion handler
       source.onended = () => {
-        // 🔥 Guard: Only proceed if this is still the current session
-        if (mySessionId !== this.sessionId) {
-          this.log(`Batch ${batchIndex} onended from old session, ignoring`);
+        // 🔥 Guard: Only proceed if this is still the current playback generation
+        if (myGeneration !== this.playbackGeneration) {
+          this.log(`Batch ${batchIndex} onended from old generation, ignoring`);
           return;
         }
 
@@ -840,6 +1041,13 @@ export class BatchCoordinator {
 
     this.log('💾 FINISHING SESSION:');
 
+    // 🔥 CRITICAL: Reset validation state for finish phase
+    // This ensures only NEW audio detected DURING finish phase causes promotion
+    // The old session's audioValidated=true should not carry over
+    this.audioValidated = false;
+    this.validationStartTime = 0;
+    this.log('🎯 Validation state reset - standby batch will only promote if NEW audio validated during finish');
+
     // 🔥 CRITICAL: Invalidate session IMMEDIATELY to prevent ANY new playback
     this.sessionId++;
     this.log(`Session invalidated (now ${this.sessionId}) - no more playback allowed`);
@@ -850,64 +1058,137 @@ export class BatchCoordinator {
     // Deactivate hardware
     await this.deactivateHardware();
 
-    // Upload all batches
-    await this.uploadAllBatches();
+    // 🚀 NON-BLOCKING UPLOAD: Enqueue for background processing
+    // This allows immediate return to idle standby without waiting for Firebase
+    this.enqueueSessionUpload();
 
-    // Cleanup
+    // Cleanup (no longer blocked by upload!)
     await this.cleanup(true);
 
-    this.log('✓ Session complete');
+    this.log('✓ Session complete (upload queued for background processing)');
   }
 
-  private async uploadAllBatches(): Promise<void> {
-    if (this.batches.length === 0) {
+  /**
+   * 🚀 BACKGROUND UPLOAD: Enqueue session for non-blocking upload
+   * This saves the blob to memory and starts background upload worker
+   * Returns immediately without waiting for Firebase
+   */
+  private enqueueSessionUpload(): void {
+    // 🔄 Use finishingSessionBatches if finish-phase prebuffer was started
+    // Otherwise use current batches
+    const batchesToUpload = this.finishingSessionBatches.length > 0
+      ? this.finishingSessionBatches
+      : this.batches;
+
+    if (batchesToUpload.length === 0) {
       this.log('No batches to upload');
       return;
     }
 
-    this.log(`Uploading ${this.batches.length} batch(es)...`);
+    // Combine all batches into single blob (fast, in-memory operation)
+    const allChunks = batchesToUpload.flatMap(b => b.chunks);
+    const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
+    const combinedBlob = new Blob(allChunks, { type: mimeType });
 
-    try {
-      // Combine all batches into single blob
-      const allChunks = this.batches.flatMap(b => b.chunks);
-      const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
-      const combinedBlob = new Blob(allChunks, { type: mimeType });
+    // Create completed session record
+    const session: CompletedSession = {
+      id: `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      sessionNumber: this.sessionId,
+      blob: combinedBlob,
+      mimeType: mimeType,
+      timestamp: Date.now(),
+      uploaded: false
+    };
 
-      this.log(`Combined blob: ${combinedBlob.size} bytes, ${mimeType}`);
+    // Add to queue
+    this.completedSessions.push(session);
 
-      // Upload to Firebase
-      const url = await this.config.onUpload(combinedBlob, mimeType);
+    this.log(`📦 Session queued for upload: ${combinedBlob.size} bytes (${batchesToUpload.length} batches)`);
+    this.log(`   Queue size: ${this.completedSessions.length} session(s)`);
 
-      this.log(`✓ Upload successful: ${url}`);
+    // Clear finishingSessionBatches
+    this.finishingSessionBatches = [];
 
-      this.config.onLog({
-        type: 'volume_change',
-        message: `🎙️ Recording saved: ${url}`
+    // Start background upload worker if not already running
+    if (!this.uploadInProgress) {
+      this.processUploadQueue().catch(error => {
+        this.log(`⚠️ Upload worker error: ${error}`);
       });
-
-    } catch (error) {
-      this.log(`Upload failed: ${error}`);
-      if (this.config.onError) {
-        this.config.onError(error as Error);
-      }
-      throw error;
     }
+  }
+
+  /**
+   * 🔄 BACKGROUND WORKER: Process upload queue asynchronously
+   * Runs continuously until queue is empty
+   * New calls can start while this is running!
+   */
+  private async processUploadQueue(): Promise<void> {
+    if (this.uploadInProgress) {
+      this.log('Upload worker already running');
+      return;
+    }
+
+    this.uploadInProgress = true;
+    this.log('🚀 Background upload worker started');
+
+    while (true) {
+      // Find next unuploaded session
+      const session = this.completedSessions.find(s => !s.uploaded);
+
+      if (!session) {
+        // Queue empty
+        this.log('✓ Upload queue empty, worker stopping');
+        break;
+      }
+
+      this.log(`⬆️ Uploading session ${session.id} (${session.blob.size} bytes)...`);
+
+      try {
+        // Upload to Firebase (this is the slow part, but it's non-blocking now!)
+        const url = await this.config.onUpload(session.blob, session.mimeType);
+
+        session.uploaded = true;
+        session.uploadUrl = url;
+
+        this.log(`✓ Background upload complete: ${url}`);
+
+        this.config.onLog({
+          type: 'volume_change',
+          message: `🎙️ Recording saved: ${url}`
+        });
+
+        // Remove from queue after successful upload (optional - keep for retry)
+        // this.completedSessions = this.completedSessions.filter(s => s.id !== session.id);
+
+      } catch (error) {
+        this.log(`⚠️ Upload failed: ${error}`);
+
+        if (this.config.onError) {
+          this.config.onError(error as Error);
+        }
+
+        // Don't remove from queue - will retry on next worker start
+        // Break out of loop to allow other operations to proceed
+        break;
+      }
+    }
+
+    this.uploadInProgress = false;
+    this.log('Upload worker stopped');
   }
 
   private async cleanup(success: boolean): Promise<void> {
     this.log(`Cleanup (success: ${success})`);
 
-    // 🔥 CRITICAL: Clear MediaRecorder callbacks BEFORE stopping
-    // This prevents zombie ondataavailable events from firing after cleanup
-    if (this.mediaRecorder) {
-      this.mediaRecorder.ondataavailable = null;
-      this.mediaRecorder.onerror = null;
+    // 🎯 PURIST APPROACH: Check if we have a standby batch (audio during finish phase)
+    const hasStandbyBatch = this.currentBatch && this.currentBatch.state === BatchState.Recording;
 
-      if (this.mediaRecorder.state !== 'inactive') {
-        this.mediaRecorder.stop();
-      }
+    // 🎯 INVARIANT ENFORCEMENT:
+    // MediaRecorder NEVER stops in cleanup - only in abort() when monitoring stops
+    // This ensures zero gaps and always-listening behavior
+    if (this.mediaRecorder) {
+      this.log('🎯 MediaRecorder stays active (purist mode - always listening)');
     }
-    this.mediaRecorder = null;
 
     // NOTE: We keep AudioContext alive for reuse across recording sessions
     // Only closed in abort() when monitoring stops completely
@@ -916,17 +1197,48 @@ export class BatchCoordinator {
       this.nextPlaybackTime = this.audioContext.currentTime;
     }
 
-    // Clear state
-    this.batches = [];
-    this.currentBatch = null;
+    // 🎯 Handle standby batch (audio detected during finish phase)
+    if (hasStandbyBatch && this.audioValidated) {
+      // Audio was validated during finish phase → promote to new session
+      this.log(`🎯 Standby batch promoted to new session (emergency audio validated)`);
+
+      // Keep current batch (it's the first batch of the new session)
+      // Clear old batches from finished session
+      this.batches = [this.currentBatch];
+
+      // Increment session ID for new session
+      this.sessionId++;
+      this.playbackGeneration++;
+      this.log(`🎯 New session started (session ${this.sessionId}) - MediaRecorder continues seamlessly`);
+
+    } else if (hasStandbyBatch && !this.audioValidated) {
+      // Standby batch exists but no validated audio → discard it
+      this.log(`🎯 Discarding standby batch (no validated emergency audio)`);
+      this.currentBatch = null;
+      this.batches = [];
+
+    } else {
+      // No standby batch
+      this.batches = [];
+      this.currentBatch = null;
+    }
+
+    // Clear playback state
     this.playbackQueue = [];
     this.isPlaying = false;
-    this.audioValidated = false;
-    this.validationStartTime = 0;
-    this.isPreBuffering = false; // Reset pre-buffer flag
     this.hardwareReady = false;
     this.pagingActive = false;
     this.isFinishing = false; // Reset finish guard
+    this.finishingSessionBatches = []; // Clear saved batches
+
+    // 🛡️ Reset TailGuard state
+    this.tailGuardActive = false;
+    this.tailGuardStartTime = 0;
+
+    // 🎯 Reset validation state for next session
+    this.audioValidated = false;
+    this.validationStartTime = 0;
+    this.isPreBuffering = false;
 
     // NOTE: We keep this.initSegment for reuse across sessions
     // Only cleared on abort() when monitoring stops completely
@@ -935,6 +1247,26 @@ export class BatchCoordinator {
       clearInterval(this.silenceCheckInterval);
       this.silenceCheckInterval = null;
     }
+
+    // 🎯 If standby batch was promoted, trigger hardware activation
+    if (hasStandbyBatch && this.audioValidated && !this.hardwareReady) {
+      await this.activateHardware().catch((error) => {
+        this.log(`Hardware activation failed: ${error}`);
+        if (this.config.onError) {
+          this.config.onError(error);
+        }
+      });
+    }
+
+    // 🎯 PURIST MODE IDLE STATE:
+    // Start an idle standby batch to capture ongoing chunks
+    // This prevents "chunk received but no active batch" warnings
+    if (this.mediaRecorder && this.mediaRecorder.state === 'recording' && !this.currentBatch) {
+      this.startBatchRecording();
+      this.log('🎯 Idle standby batch started (capturing chunks silently)');
+    }
+
+    this.log('🎯 System in idle standby state (ready for next session)');
   }
 
   // ============================================================================
@@ -1009,6 +1341,13 @@ export class BatchCoordinator {
   }
 
   private log(message: string): void {
-    console.log(`[BatchCoordinator] ${message}`);
+    // 🎨 Color idle standby messages in green
+    if (message.includes('System in idle standby state') ||
+        message.includes('Idle standby batch started') ||
+        message.includes('Session complete')) {
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #00ff00; font-weight: bold');
+    } else {
+      console.log(`[BatchCoordinator] ${message}`);
+    }
   }
 }
