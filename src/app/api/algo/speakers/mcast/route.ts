@@ -47,6 +47,10 @@ export async function POST(request: NextRequest) {
           });
 
           await client.setSetting({ "mcast.mode": mcastMode });
+
+          // CRITICAL: Reload device to apply config changes
+          await client.reload();
+
           results.push({ ip: speaker.ipAddress, success: true });
         } catch (error) {
           results.push({

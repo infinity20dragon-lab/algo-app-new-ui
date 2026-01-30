@@ -3205,9 +3205,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
         pagingWasEnabledRef.current = false; // Paging is in idle zone, not active
 
-        // Step 3: Set all speakers to mode 2 (receiver - listening to Zone 1)
-        debugLog('[AudioMonitoring] Step 3: Setting speakers to mode 2 (receiver - listening Zone 1)');
-        await setSpeakersMulticast(2);
+        // Step 3: REMOVED - We NEVER change speaker multicast mode!
+        // Speakers should ALWAYS be pre-configured to mode 2 (receiver) and left alone
+        // await setSpeakersMulticast(2); // ← REMOVED
+        debugLog('[AudioMonitoring] Step 3: Speakers assumed to be in mode 2 (receiver - listening Zone 1)');
 
         setSpeakersEnabled(true); // Mark as ready
 
@@ -3220,10 +3221,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           type: "speakers_enabled",
           speakersEnabled: true,
           volume: skipRampForLog ? 100 : 0,
-          message: `Monitoring ready: Paging=Zone 2 (idle), Speakers=Zone 1 (listening), ${volumeMsg}`,
+          message: `Monitoring ready: Paging=Zone 2 (idle), Speakers=pre-configured (multicast unchanged), ${volumeMsg}`,
         });
 
-        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging Zone 2 (idle), Speakers listening Zone 1, ${volumeMsg}`);
+        debugLog(`[AudioMonitoring] ✓ Setup complete: Paging Zone 2 (idle), Speakers pre-configured (multicast unchanged), ${volumeMsg}`);
       } catch (error) {
         console.error('[AudioMonitoring] Error during speaker setup:', error);
         // Continue anyway - audio capture is already running
@@ -3268,12 +3269,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Step 1: Set speakers to idle volume
       await setDevicesVolume(0);
 
-      // Step 2: Set all speakers to mode 0 (disabled)
-      // NOTE: We don't change paging mcast mode - only zones!
-      await setSpeakersMulticast(0);
+      // Step 2: REMOVED - We NEVER change speaker multicast mode!
+      // Speakers should ALWAYS stay in mode 2 (receiver)
+      // await setSpeakersMulticast(0); // ← REMOVED
 
       controllingSpakersRef.current = false;
-      debugLog(`[AudioMonitoring] ✓ Clean shutdown complete: All devices mode 0, speakers ${getIdleVolumeString()}`);
+      debugLog(`[AudioMonitoring] ✓ Clean shutdown complete: Speakers ${getIdleVolumeString()}, multicast unchanged`);
     }
 
     // 🚀 NEW CALL COORDINATOR SYSTEM: Abort if active

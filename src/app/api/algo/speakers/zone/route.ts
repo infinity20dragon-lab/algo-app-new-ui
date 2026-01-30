@@ -37,6 +37,10 @@ export async function POST(request: NextRequest) {
 
     await client.setSetting({ "mcast.tx.fixed": String(zone) });
 
+    // CRITICAL: Reload device to apply the zone change
+    // Without this, device gets stuck in desync state
+    await client.reload();
+
     console.log(`[Zone API] ✓ Changed paging zone to ${zone} for ${ipAddress}`);
 
     return NextResponse.json({
