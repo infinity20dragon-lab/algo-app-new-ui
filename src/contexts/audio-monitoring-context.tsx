@@ -9,6 +9,7 @@ import { ref as dbRef, set, push } from "firebase/database";
 import { useAuth } from "@/contexts/auth-context";
 import { getIdleVolumeString, getAlwaysKeepPagingOn } from "@/lib/settings";
 import { CallCoordinator, CallState } from "@/lib/call-coordinator";
+import { BatchCoordinator, type BatchCoordinatorConfig } from "@/lib/batch-coordinator";
 
 // Debug mode - set to false for production to reduce console noise
 const DEBUG_MODE = process.env.NODE_ENV === 'development';
@@ -17,6 +18,11 @@ const DEBUG_MODE = process.env.NODE_ENV === 'development';
 // Set to true to use the new state machine architecture
 // Set to false to use the legacy implementation
 const USE_NEW_CALL_SYSTEM = true; // ✅ ENABLED - Using new state machine!
+
+// 🎯 FEATURE FLAG: Micro-Batch System
+// Set to true to use simplified batch recording/playback (replaces MediaSource streaming)
+// Set to false to use CallCoordinator with MediaSource (legacy streaming)
+const USE_BATCH_SYSTEM = true; // ✅ ENABLED - Using micro-batch architecture!
 
 // Debug logging helper - only logs in development
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -358,6 +364,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // 🚀 NEW CALL COORDINATOR SYSTEM
   const callCoordinatorRef = useRef<CallCoordinator | null>(null);
+  const batchCoordinatorRef = useRef<BatchCoordinator | null>(null);
 
   const {
     isCapturing,
@@ -2604,36 +2611,57 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [user]);
 
-  // 🚀 NEW CALL COORDINATOR SYSTEM: Initialize/update when config changes
+  // 🚀 COORDINATOR SYSTEM: Initialize/update when config changes
   useEffect(() => {
-    if (!USE_NEW_CALL_SYSTEM) return;
+    if (!USE_NEW_CALL_SYSTEM && !USE_BATCH_SYSTEM) return;
     if (!isCapturing) return;
     if (!monitoringStream) return;
 
-    // If CallCoordinator exists and is in Idle state, recreate it with new config
-    // If it's in an active call, don't interrupt it
-    if (callCoordinatorRef.current) {
-      const currentState = callCoordinatorRef.current.getState();
-      if (currentState !== 'Idle') {
-        // Don't recreate during active call - let it finish
-        debugLog('[CallCoordinator] Config changed but call is active, will apply on next call');
-        return;
-      } else {
-        // In Idle state - safe to recreate with new config
-        debugLog('[CallCoordinator] Config changed, recreating coordinator in Idle state');
-        callCoordinatorRef.current.abort(); // Clean up old instance
-        callCoordinatorRef.current = null;
+    // Check which coordinator is currently active and handle state accordingly
+    if (USE_BATCH_SYSTEM) {
+      // Using BatchCoordinator
+      if (batchCoordinatorRef.current) {
+        const currentState = batchCoordinatorRef.current.getState();
+        if (currentState !== 'Idle') {
+          debugLog('[BatchCoordinator] Config changed but call is active, will apply on next call');
+          return;
+        } else {
+          debugLog('[BatchCoordinator] Config changed, recreating coordinator in Idle state');
+          batchCoordinatorRef.current.abort();
+          batchCoordinatorRef.current = null;
+        }
+      }
+    } else if (USE_NEW_CALL_SYSTEM) {
+      // Using CallCoordinator (legacy)
+      if (callCoordinatorRef.current) {
+        const currentState = callCoordinatorRef.current.getState();
+        if (currentState !== 'Idle') {
+          debugLog('[CallCoordinator] Config changed but call is active, will apply on next call');
+          return;
+        } else {
+          debugLog('[CallCoordinator] Config changed, recreating coordinator in Idle state');
+          callCoordinatorRef.current.abort();
+          callCoordinatorRef.current = null;
+        }
       }
     }
 
-    debugLog('[CallCoordinator] Initializing CallCoordinator with current config');
+    const coordinatorName = USE_BATCH_SYSTEM ? 'BatchCoordinator' : 'CallCoordinator';
+    debugLog(`[${coordinatorName}] Initializing with current config`);
 
     // Get the first selected paging device (type 8301)
     const pagingDevices = devices.filter(d =>
       d.type === "8301" && selectedDevices.includes(d.id)
     );
     const pagingDevice = pagingDevices.length > 0
-      ? { id: pagingDevices[0].id, name: pagingDevices[0].name, ip: pagingDevices[0].ipAddress }
+      ? {
+          id: pagingDevices[0].id,
+          name: pagingDevices[0].name,
+          ip: pagingDevices[0].ipAddress, // CallCoordinator uses 'ip'
+          ipAddress: pagingDevices[0].ipAddress, // BatchCoordinator uses 'ipAddress'
+          password: pagingDevices[0].apiPassword || '',
+          authMethod: pagingDevices[0].authMethod || 'basic',
+        }
       : null;
 
     // Extract linked speakers for this paging device
@@ -2648,12 +2676,14 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           .map(s => ({
             id: s.id,
             name: s.name,
-            ip: s.ipAddress,
-            maxVolume: s.maxVolume ?? 100,
+            ipAddress: s.ipAddress, // BatchCoordinator expects 'ipAddress', CallCoordinator expects 'ip'
+            ip: s.ipAddress, // Keep for CallCoordinator backward compatibility
+            volume: s.maxVolume ?? 100, // BatchCoordinator expects 'volume'
+            maxVolume: s.maxVolume ?? 100, // Keep for CallCoordinator backward compatibility
           }))
       : [];
 
-    debugLog(`[CallCoordinator] Found ${linkedSpeakers.length} linked speakers for paging device ${pagingDevice?.name || 'N/A'}`);
+    debugLog(`[${coordinatorName}] Found ${linkedSpeakers.length} linked speakers for paging device ${pagingDevice?.name || 'N/A'}`);
 
     // Create speaker volume control callback
     const setSpeakerVolume = async (speakerId: string, volumePercent: number) => {
@@ -2709,16 +2739,16 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
     };
 
-    // Extract PoE devices (for passing to CallCoordinator)
-    const poeDevicesForCoordinator = poeDevices
-      .filter(d => d.mode === "auto")
-      .map(d => ({
-        id: d.id,
-        name: d.name,
-        mode: d.mode,
-      }));
+    // Extract PoE devices (for passing to coordinator)
+    const poeDevicesForCoordinator = poeDevices.map(d => ({
+      id: d.id,
+      name: d.name,
+      mode: d.mode,
+      linkedPagingDevices: d.linkedPagingDevices || [],
+    }));
 
-    const config = {
+    // Create config object (shared by both coordinators)
+    const baseConfig = {
       audioThreshold,
       sustainDuration,
       playbackEnabled,
@@ -2744,21 +2774,50 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       controlPoEDevices,
     };
 
-    callCoordinatorRef.current = new CallCoordinator(config);
+    // Instantiate the appropriate coordinator based on feature flag
+    if (USE_BATCH_SYSTEM) {
+      // BatchCoordinator config (includes batch-specific settings)
+      const batchConfig: BatchCoordinatorConfig = {
+        ...baseConfig,
+        batchDuration: 5000, // 5 seconds per batch
+        minBatchDuration: 1000, // 1 second minimum
+        maxBatchDuration: 10000, // 10 seconds maximum
+      };
 
-    // Start the coordinator with the monitoring stream
-    callCoordinatorRef.current.start(monitoringStream).then(() => {
-      debugLog('[CallCoordinator] ✅ Call coordinator started and ready');
-    }).catch((error) => {
-      console.error('[CallCoordinator] Failed to start:', error);
-    });
+      batchCoordinatorRef.current = new BatchCoordinator(batchConfig);
+
+      // Start the coordinator with the monitoring stream
+      batchCoordinatorRef.current.start(monitoringStream).then(() => {
+        debugLog('[BatchCoordinator] ✅ Batch coordinator started and ready');
+      }).catch((error) => {
+        console.error('[BatchCoordinator] Failed to start:', error);
+      });
+    } else if (USE_NEW_CALL_SYSTEM) {
+      // CallCoordinator (legacy streaming)
+      callCoordinatorRef.current = new CallCoordinator(baseConfig);
+
+      // Start the coordinator with the monitoring stream
+      callCoordinatorRef.current.start(monitoringStream).then(() => {
+        debugLog('[CallCoordinator] ✅ Call coordinator started and ready');
+      }).catch((error) => {
+        console.error('[CallCoordinator] Failed to start:', error);
+      });
+    }
 
     // Cleanup function - abort coordinator if monitoring stops or config changes during active call
     return () => {
-      if (callCoordinatorRef.current && callCoordinatorRef.current.getState() !== 'Idle') {
-        debugLog('[CallCoordinator] Stopping active call due to monitoring stop or config change');
-        callCoordinatorRef.current.abort();
-        callCoordinatorRef.current = null;
+      if (USE_BATCH_SYSTEM && batchCoordinatorRef.current) {
+        if (batchCoordinatorRef.current.getState() !== 'Idle') {
+          debugLog('[BatchCoordinator] Stopping active call due to monitoring stop or config change');
+          batchCoordinatorRef.current.abort();
+          batchCoordinatorRef.current = null;
+        }
+      } else if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
+        if (callCoordinatorRef.current.getState() !== 'Idle') {
+          debugLog('[CallCoordinator] Stopping active call due to monitoring stop or config change');
+          callCoordinatorRef.current.abort();
+          callCoordinatorRef.current = null;
+        }
       }
     };
   }, [
@@ -2798,8 +2857,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       return;
     }
 
-    // 🚀 NEW CALL COORDINATOR SYSTEM: Delegate to CallCoordinator if enabled
-    if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
+    // 🚀 COORDINATOR SYSTEM: Delegate to appropriate coordinator if enabled
+    if (USE_BATCH_SYSTEM && batchCoordinatorRef.current) {
+      // BatchCoordinator system
+      if (audioLevel > audioThreshold) {
+        batchCoordinatorRef.current.onAudioDetected(audioLevel);
+      } else {
+        batchCoordinatorRef.current.onSilence();
+      }
+      return; // Skip legacy audio detection logic
+    } else if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
+      // CallCoordinator system (legacy streaming)
       if (audioLevel > audioThreshold) {
         callCoordinatorRef.current.onAudioDetected(audioLevel);
       } else {
@@ -3277,8 +3345,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       debugLog(`[AudioMonitoring] ✓ Clean shutdown complete: Speakers ${getIdleVolumeString()}, multicast unchanged`);
     }
 
-    // 🚀 NEW CALL COORDINATOR SYSTEM: Abort if active
-    if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
+    // 🚀 COORDINATOR SYSTEM: Abort if active
+    if (USE_BATCH_SYSTEM && batchCoordinatorRef.current) {
+      debugLog('[BatchCoordinator] Aborting batch coordinator');
+      await batchCoordinatorRef.current.abort();
+      batchCoordinatorRef.current = null;
+    } else if (USE_NEW_CALL_SYSTEM && callCoordinatorRef.current) {
       debugLog('[CallCoordinator] Aborting call coordinator');
       await callCoordinatorRef.current.abort();
       callCoordinatorRef.current = null;
