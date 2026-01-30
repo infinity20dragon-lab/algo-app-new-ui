@@ -34,8 +34,8 @@ export interface AudioBatch {
   blob: Blob | null;                       // Combined blob for playback
   duration: number;                        // Recorded duration in ms
   state: BatchState;                       // Current state
-  audioElement: HTMLAudioElement | null;   // Playback element
-  blobUrl: string | null;                  // Object URL for playback
+  audioElement: HTMLAudioElement | null;   // Deprecated: Not used with Web Audio API
+  blobUrl: string | null;                  // Deprecated: Not used with Web Audio API
   startTime: number;                       // Recording start timestamp
   endTime: number | null;                  // Recording end timestamp
   playbackStartTime: number | null;        // When playback began
@@ -124,6 +124,10 @@ export class BatchCoordinator {
   private sessionStartTime: number = 0;
   private initSegment: Blob | null = null; // First chunk with headers for playback
 
+  // Web Audio API for playback
+  private audioContext: AudioContext | null = null;
+  private nextPlaybackTime: number = 0; // Timeline position for scheduling
+
   // Hardware state
   private pagingActive: boolean = false;      // Zone 1 active
   private hardwareReady: boolean = false;     // Speakers ramped, PoE enabled
@@ -169,6 +173,17 @@ export class BatchCoordinator {
     this.isFinishing = false; // Reset finish guard
 
     this.log(`BatchCoordinator started (session ${this.sessionId})`);
+
+    // 🔥 Initialize Web Audio API for playback
+    if (!this.audioContext || this.audioContext.state === 'closed') {
+      this.audioContext = new AudioContext();
+      this.nextPlaybackTime = 0;
+      this.log(`🎵 Web Audio API initialized (sample rate: ${this.audioContext.sampleRate}Hz)`);
+    } else {
+      // Reset timeline for new session
+      this.nextPlaybackTime = this.audioContext.currentTime;
+      this.log('Web Audio timeline reset for new session');
+    }
 
     // 🔥 Capture silent pre-roll for init segment (if not already captured)
     if (!this.initSegment) {
@@ -330,9 +345,16 @@ export class BatchCoordinator {
       clearInterval(this.silenceCheckInterval);
     }
 
-    // Stop playback
-    if (this.currentBatch?.audioElement) {
-      this.currentBatch.audioElement.pause();
+    // Stop playback - close AudioContext (monitoring is stopping)
+    if (this.audioContext && this.audioContext.state !== 'closed') {
+      try {
+        await this.audioContext.close();
+        this.log('AudioContext closed');
+      } catch (error) {
+        this.log(`AudioContext close error: ${error}`);
+      }
+      this.audioContext = null;
+      this.nextPlaybackTime = 0;
     }
 
     // Clear init segment (monitoring is stopping completely)
@@ -503,6 +525,10 @@ export class BatchCoordinator {
   // Batch Playback
   // ============================================================================
 
+  /**
+   * Play next batch using Web Audio API
+   * Decodes blob to AudioBuffer and schedules on timeline for gap-free playback
+   */
   private async playNextBatch(): Promise<void> {
     if (this.playbackQueue.length === 0) {
       this.isPlaying = false;
@@ -527,9 +553,8 @@ export class BatchCoordinator {
     const batchIndex = this.batches.indexOf(batch) + 1;
     this.log(`Playing batch ${batchIndex} of ${this.batches.length}`);
 
-    // 🔥 Capture session ID and generation to guard against race conditions
+    // 🔥 Capture session ID to guard against race conditions
     const mySessionId = this.sessionId;
-    const generation = this.playbackGeneration;
 
     try {
       // Ensure hardware is active before first playback
@@ -543,97 +568,59 @@ export class BatchCoordinator {
         return;
       }
 
-      // Create audio element
-      const audio = new Audio();
-      batch.audioElement = audio;
+      if (!this.audioContext) {
+        throw new Error('AudioContext not initialized');
+      }
 
-      // Create blob URL
-      batch.blobUrl = URL.createObjectURL(batch.blob!);
-      audio.src = batch.blobUrl;
+      // 🎵 Step 1: Decode blob to AudioBuffer
+      const arrayBuffer = await batch.blob!.arrayBuffer();
+      const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
 
-      // Set up completion handler with generation guard
-      audio.onended = () => {
+      this.log(`Decoded batch ${batchIndex}: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.numberOfChannels}ch`);
+
+      // 🔥 Gate: Check session STILL valid after async decode
+      if (mySessionId !== this.sessionId) {
+        this.log(`Playback aborted after decode: session ${mySessionId} invalidated`);
+        return;
+      }
+
+      // 🎵 Step 2: Create AudioBufferSourceNode
+      const source = this.audioContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(this.audioContext.destination);
+
+      // 🎵 Step 3: Calculate playback time (sample-accurate scheduling)
+      const now = this.audioContext.currentTime;
+      const playTime = Math.max(this.nextPlaybackTime, now);
+
+      // 🎵 Step 4: Set up completion handler
+      source.onended = () => {
         // 🔥 Guard: Only proceed if this is still the current session
-        if (generation !== this.playbackGeneration) {
-          this.log(`Batch ${batchIndex} onended from old session (gen ${generation}), ignoring`);
+        if (mySessionId !== this.sessionId) {
+          this.log(`Batch ${batchIndex} onended from old session, ignoring`);
           return;
         }
 
         this.log(`Batch ${batchIndex} playback complete`);
         batch.state = BatchState.Complete;
 
-        // 🔥 CRITICAL: Remove event listeners BEFORE cleanup to prevent race
-        if (batch.audioElement) {
-          batch.audioElement.onended = null;
-          batch.audioElement.onerror = null;
-        }
-
-        // Cleanup - flush decoder buffer and free blob URL
-        if (batch.audioElement) {
-          batch.audioElement.pause();
-          batch.audioElement.src = '';
-          batch.audioElement.load(); // 🔥 Flush decoder buffer
-        }
-        if (batch.blobUrl) {
-          URL.revokeObjectURL(batch.blobUrl);
-        }
-        batch.audioElement = null;
-        batch.blobUrl = null;
-
+        // No cleanup needed - Web Audio handles everything
         // Play next batch
         this.playNextBatch();
       };
 
-      audio.onerror = (error) => {
-        // 🔥 Guard: Only proceed if this is still the current session
-        if (generation !== this.playbackGeneration) {
-          this.log(`Batch ${batchIndex} onerror from old session (gen ${generation}), ignoring`);
-          return;
-        }
+      // 🎵 Step 5: Start playback at scheduled time
+      source.start(playTime);
 
-        this.log(`Batch ${batchIndex} playback error: ${error}`);
-        batch.state = BatchState.Failed;
-        batch.error = new Error(`Playback failed: ${error}`);
+      // 🎵 Step 6: Update timeline for next batch
+      this.nextPlaybackTime = playTime + audioBuffer.duration;
 
-        // 🔥 CRITICAL: Remove event listeners BEFORE cleanup to prevent race
-        if (batch.audioElement) {
-          batch.audioElement.onended = null;
-          batch.audioElement.onerror = null;
-        }
-
-        // Cleanup
-        if (batch.audioElement) {
-          batch.audioElement.pause();
-          batch.audioElement.src = '';
-          batch.audioElement.load(); // 🔥 Flush decoder buffer
-        }
-        if (batch.blobUrl) {
-          URL.revokeObjectURL(batch.blobUrl);
-        }
-
-        if (this.config.onError) {
-          this.config.onError(batch.error);
-        }
-
-        // Try next batch anyway
-        this.playNextBatch();
-      };
-
-      // 🔥 Final gate: Check session is STILL valid before play
-      if (mySessionId !== this.sessionId) {
-        this.log(`Playback aborted right before play(): session ${mySessionId} invalidated`);
-        // Clean up the audio element we just created
-        if (batch.blobUrl) {
-          URL.revokeObjectURL(batch.blobUrl);
-        }
-        batch.audioElement = null;
-        batch.blobUrl = null;
-        return;
+      const delay = playTime - now;
+      if (delay > 0) {
+        this.log(`✓ Batch ${batchIndex} scheduled in ${(delay * 1000).toFixed(0)}ms`);
+      } else {
+        this.log(`✓ Batch ${batchIndex} playing immediately`);
       }
-
-      // Start playback
-      await audio.play();
-      this.log(`✓ Batch ${batchIndex} playback started`);
 
     } catch (error) {
       this.log(`Failed to play batch ${batchIndex}: ${error}`);
@@ -897,20 +884,11 @@ export class BatchCoordinator {
     }
     this.mediaRecorder = null;
 
-    // Stop playback - properly cleanup audio elements
-    for (const batch of this.batches) {
-      if (batch.audioElement) {
-        batch.audioElement.pause();
-        batch.audioElement.src = ''; // Clear source
-        batch.audioElement.load(); // 🔥 CRITICAL: Flush decoder buffer
-        batch.audioElement.onended = null; // Remove event listener
-        batch.audioElement.onerror = null; // Remove event listener
-        batch.audioElement = null;
-      }
-      if (batch.blobUrl) {
-        URL.revokeObjectURL(batch.blobUrl); // 🔥 CRITICAL: Free blob URL
-        batch.blobUrl = null;
-      }
+    // NOTE: We keep AudioContext alive for reuse across recording sessions
+    // Only closed in abort() when monitoring stops completely
+    // Reset timeline for next recording session
+    if (this.audioContext) {
+      this.nextPlaybackTime = this.audioContext.currentTime;
     }
 
     // Clear state
