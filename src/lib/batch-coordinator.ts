@@ -1054,15 +1054,15 @@ export class BatchCoordinator {
     this.log('🎛️  HARDWARE ACTIVATION:');
 
     try {
-      // Step 1: Set paging multicast IP to active (224.0.2.60:5002)
-      // Much simpler than zone switching - just change the IP/port!
+      // Step 1: Set speakers' multicast IP to active (224.0.2.60:50002)
+      // DON'T touch paging device (it freezes) - change speakers instead!
       if (this.config.pagingDevice && this.config.setPagingMulticastIP) {
         if (this.isInZone1) {
-          this.log('Step 1: Paging already in active mode');
+          this.log('Step 1: Speakers already in active mode');
         } else {
-          this.log('Step 1: Switching paging to active mode (224.0.2.60:5002)...');
+          this.log('Step 1: Switching speakers to active mode (224.0.2.60:50002)...');
           await this.config.setPagingMulticastIP(true);
-          this.log('  ✓ Multicast IP change sent (includes reload + polling)');
+          this.log('  ✓ Multicast IP change sent to speakers (includes reload + polling)');
           this.isInZone1 = true;
         }
         this.pagingActive = true;
@@ -1136,17 +1136,17 @@ export class BatchCoordinator {
         this.log(`  ✓ Disabled ${autoPoEDevices.length} PoE device(s)`);
       }
 
-      // Step 3: Set paging multicast IP to idle (224.0.2.60:50022)
-      // Different port = speakers don't receive audio
+      // Step 3: Set speakers' multicast IP to idle (224.0.2.60:50022)
+      // Different port = speakers don't receive audio from paging
       if (this.config.pagingDevice && this.config.setPagingMulticastIP) {
         if (this.isInZone1) {
-          this.log('Step 3: Switching paging to idle mode (224.0.2.60:50022)...');
+          this.log('Step 3: Switching speakers to idle mode (224.0.2.60:50022)...');
           await this.config.setPagingMulticastIP(false);
-          this.log('  ✓ Multicast IP change sent (includes reload + polling)');
+          this.log('  ✓ Multicast IP change sent to speakers (includes reload + polling)');
           this.pagingActive = false;
           this.isInZone1 = false;
         } else {
-          this.log('Step 3: Paging already in idle mode');
+          this.log('Step 3: Speakers already in idle mode');
           this.pagingActive = false;
         }
       }

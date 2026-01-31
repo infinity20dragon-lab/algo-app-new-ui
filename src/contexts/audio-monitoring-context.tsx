@@ -1929,62 +1929,31 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const setPagingMulticastIP = useCallback(async (active: boolean) => {
     const multicastIP = active ? "224.0.2.60:50002" : "224.0.2.60:50022";
     const mode = active ? "active" : "idle";
-    const pagingDevices = devices.filter(d =>
-      d.type === "8301" && selectedDevices.includes(d.id)
+
+    // DON'T touch paging devices - change speakers instead!
+    const speakerDevices = devices.filter(d =>
+      d.type === "8180" && selectedDevices.includes(d.id)
     );
 
-    if (pagingDevices.length === 0) {
-      debugLog('[AudioMonitoring] No selected paging devices found');
+    if (speakerDevices.length === 0) {
+      debugLog('[AudioMonitoring] No selected speaker devices found');
       return;
     }
 
-    debugLog(`[AudioMonitoring] Setting ${pagingDevices.length} paging device(s) to ${mode} mode (${multicastIP})...`);
+    debugLog(`[AudioMonitoring] Setting ${speakerDevices.length} speaker(s) to ${mode} mode (${multicastIP})...`);
 
+    // Change all speakers' mcast.zone1
     await Promise.allSettled(
-      pagingDevices.map(async (paging) => {
+      speakerDevices.map(async (speaker) => {
         try {
-          // Check current multicast IP first to avoid redundant calls
-          try {
-            const checkAbort = new AbortController();
-            const checkTimeout = setTimeout(() => checkAbort.abort(), 3000); // 3s timeout
-
-            const checkResponse = await fetch("/api/algo/settings/get", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                ipAddress: paging.ipAddress,
-                password: paging.apiPassword,
-                authMethod: paging.authMethod,
-                setting: "mcast.zone1",
-              }),
-              signal: checkAbort.signal,
-            });
-
-            clearTimeout(checkTimeout);
-
-            if (checkResponse.ok) {
-              const checkData = await checkResponse.json();
-              const currentIP = checkData.value;
-
-              if (currentIP === multicastIP) {
-                debugLog(`[AudioMonitoring] ⏭️  ${paging.name} already at ${mode} IP (${multicastIP}), skipping`);
-                return;
-              }
-
-              debugLog(`[AudioMonitoring] ${paging.name} is at ${currentIP}, changing to ${multicastIP}...`);
-            }
-          } catch (checkError) {
-            console.warn(`[AudioMonitoring] Failed to check ${paging.name} multicast IP (timeout or error), proceeding with change...`);
-          }
-
           // Change the multicast IP for zone 1
           const response = await fetch("/api/algo/settings", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              ipAddress: paging.ipAddress,
-              password: paging.apiPassword,
-              authMethod: paging.authMethod,
+              ipAddress: speaker.ipAddress,
+              password: speaker.apiPassword,
+              authMethod: speaker.authMethod,
               settings: {
                 "mcast.zone1": multicastIP,
               },
@@ -1992,86 +1961,90 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           });
 
           if (response.ok) {
-            debugLog(`[AudioMonitoring] ✓ Set ${paging.name} multicast IP to ${multicastIP}`);
+            debugLog(`[AudioMonitoring] ✓ Set ${speaker.name} multicast IP to ${multicastIP}`);
 
-            // Reload device after zone change to prevent desync
+            // Reload device after zone change
             try {
-              debugLog(`[AudioMonitoring] Reloading ${paging.name}...`);
+              debugLog(`[AudioMonitoring] Reloading ${speaker.name}...`);
               const reloadResponse = await fetch("/api/algo/reload", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  ipAddress: paging.ipAddress,
-                  password: paging.apiPassword,
-                  authMethod: paging.authMethod || "standard",
+                  ipAddress: speaker.ipAddress,
+                  password: speaker.apiPassword,
+                  authMethod: speaker.authMethod || "standard",
                 }),
               });
 
               if (!reloadResponse.ok) {
-                console.warn(`[AudioMonitoring] ⚠️ Failed to reload ${paging.name}: HTTP ${reloadResponse.status}`);
+                console.warn(`[AudioMonitoring] ⚠️ Failed to reload ${speaker.name}: HTTP ${reloadResponse.status}`);
               } else {
-                debugLog(`[AudioMonitoring] ✓ Reload command sent to ${paging.name}`);
+                debugLog(`[AudioMonitoring] ✓ Reload command sent to ${speaker.name}`);
               }
             } catch (reloadError) {
-              console.warn(`[AudioMonitoring] ⚠️ Error reloading ${paging.name}:`, reloadError);
+              console.warn(`[AudioMonitoring] ⚠️ Error reloading ${speaker.name}:`, reloadError);
             }
-
-            // Poll multicast IP to verify change (device needs ~2-5s to reload)
-            debugLog(`[AudioMonitoring] Polling ${paging.name} multicast IP status...`);
-            const maxPollAttempts = 20; // 20 attempts × 500ms = 10s max
-            let pollAttempt = 0;
-            let ipVerified = false;
-
-            while (pollAttempt < maxPollAttempts && !ipVerified) {
-              await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms between polls
-              pollAttempt++;
-
-              try {
-                const pollResponse = await fetch("/api/algo/settings/get", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    ipAddress: paging.ipAddress,
-                    password: paging.apiPassword,
-                    authMethod: paging.authMethod,
-                    setting: "mcast.zone1",
-                  }),
-                });
-
-                if (pollResponse.ok) {
-                  const pollData = await pollResponse.json();
-                  const currentIP = pollData.value;
-
-                  if (currentIP === multicastIP) {
-                    ipVerified = true;
-                    debugLog(`[AudioMonitoring] ✓ ${paging.name} multicast IP verified as ${multicastIP} (attempt ${pollAttempt})`);
-                    break;
-                  } else {
-                    debugLog(`[AudioMonitoring] Polling ${paging.name}: IP is ${currentIP}, waiting for ${multicastIP}... (${pollAttempt}/${maxPollAttempts})`);
-                  }
-                }
-              } catch (pollError) {
-                // Device might be reloading, continue polling
-                debugLog(`[AudioMonitoring] Poll ${pollAttempt}: ${paging.name} not responding (reloading...)`);
-              }
-            }
-
-            if (!ipVerified) {
-              console.warn(`[AudioMonitoring] ⚠️ Could not verify ${paging.name} multicast IP change after ${maxPollAttempts} attempts`);
-            }
-
-            addLog({
-              type: "speakers_enabled",
-              message: `Paging ${paging.name} ${mode} mode activated (${multicastIP})${ipVerified ? ' (verified)' : ' (unverified)'}`,
-            });
           } else {
-            console.error(`[AudioMonitoring] Failed to set ${paging.name} multicast IP: HTTP ${response.status}`);
+            console.error(`[AudioMonitoring] Failed to set ${speaker.name} multicast IP: HTTP ${response.status}`);
           }
         } catch (error) {
-          console.error(`Failed to set ${paging.name} multicast IP:`, error);
+          console.error(`Failed to set ${speaker.name} multicast IP:`, error);
         }
       })
     );
+
+    // Poll ONLY the first speaker to verify (don't poll all of them)
+    if (speakerDevices.length > 0) {
+      const firstSpeaker = speakerDevices[0];
+      debugLog(`[AudioMonitoring] Polling ${firstSpeaker.name} multicast IP status (verification speaker)...`);
+
+      const maxPollAttempts = 20; // 20 attempts × 500ms = 10s max
+      let pollAttempt = 0;
+      let ipVerified = false;
+
+      while (pollAttempt < maxPollAttempts && !ipVerified) {
+        await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms between polls
+        pollAttempt++;
+
+        try {
+          const pollResponse = await fetch("/api/algo/settings/get", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ipAddress: firstSpeaker.ipAddress,
+              password: firstSpeaker.apiPassword,
+              authMethod: firstSpeaker.authMethod,
+              setting: "mcast.zone1",
+            }),
+          });
+
+          if (pollResponse.ok) {
+            const pollData = await pollResponse.json();
+            const currentIP = pollData.value;
+
+            if (currentIP === multicastIP) {
+              ipVerified = true;
+              debugLog(`[AudioMonitoring] ✓ ${firstSpeaker.name} multicast IP verified as ${multicastIP} (attempt ${pollAttempt})`);
+              break;
+            } else {
+              debugLog(`[AudioMonitoring] Polling ${firstSpeaker.name}: IP is ${currentIP}, waiting for ${multicastIP}... (${pollAttempt}/${maxPollAttempts})`);
+            }
+          }
+        } catch (pollError) {
+          // Device might be reloading, continue polling
+          debugLog(`[AudioMonitoring] Poll ${pollAttempt}: ${firstSpeaker.name} not responding (reloading...)`);
+        }
+      }
+
+      if (!ipVerified) {
+        console.warn(`[AudioMonitoring] ⚠️ Could not verify ${firstSpeaker.name} multicast IP change after ${maxPollAttempts} attempts`);
+      }
+
+      addLog({
+        type: "speakers_enabled",
+        message: `Speakers ${mode} mode activated (${multicastIP})${ipVerified ? ' (verified)' : ' (unverified)'}`,
+      });
+    }
   }, [devices, selectedDevices, addLog]);
 
   // Wait for paging device to be ready by polling until mcast.mode = 1
