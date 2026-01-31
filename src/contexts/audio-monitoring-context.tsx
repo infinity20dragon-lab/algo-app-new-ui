@@ -1943,7 +1943,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Get all linked speakers from all selected paging devices
     const allLinkedSpeakers: typeof devices = [];
     selectedPagingDevices.forEach(paging => {
-      const linkedSpeakerIds = paging.linkedPagingDeviceIds || [];
+      const linkedSpeakerIds = paging.linkedSpeakerIds || [];
       const linkedSpeakers = devices.filter(d => linkedSpeakerIds.includes(d.id));
       allLinkedSpeakers.push(...linkedSpeakers);
     });
