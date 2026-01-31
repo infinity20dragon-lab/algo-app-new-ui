@@ -1930,17 +1930,35 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     const multicastIP = active ? "224.0.2.60:50002" : "224.0.2.60:50022";
     const mode = active ? "active" : "idle";
 
-    // DON'T touch paging devices - change speakers instead!
-    const speakerDevices = devices.filter(d =>
-      d.type === "8180" && selectedDevices.includes(d.id)
+    // DON'T touch paging devices - change speakers linked to selected paging devices!
+    const selectedPagingDevices = devices.filter(d =>
+      d.type === "8301" && selectedDevices.includes(d.id)
     );
 
-    if (speakerDevices.length === 0) {
-      debugLog('[AudioMonitoring] No selected speaker devices found');
+    if (selectedPagingDevices.length === 0) {
+      debugLog('[AudioMonitoring] No selected paging devices found');
       return;
     }
 
-    debugLog(`[AudioMonitoring] Setting ${speakerDevices.length} speaker(s) to ${mode} mode (${multicastIP})...`);
+    // Get all linked speakers from all selected paging devices
+    const allLinkedSpeakers: typeof devices = [];
+    selectedPagingDevices.forEach(paging => {
+      const linkedSpeakerIds = paging.linkedPagingDeviceIds || [];
+      const linkedSpeakers = devices.filter(d => linkedSpeakerIds.includes(d.id));
+      allLinkedSpeakers.push(...linkedSpeakers);
+    });
+
+    // Remove duplicates
+    const speakerDevices = Array.from(new Set(allLinkedSpeakers.map(s => s.id)))
+      .map(id => allLinkedSpeakers.find(s => s.id === id)!)
+      .filter(Boolean);
+
+    if (speakerDevices.length === 0) {
+      debugLog('[AudioMonitoring] No linked speakers found for selected paging devices');
+      return;
+    }
+
+    debugLog(`[AudioMonitoring] Setting ${speakerDevices.length} linked speaker(s) to ${mode} mode (${multicastIP})...`);
 
     // Change all speakers' mcast.zone1
     await Promise.allSettled(
