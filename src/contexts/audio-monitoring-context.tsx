@@ -3299,6 +3299,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Reset paging state tracker
     pagingWasEnabledRef.current = false;
 
+    // Set speakers to idle mode (don't listen to paging yet)
+    await setPagingMulticastIP(false);
+
     addLog({
       type: "audio_detected",
       audioThreshold,
@@ -3444,10 +3447,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Clean up MediaSource if active
     cleanupMediaSource();
 
+    // Set speakers to idle mode (stop listening to paging)
+    await setPagingMulticastIP(false);
+
     // Reset continuous recording flag
     continuousRecordingRef.current = false;
     validRecordingStartIndexRef.current = 0;
-  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setSpeakersMulticast, addLog, cleanupMediaSource]);
+  }, [stopCapture, stopVolumeRamp, setDevicesVolume, setSpeakersMulticast, addLog, cleanupMediaSource, setPagingMulticastIP]);
 
   const setVolume = useCallback((vol: number) => {
     setVolumeState(vol);
