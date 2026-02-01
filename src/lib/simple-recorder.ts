@@ -767,6 +767,16 @@ export class SimpleRecorder {
       return;
     }
 
+    // Check if any hardware is configured
+    const hasLinkedSpeakers = (this.config.linkedSpeakers || []).length > 0;
+    const hasPagingDevice = !!this.config.pagingDevice;
+
+    if (!hasLinkedSpeakers && !hasPagingDevice) {
+      this.log('⚠️  No hardware configured - skipping activation');
+      this.hardwareReady = true; // Mark as ready anyway for playback
+      return;
+    }
+
     this.log('🎛️ ═══ HARDWARE ACTIVATION START ═══');
     this.log('🌐 Setting speaker multicast IP to 224.0.2.60:50002 (ACTIVE)');
     this.log('⚠️  NEVER touching paging device (no zone changes, no IP changes)');
@@ -828,16 +838,18 @@ export class SimpleRecorder {
         this.log('⚠️  No linked speakers to activate');
       }
 
-      // Set paging device multicast IP to active mode
-      if (this.config.pagingDevice) {
+      // Set paging device multicast IP to active mode (only if configured)
+      if (this.config.pagingDevice && this.config.pagingDevice.ipAddress && this.config.pagingDevice.apiPassword) {
         this.log(`📢 Paging device: ${this.config.pagingDevice.name} (${this.config.pagingDevice.ipAddress})`);
         this.log(`   Setting paging to ACTIVE mode (224.0.2.60:50002)`);
 
         if (this.config.setPagingMulticastIP) {
           await this.config.setPagingMulticastIP(true);
         }
+      } else if (this.config.pagingDevice) {
+        this.log('⚠️  Paging device configured but missing IP/password - skipping');
       } else {
-        this.log('⚠️  No paging device configured');
+        this.log('⚠️  No paging device configured - skipping');
       }
 
       this.hardwareReady = true;
@@ -988,6 +1000,16 @@ export class SimpleRecorder {
       return;
     }
 
+    // Check if any hardware is configured
+    const hasLinkedSpeakers = (this.config.linkedSpeakers || []).length > 0;
+    const hasPagingDevice = !!this.config.pagingDevice;
+
+    if (!hasLinkedSpeakers && !hasPagingDevice) {
+      this.log('⚠️  No hardware configured - skipping deactivation');
+      this.hardwareReady = false;
+      return;
+    }
+
     this.log('🎛️ ═══ HARDWARE DEACTIVATION START ═══');
     this.log('🌐 Setting speaker multicast IP to 224.0.2.60:50022 (IDLE)');
     this.log('⚠️  NEVER touching paging device (no zone changes, no IP changes)');
@@ -1049,13 +1071,15 @@ export class SimpleRecorder {
         this.log('⚠️  No linked speakers to deactivate');
       }
 
-      // Set paging device multicast IP to idle mode
-      if (this.config.pagingDevice) {
+      // Set paging device multicast IP to idle mode (only if configured)
+      if (this.config.pagingDevice && this.config.pagingDevice.ipAddress && this.config.pagingDevice.apiPassword) {
         this.log(`   Setting paging to IDLE mode (224.0.2.60:50022)`);
 
         if (this.config.setPagingMulticastIP) {
           await this.config.setPagingMulticastIP(false);
         }
+      } else if (this.config.pagingDevice) {
+        this.log('⚠️  Paging device configured but missing IP/password - skipping');
       }
 
       this.hardwareReady = false;

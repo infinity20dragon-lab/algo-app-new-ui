@@ -307,7 +307,8 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
           // Find speaker device
           const speaker = devices.find(d => d.id === speakerId);
           if (!speaker || !speaker.ipAddress || !speaker.apiPassword) {
-            throw new Error(`Speaker ${speakerId} not found or missing credentials`);
+            addLog(`⚠️  Speaker ${speakerId} not found or missing credentials - skipping`, 'warning');
+            return; // Don't throw error, just skip
           }
 
           addLog(`Setting ${speaker.name} multicast to ${ip}:${port}`, 'info');
@@ -338,11 +339,13 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
           const multicastIP = active ? "224.0.2.60:50002" : "224.0.2.60:50022";
           const mode = active ? "active" : "idle";
 
-          addLog(`Setting paging multicast to ${mode} (${multicastIP})`, 'info');
-
+          // Skip if no paging device configured
           if (!pagingDevice || !pagingDevice.ipAddress || !pagingDevice.apiPassword) {
-            throw new Error('Paging device not configured or missing credentials');
+            addLog(`⚠️  No paging device configured - skipping ${mode} mode`, 'warning');
+            return; // Don't throw error, just skip
           }
+
+          addLog(`Setting paging multicast to ${mode} (${multicastIP})`, 'info');
 
           try {
             const response = await fetch("/api/algo/settings", {
