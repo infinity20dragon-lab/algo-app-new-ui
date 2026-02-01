@@ -408,69 +408,50 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
         onPlaybackLevel: (level) => {
           setPlaybackAudioLevel(level);
         },
-        setSpeakerMulticastIP: async (speakerId: string, ip: string, port: number) => {
-          // Find speaker device
-          const speaker = devices.find(d => d.id === speakerId);
-          if (!speaker || !speaker.ipAddress || !speaker.apiPassword) {
-            addLog(`⚠️  Speaker ${speakerId} not found or missing credentials - skipping`, 'warning');
-            return; // Don't throw error, just skip
+        setSpeakerZoneIP: async (speakers: any[], zoneIP: string) => {
+          if (speakers.length === 0) {
+            addLog(`⚠️  No speakers to control`, 'warning');
+            return;
           }
 
-          addLog(`Setting ${speaker.name} multicast to ${ip}:${port}`, 'info');
+          const mode = zoneIP.includes(':50002') ? 'ACTIVE' : 'IDLE';
+          addLog(`Setting ${speakers.length} speakers' mcast.zone1 to ${zoneIP} (${mode}) - in parallel`, 'info');
 
           try {
-            const response = await fetch("/api/algo/speakers/mcast", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                ipAddress: speaker.ipAddress,
-                password: speaker.apiPassword,
-                multicastIP: ip,
-                multicastPort: port,
-              }),
-            });
+            // Set each speaker's mcast.zone1 in parallel
+            const results = await Promise.allSettled(
+              speakers.map(async (speaker) => {
+                const response = await fetch("/api/algo/settings", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    ipAddress: speaker.ipAddress,
+                    password: speaker.apiPassword || speaker.password,
+                    authMethod: speaker.authMethod || 'basic',
+                    settings: {
+                      "mcast.zone1": zoneIP,
+                    },
+                  }),
+                });
 
-            if (!response.ok) {
-              throw new Error(`API returned ${response.status}`);
+                if (!response.ok) {
+                  throw new Error(`${speaker.name}: API returned ${response.status}`);
+                }
+
+                return { speaker: speaker.name, success: true };
+              })
+            );
+
+            const successCount = results.filter(r => r.status === 'fulfilled').length;
+            const failCount = speakers.length - successCount;
+
+            if (failCount > 0) {
+              addLog(`⚠️  ${successCount}/${speakers.length} speakers updated (${failCount} failed)`, 'warning');
+            } else {
+              addLog(`✓ All ${speakers.length} speakers' zone IP set to ${zoneIP}`, 'info');
             }
-
-            addLog(`✓ ${speaker.name} multicast updated`, 'info');
           } catch (error) {
-            addLog(`❌ Failed to set ${speaker.name} multicast: ${error}`, 'error');
-            throw error;
-          }
-        },
-        setPagingMulticastIP: async (active: boolean) => {
-          const multicastIP = active ? "224.0.2.60:50002" : "224.0.2.60:50022";
-          const mode = active ? "active" : "idle";
-
-          // Skip if no paging device configured
-          if (!pagingDevice || !pagingDevice.ipAddress || !pagingDevice.apiPassword) {
-            addLog(`⚠️  No paging device configured - skipping ${mode} mode`, 'warning');
-            return; // Don't throw error, just skip
-          }
-
-          addLog(`Setting paging multicast to ${mode} (${multicastIP})`, 'info');
-
-          try {
-            const response = await fetch("/api/algo/settings", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                ipAddress: pagingDevice.ipAddress,
-                password: pagingDevice.apiPassword,
-                setting: "mcast.1.addr",
-                value: multicastIP,
-              }),
-            });
-
-            if (!response.ok) {
-              throw new Error(`API returned ${response.status}`);
-            }
-
-            addLog(`✓ Paging device set to ${mode} mode`, 'info');
-          } catch (error) {
-            addLog(`❌ Failed to set paging multicast: ${error}`, 'error');
+            addLog(`❌ Failed to set speaker zone IP: ${error}`, 'error');
             throw error;
           }
         },
@@ -515,9 +496,9 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
       // Start recorder
       await recorderRef.current.start(stream);
 
-      // Initialize hardware (set to idle + volume)
+      // Initialize hardware (set to idle + individual volumes)
       addLog('Initializing hardware...', 'info');
-      await recorderRef.current.initializeHardware(targetVolume);
+      await recorderRef.current.initializeHardware();
 
       setIsMonitoring(true);
       addLog('✅ Monitoring started', 'info');
