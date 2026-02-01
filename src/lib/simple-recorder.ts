@@ -368,23 +368,26 @@ export class SimpleRecorder {
       this.log(`✓ All speakers' zone IP set to 224.0.2.60:50022`);
       this.log('');
 
-      // Set volume for each speaker using its own configured volume (in parallel)
+      // Set volume for each speaker using its maxVolume from /live-v2 page (in parallel)
       this.log(`Setting individual volumes for ${linkedSpeakers.length} speakers (in parallel)...`);
       if (this.config.setSpeakerVolume) {
         await Promise.all(
           linkedSpeakers.map(speaker => {
-            const volume = speaker.volume || 50; // Use speaker's configured volume
-            return this.config.setSpeakerVolume!(speaker.id, volume);
+            const maxVolume = speaker.maxVolume ?? 100; // Use speaker's maxVolume from /live-v2
+            return this.config.setSpeakerVolume!(speaker.id, maxVolume);
           })
         );
       }
       this.log(`✓ All speakers' volumes set to their configured levels`);
       this.log('');
 
-      // Show each speaker's volume
+      // Show each speaker's maxVolume and corresponding level
       linkedSpeakers.forEach(speaker => {
-        const volume = speaker.volume || 50;
-        this.log(`   ${speaker.name}: ${volume}%`);
+        const maxVolume = speaker.maxVolume ?? 100;
+        const level = Math.round((maxVolume / 100) * 10);
+        const dB = (level - 10) * 3;
+        const dbString = dB === 0 ? "0dB" : `${dB}dB`;
+        this.log(`   ${speaker.name}: ${maxVolume}% (Level ${level} = ${dbString})`);
       });
       this.log('');
 
