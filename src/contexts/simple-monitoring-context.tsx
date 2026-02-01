@@ -260,7 +260,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   useEffect(() => {
     syncSessionState({
       selectedDevices,
-      selectedInputDevice,
+      selectedInputDevice: selectedInputDevice || undefined,
       batchDuration,
       silenceTimeout,
       playbackDelay,
