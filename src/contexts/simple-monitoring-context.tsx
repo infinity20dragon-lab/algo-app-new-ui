@@ -201,6 +201,9 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   useEffect(() => {
     if (!sessionState) return;
 
+    // Load device selection
+    if (sessionState.selectedDevices !== undefined) setSelectedDevices(sessionState.selectedDevices);
+
     // Load SimpleRecorder settings
     if (sessionState.batchDuration !== undefined) setBatchDuration(sessionState.batchDuration);
     if (sessionState.silenceTimeout !== undefined) setSilenceTimeout(sessionState.silenceTimeout);
@@ -243,6 +246,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   // Sync settings to RTDB when they change
   useEffect(() => {
     syncSessionState({
+      selectedDevices,
       batchDuration,
       silenceTimeout,
       playbackDelay,
@@ -271,6 +275,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
       emulationNetworkDelay,
     });
   }, [
+    selectedDevices,
     batchDuration, silenceTimeout, playbackDelay, audioThreshold, sustainDuration, disableDelay,
     targetVolume, rampEnabled, rampDuration, dayNightMode, dayStartHour, dayEndHour, nightRampDuration,
     playbackRampDuration, playbackStartVolume, playbackMaxVolume, playbackVolume,
