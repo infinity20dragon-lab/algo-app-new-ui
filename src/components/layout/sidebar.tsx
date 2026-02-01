@@ -35,6 +35,7 @@ const baseNavItems: NavItem[] = [
   { title: "Station Zones", href: "/zones", icon: Map, section: "Overview" },
   { title: "Call Routing", href: "/distribute", icon: Activity, section: "Overview" },
   { title: "Audio Input", href: "/live", icon: Mic, section: "Audio" },
+  { title: "Live V2 (Clean)", href: "/live-v2", icon: Radio, section: "Audio" },
   { title: "Multi-Input Routing", href: "/input-routing", icon: Network, section: "Audio" },
   { title: "Output & Speakers", href: "/devices", icon: Speaker, section: "Audio" },
   { title: "PoE Devices", href: "/poe-devices", icon: Lightbulb, section: "Audio" },

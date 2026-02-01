@@ -58,7 +58,7 @@ export interface CallConfig {
   onStateChange?: (state: CallState) => void;
   onError?: (error: Error) => void;
   onLog?: (entry: { type: any; message: string; audioLevel?: number }) => void;
-  onUpload?: (blob: Blob, mimeType: string) => Promise<string>; // Returns download URL
+  onUpload?: (blob: Blob, mimeType: string, firstAudioTimestamp: number, isPlayback?: boolean) => Promise<string>; // Returns download URL
 }
 
 export interface CallMetrics {
@@ -1226,7 +1226,8 @@ export class CallCoordinator {
     try {
       // Upload to Firebase via callback
       if (this.config.onUpload) {
-        const url = await this.config.onUpload(blob, mimeType);
+        const firstAudioTime = this.metrics.audioDetectedTime || this.metrics.recordingStartTime;
+        const url = await this.config.onUpload(blob, mimeType, firstAudioTime, this.config.playbackEnabled);
 
         this.log({
           type: 'volume_change',

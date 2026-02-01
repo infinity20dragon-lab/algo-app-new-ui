@@ -30,26 +30,18 @@ import {
   Map as MapIcon,
 } from "lucide-react";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
-import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
-import { useSessionSync } from "@/hooks/useSessionSync";
-import { useRealtimeSync } from "@/contexts/realtime-sync-context";
+import { useSimpleMonitoring } from "@/contexts/simple-monitoring-context";
 import { getDevices, getZones, getPoEDevices } from "@/lib/firebase/firestore";
 import { useAuth } from "@/contexts/auth-context";
 import type { Zone } from "@/lib/algo/types";
 
-export default function LiveBroadcastPage() {
+function LiveV2Content() {
   const { user } = useAuth();
   const isDev = process.env.NODE_ENV === 'development';
 
-  // Enable real-time session sync
-  useSessionSync();
-
-  // Get session state to check for multi-input monitoring conflicts
-  const { sessionState, viewingAsUserEmail, viewingAsUserId, syncSessionState } = useRealtimeSync();
-
-  // Get monitoring state from global context
+  // Get monitoring state from CLEAN simple monitoring context
   const {
-    isCapturing,
+    isMonitoring,
     audioLevel,
     playbackAudioLevel,
     selectedInputDevice,
@@ -88,12 +80,8 @@ export default function LiveBroadcastPage() {
     setPlaybackEnabled,
     playbackDelay,
     setPlaybackDelay,
-    playbackDisableDelay,
-    setPlaybackDisableDelay,
-    tailGuardDuration,
-    setTailGuardDuration,
-    postPlaybackGraceDuration,
-    setPostPlaybackGraceDuration,
+    silenceTimeout,
+    setSilenceTimeout,
     playbackRampDuration,
     setPlaybackRampDuration,
     playbackStartVolume,
@@ -102,6 +90,14 @@ export default function LiveBroadcastPage() {
     setPlaybackMaxVolume,
     playbackVolume,
     setPlaybackVolume,
+    playbackRampEnabled,
+    setPlaybackRampEnabled,
+    playbackRampStartVolume,
+    setPlaybackRampStartVolume,
+    playbackRampTargetVolume,
+    setPlaybackRampTargetVolume,
+    playbackSessionRampDuration,
+    setPlaybackSessionRampDuration,
     devices: contextDevices,
     setDevices: setContextDevices,
     setPoeDevices,
@@ -115,52 +111,15 @@ export default function LiveBroadcastPage() {
     emulationNetworkDelay,
     setEmulationNetworkDelay,
     triggerTestCall,
-  } = useAudioMonitoring();
-
-  // When admin is viewing a user, use sessionState for display
-  // Otherwise use local context values
-  const displayState = viewingAsUserId && sessionState ? sessionState : null;
-
-  // Displayed values (what the UI shows)
-  const displayedIsCapturing = displayState?.audioInputMonitoring ?? isCapturing;
-  const displayedAudioLevel = displayState?.audioLevel ?? audioLevel;
-  const displayedPlaybackAudioLevel = displayState?.playbackAudioLevel ?? playbackAudioLevel;
-  const displayedSelectedInputDevice = displayState?.selectedInputDevice ?? selectedInputDevice;
-  const displayedTargetVolume = displayState?.targetVolume ?? targetVolume;
-  const displayedAudioThreshold = displayState?.audioThreshold ?? audioThreshold;
-  const displayedAudioDetected = displayState?.audioDetected ?? audioDetected;
-  const displayedSpeakersEnabled = displayState?.speakersEnabled ?? speakersEnabled;
-  const displayedRampEnabled = displayState?.rampEnabled ?? rampEnabled;
-  const displayedRampDuration = displayState?.rampDuration ?? rampDuration;
-  const displayedDayNightMode = displayState?.dayNightMode ?? dayNightMode;
-  const displayedDayStartHour = displayState?.dayStartHour ?? dayStartHour;
-  const displayedDayEndHour = displayState?.dayEndHour ?? dayEndHour;
-  const displayedNightRampDuration = displayState?.nightRampDuration ?? nightRampDuration;
-  const displayedSustainDuration = displayState?.sustainDuration ?? sustainDuration;
-  const displayedDisableDelay = displayState?.disableDelay ?? disableDelay;
-  const displayedPlaybackDelay = displayState?.playbackDelay ?? playbackDelay;
-  const displayedPlaybackDisableDelay = displayState?.playbackDisableDelay ?? playbackDisableDelay;
-  const displayedTailGuardDuration = displayState?.tailGuardDuration ?? tailGuardDuration;
-  const displayedPostPlaybackGraceDuration = displayState?.postPlaybackGraceDuration ?? postPlaybackGraceDuration;
-  const displayedPlaybackRampDuration = displayState?.playbackRampDuration ?? playbackRampDuration;
-  const displayedPlaybackStartVolume = displayState?.playbackStartVolume ?? playbackStartVolume;
-  const displayedPlaybackMaxVolume = displayState?.playbackMaxVolume ?? playbackMaxVolume;
-  const displayedPlaybackVolume = displayState?.playbackVolume ?? playbackVolume;
-  const displayedSelectedDevices = displayState?.selectedDevices ?? (selectedDevices || []);
-  const displayedLoggingEnabled = displayState?.loggingEnabled ?? loggingEnabled;
-  const displayedRecordingEnabled = displayState?.recordingEnabled ?? recordingEnabled;
-  const displayedPlaybackEnabled = displayState?.playbackEnabled ?? playbackEnabled;
+    onAudioDetected,
+    logs,
+  } = useSimpleMonitoring();
 
   // Safety check: ensure selectedDevices is always an array
-  const safeSelectedDevices = displayedSelectedDevices || [];
+  const safeSelectedDevices = selectedDevices || [];
 
   const [loading, setLoading] = useState(true);
   const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
-
-  // When admin is viewing, use user's available input devices from sessionState
-  const displayedInputDevices = viewingAsUserId && sessionState?.availableInputDevices
-    ? sessionState.availableInputDevices
-    : inputDevices;
   const [editingSpeakerId, setEditingSpeakerId] = useState<string | null>(null);
   const [localMaxVolumes, setLocalMaxVolumes] = useState<Record<string, number>>({});
   const [zones, setZones] = useState<Zone[]>([]);
@@ -172,20 +131,21 @@ export default function LiveBroadcastPage() {
     getInputDevices,
   } = useAudioCapture();
 
+  // Alias isMonitoring as isCapturing for UI compatibility
+  const isCapturing = isMonitoring;
+
   useEffect(() => {
     if (user?.email) {
       loadData();
       loadInputDevices();
     }
-  }, [user?.email, viewingAsUserEmail]); // Reload when user changes or admin switches viewing target
+  }, [user?.email]);
 
   const loadData = async () => {
     if (!user) return;
 
     try {
-      // Filter devices/zones by current user
-      // If admin is viewing as another user, use their email instead
-      const userEmail = viewingAsUserEmail || user.email || "";
+      const userEmail = user.email || "";
 
       const [devicesData, zonesData, poeDevicesData] = await Promise.all([
         getDevices(userEmail),
@@ -207,24 +167,11 @@ export default function LiveBroadcastPage() {
     setInputDevices(devices);
   };
 
-  // Sync input devices to session when they change (so admin can see user's available inputs)
-  useEffect(() => {
-    if (inputDevices.length > 0 && !viewingAsUserId) {
-      // Only sync if we're the user (not admin viewing)
-      syncSessionState({
-        availableInputDevices: inputDevices.map(d => ({
-          deviceId: d.deviceId,
-          label: d.label || `Input ${d.deviceId.slice(0, 8)}`,
-        })),
-      });
-    }
-  }, [inputDevices, viewingAsUserId, syncSessionState]);
-
   const toggleDevice = (deviceId: string) => {
     const newDevices = safeSelectedDevices.includes(deviceId)
       ? safeSelectedDevices.filter((id) => id !== deviceId)
       : [...selectedDevices, deviceId];
-    console.log('[Live] Device selection changed:', newDevices);
+    console.log('[Live V2] Device selection changed:', newDevices);
     setSelectedDevices(newDevices);
   };
 
@@ -259,45 +206,43 @@ export default function LiveBroadcastPage() {
     );
     const deviceIds = devicesInZones.map(d => d.id);
 
-    console.log('[Live] Zone selection changed:', zoneIds);
-    console.log('[Live] Speakers in selected zones:', deviceIds);
+    console.log('[Live V2] Zone selection changed:', zoneIds);
+    console.log('[Live V2] Speakers in selected zones:', deviceIds);
 
     // Update selected devices
     setSelectedDevices(deviceIds);
 
     // If monitoring is active, dynamically update speaker states
-    // IMPORTANT: We NEVER touch the paging device (8301) - it stays in sending mode
-    // We ONLY enable/disable individual speakers based on zone selection
-    if (displayedIsCapturing) {
-      console.log('[Live] Monitoring is active - dynamically updating SPEAKERS ONLY (paging device untouched)');
+    if (isCapturing) {
+      console.log('[Live V2] Monitoring is active - dynamically updating SPEAKERS ONLY');
 
-      // Get all speakers (exclude paging devices - we NEVER control those)
+      // Get all speakers (exclude paging devices)
       const allSpeakers = contextDevices.filter(d => d.type !== "8301");
 
-      // Disable speakers NOT in selected zones (volume → 0, multicast → none)
+      // Disable speakers NOT in selected zones
       const speakersToDisable = allSpeakers.filter(s => !deviceIds.includes(s.id));
       for (const speaker of speakersToDisable) {
-        console.log(`[Live] Disabling speaker ${speaker.name} (not in selected zones)`);
+        console.log(`[Live V2] Disabling speaker ${speaker.name}`);
         await controlSingleSpeaker(speaker.id, false);
       }
 
-      // Enable speakers in selected zones (multicast → enabled, volume applied)
+      // Enable speakers in selected zones
       const speakersToEnable = allSpeakers.filter(s => deviceIds.includes(s.id));
       for (const speaker of speakersToEnable) {
-        console.log(`[Live] Enabling speaker ${speaker.name} (in selected zones)`);
+        console.log(`[Live V2] Enabling speaker ${speaker.name}`);
         await controlSingleSpeaker(speaker.id, true);
       }
 
-      console.log(`[Live] Zone switch complete - ${speakersToEnable.length} speakers ON, ${speakersToDisable.length} speakers OFF`);
+      console.log(`[Live V2] Zone switch complete - ${speakersToEnable.length} speakers ON, ${speakersToDisable.length} speakers OFF`);
     }
   };
 
-  // Determine if currently in day or night mode (supports half-hour intervals)
+  // Determine if currently in day or night mode
   const now = new Date();
   const currentHour = now.getHours();
   const currentMinute = now.getMinutes();
   const currentTime = currentHour + (currentMinute >= 30 ? 0.5 : 0);
-  const isDaytime = currentTime >= displayedDayStartHour && currentTime < displayedDayEndHour;
+  const isDaytime = currentTime >= dayStartHour && currentTime < dayEndHour;
 
   if (loading) {
     return (
@@ -316,15 +261,16 @@ export default function LiveBroadcastPage() {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold text-[var(--text-primary)]">Audio Input</h1>
-            <p className="text-[var(--text-secondary)] text-sm">
-              Monitor audio and automatically control speaker activation
-            </p>
+            <div className="text-[var(--text-secondary)] text-sm flex items-center gap-2">
+              <Badge variant="secondary" className="text-xs">Clean Architecture</Badge>
+              <span>Producer/Consumer pattern • 5s batches • Configurable silence timeout</span>
+            </div>
           </div>
-          {displayedIsCapturing && (
+          {isCapturing && (
             <div className="flex items-center gap-3">
-              <Badge variant={displayedSpeakersEnabled ? "destructive" : "success"} className="px-3 py-1">
-                <div className={`w-2 h-2 rounded-full mr-2 ${displayedSpeakersEnabled ? "bg-white animate-blink" : "bg-white"}`} />
-                {displayedSpeakersEnabled ? "Broadcasting" : "Standby"}
+              <Badge variant={speakersEnabled ? "destructive" : "success"} className="px-3 py-1">
+                <div className={`w-2 h-2 rounded-full mr-2 ${speakersEnabled ? "bg-white animate-blink" : "bg-white"}`} />
+                {speakersEnabled ? "Broadcasting" : "Standby"}
               </Badge>
             </div>
           )}
@@ -340,20 +286,6 @@ export default function LiveBroadcastPage() {
         <div className="grid gap-6 lg:grid-cols-3">
           {/* Left Column - Audio Input & VU Meter */}
           <div className="space-y-6 lg:col-span-2">
-            {/* Warning if multi-input is active */}
-            {sessionState?.multiInputMonitoring && (
-              <Card className="border-orange-500 bg-orange-50 dark:bg-orange-950">
-                <CardContent className="pt-6">
-                  <div className="flex items-center gap-2">
-                    <AlertTriangle className="h-5 w-5 text-orange-600" />
-                    <span className="text-orange-700 dark:text-orange-300 font-semibold">
-                      Multi-Input Routing is currently active. Audio Input monitoring is disabled.
-                    </span>
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
             {/* Audio Level Display */}
             <Card>
               <CardHeader className="pb-4">
@@ -364,19 +296,12 @@ export default function LiveBroadcastPage() {
                     </div>
                     <CardTitle>Audio Monitor</CardTitle>
                   </div>
-                  {!displayedIsCapturing ? (
+                  {!isCapturing ? (
                     <Button
                       onClick={() => {
-                        // Check if multi-input monitoring is active
-                        if (sessionState?.multiInputMonitoring) {
-                          alert('Cannot start audio input monitoring: Multi-Input Routing is currently active. Please stop multi-input monitoring first.');
-                          return;
-                        }
-                        console.log('[Live] User clicked Start Monitoring');
-                        startMonitoring(displayedSelectedInputDevice || undefined);
+                        console.log('[Live V2] User clicked Start Monitoring');
+                        startMonitoring();
                       }}
-                      disabled={sessionState?.multiInputMonitoring}
-                      title={sessionState?.multiInputMonitoring ? 'Multi-Input Routing is active' : ''}
                     >
                       <Mic className="mr-2 h-4 w-4" />
                       Start Monitoring
@@ -385,7 +310,7 @@ export default function LiveBroadcastPage() {
                     <Button
                       variant="destructive"
                       onClick={() => {
-                        console.log('[Live] User clicked Stop Monitoring');
+                        console.log('[Live V2] User clicked Stop Monitoring');
                         stopMonitoring();
                       }}
                     >
@@ -401,21 +326,21 @@ export default function LiveBroadcastPage() {
                   <div className="flex items-center justify-between mb-4">
                     <span className="text-sm font-semibold text-[var(--text-secondary)]">Input Level</span>
                     <span className="text-sm font-mono text-[var(--accent-blue)]">
-                      {displayedIsCapturing ? `${displayedAudioLevel.toFixed(1)}%` : "-- %"}
+                      {isCapturing ? `${audioLevel.toFixed(1)}%` : "-- %"}
                     </span>
                   </div>
-                  <VUMeter level={displayedIsCapturing ? displayedAudioLevel : 0} barCount={24} showPeakHold={false} />
+                  <VUMeter level={isCapturing ? audioLevel : 0} barCount={24} showPeakHold={false} />
 
                   {/* Threshold indicator */}
                   <div className="mt-4 flex items-center gap-2">
                     <div className="flex-1 h-1 bg-[var(--bg-tertiary)] rounded relative">
                       <div
                         className="absolute top-0 bottom-0 w-0.5 bg-[var(--accent-orange)]"
-                        style={{ left: `${displayedAudioThreshold * 2}%` }}
+                        style={{ left: `${audioThreshold * 2}%` }}
                       />
                     </div>
                     <span className="text-xs text-[var(--text-muted)]">
-                      Threshold: {displayedAudioThreshold}%
+                      Threshold: {audioThreshold}%
                     </span>
                   </div>
                 </div>
@@ -426,16 +351,16 @@ export default function LiveBroadcastPage() {
                     <div className="flex items-center justify-between mb-4">
                       <span className="text-sm font-semibold text-[var(--text-secondary)]">Playback Level</span>
                       <span className="text-sm font-mono text-[var(--accent-green)]">
-                        {displayedPlaybackAudioLevel > 0 ? `${displayedPlaybackAudioLevel.toFixed(1)}%` : "-- %"}
+                        {playbackAudioLevel > 0 ? `${playbackAudioLevel.toFixed(1)}%` : "-- %"}
                       </span>
                     </div>
-                    <VUMeter level={displayedPlaybackAudioLevel} barCount={24} showPeakHold={false} />
+                    <VUMeter level={playbackAudioLevel} barCount={24} showPeakHold={false} />
 
                     {/* Playback status */}
                     <div className="mt-4 flex items-center gap-2">
-                      <div className={`w-2 h-2 rounded-full ${displayedPlaybackAudioLevel > 0 ? 'bg-[var(--accent-green)] animate-pulse' : 'bg-[var(--text-muted)]'}`}></div>
+                      <div className={`w-2 h-2 rounded-full ${playbackAudioLevel > 0 ? 'bg-[var(--accent-green)] animate-pulse' : 'bg-[var(--text-muted)]'}`}></div>
                       <span className="text-xs text-[var(--text-muted)]">
-                        {displayedPlaybackAudioLevel > 0 ? "Playing to system audio" : "No playback"}
+                        {playbackAudioLevel > 0 ? "Playing to system audio" : "No playback"}
                       </span>
                     </div>
 
@@ -444,19 +369,95 @@ export default function LiveBroadcastPage() {
                       <div className="flex items-center justify-between mb-2">
                         <Label className="text-sm">Playback Volume</Label>
                         <span className="text-sm font-mono text-[var(--accent-green)]">
-                          {(displayedPlaybackVolume * 100).toFixed(0)}%
+                          {(playbackVolume * 100).toFixed(0)}%
                         </span>
                       </div>
                       <Slider
                         min={0}
                         max={2}
                         step={0.05}
-                        value={displayedPlaybackVolume}
+                        value={playbackVolume}
                         onChange={(e) => setPlaybackVolume(parseFloat(e.target.value))}
                       />
                       <p className="text-xs text-[var(--text-muted)] mt-2">
                         0% = mute, 100% = normal, 200% = amplified
                       </p>
+                    </div>
+
+                    {/* Playback Volume Ramping */}
+                    <div className="mt-4 pt-4 border-t border-[var(--border-color)] space-y-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <Label className="text-sm">Session Volume Ramp</Label>
+                          <p className="text-xs text-[var(--text-muted)]">Fade in volume at start of each session</p>
+                        </div>
+                        <Switch
+                          checked={playbackRampEnabled}
+                          onCheckedChange={setPlaybackRampEnabled}
+                        />
+                      </div>
+
+                      {playbackRampEnabled && (
+                        <div className="space-y-4 p-3 rounded-lg bg-[var(--accent-blue)]/5 border border-[var(--accent-blue)]/20">
+                          {/* Start Volume */}
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <Label className="text-xs">Start Volume</Label>
+                              <span className="text-xs font-mono text-[var(--accent-blue)]">
+                                {(playbackRampStartVolume * 100).toFixed(0)}%
+                              </span>
+                            </div>
+                            <Slider
+                              min={0}
+                              max={2}
+                              step={0.05}
+                              value={playbackRampStartVolume}
+                              onChange={(e) => setPlaybackRampStartVolume(parseFloat(e.target.value))}
+                            />
+                          </div>
+
+                          {/* Target Volume */}
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <Label className="text-xs">Target Volume</Label>
+                              <span className="text-xs font-mono text-[var(--accent-green)]">
+                                {(playbackRampTargetVolume * 100).toFixed(0)}%
+                              </span>
+                            </div>
+                            <Slider
+                              min={0}
+                              max={2}
+                              step={0.05}
+                              value={playbackRampTargetVolume}
+                              onChange={(e) => setPlaybackRampTargetVolume(parseFloat(e.target.value))}
+                            />
+                          </div>
+
+                          {/* Ramp Duration */}
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <Label className="text-xs">Ramp Duration</Label>
+                              <span className="text-xs font-mono text-[var(--accent-purple)]">
+                                {(playbackSessionRampDuration / 1000).toFixed(1)}s
+                              </span>
+                            </div>
+                            <Slider
+                              min={0}
+                              max={5000}
+                              step={100}
+                              value={playbackSessionRampDuration}
+                              onChange={(e) => setPlaybackSessionRampDuration(parseInt(e.target.value))}
+                            />
+                          </div>
+
+                          <div className="flex items-start gap-2 p-2 rounded bg-[var(--accent-blue)]/10">
+                            <span className="text-xs">🎚️</span>
+                            <p className="text-xs text-[var(--text-secondary)]">
+                              <strong>Example:</strong> 0% → 200% over 2s = dramatic fade-in at start of each session
+                            </p>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
@@ -464,19 +465,19 @@ export default function LiveBroadcastPage() {
                 {/* Status Grid */}
                 <div className="grid grid-cols-3 gap-4">
                   <div className="p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)] text-center">
-                    <div className={`w-3 h-3 rounded-full mx-auto mb-2 ${displayedIsCapturing ? "bg-[var(--accent-green)]" : "bg-[var(--text-muted)]"}`} />
+                    <div className={`w-3 h-3 rounded-full mx-auto mb-2 ${isCapturing ? "bg-[var(--accent-green)]" : "bg-[var(--text-muted)]"}`} />
                     <div className="text-xs text-[var(--text-muted)]">Monitoring</div>
-                    <div className="text-sm font-semibold text-[var(--text-primary)]">{displayedIsCapturing ? "Active" : "Off"}</div>
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">{isCapturing ? "Active" : "Off"}</div>
                   </div>
                   <div className="p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)] text-center">
-                    <div className={`w-3 h-3 rounded-full mx-auto mb-2 ${displayedAudioDetected ? "bg-[var(--accent-orange)]" : "bg-[var(--text-muted)]"}`} />
+                    <div className={`w-3 h-3 rounded-full mx-auto mb-2 ${audioDetected ? "bg-[var(--accent-orange)]" : "bg-[var(--text-muted)]"}`} />
                     <div className="text-xs text-[var(--text-muted)]">Audio</div>
-                    <div className="text-sm font-semibold text-[var(--text-primary)]">{displayedAudioDetected ? "Detected" : "Silent"}</div>
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">{audioDetected ? "Detected" : "Silent"}</div>
                   </div>
                   <div className="p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)] text-center">
-                    <div className={`w-3 h-3 rounded-full mx-auto mb-2 ${displayedSpeakersEnabled ? "bg-[var(--accent-red)] animate-blink" : "bg-[var(--text-muted)]"}`} />
+                    <div className={`w-3 h-3 rounded-full mx-auto mb-2 ${speakersEnabled ? "bg-[var(--accent-red)] animate-blink" : "bg-[var(--text-muted)]"}`} />
                     <div className="text-xs text-[var(--text-muted)]">Speakers</div>
-                    <div className="text-sm font-semibold text-[var(--text-primary)]">{displayedSpeakersEnabled ? "On" : "Off"}</div>
+                    <div className="text-sm font-semibold text-[var(--text-primary)]">{speakersEnabled ? "On" : "Off"}</div>
                   </div>
                 </div>
 
@@ -484,11 +485,11 @@ export default function LiveBroadcastPage() {
                 <div className="space-y-2">
                   <Label>Input Device</Label>
                   <Select
-                    value={displayedSelectedInputDevice}
+                    value={selectedInputDevice || ""}
                     onChange={(e) => setInputDevice(e.target.value)}
                   >
                     <option value="">Default Input</option>
-                    {displayedInputDevices.map((device) => (
+                    {inputDevices.map((device) => (
                       <option key={device.deviceId} value={device.deviceId}>
                         {device.label || `Input ${device.deviceId.slice(0, 8)}`}
                       </option>
@@ -498,7 +499,7 @@ export default function LiveBroadcastPage() {
               </CardContent>
             </Card>
 
-            {/* Emulation Mode - Testing without physical devices */}
+            {/* Emulation Mode */}
             <Card className="border-[var(--accent-cyan)]/30">
               <CardHeader>
                 <div className="flex items-center gap-3">
@@ -596,15 +597,6 @@ export default function LiveBroadcastPage() {
                         </p>
                       )}
                     </div>
-
-                    <div className="text-xs text-[var(--text-muted)] space-y-1">
-                      <p className="font-semibold text-[var(--accent-cyan)]">Test Scenarios:</p>
-                      <p>✅ Concurrent ops: Set delay to 20s, start monitoring, then trigger call while polling</p>
-                      <p>✅ TailGuard & Grace periods validation</p>
-                      <p>✅ Batch recording & playback flow</p>
-                      <p>✅ Error handling (API failures expected)</p>
-                      <p>✅ No physical devices required</p>
-                    </div>
                   </div>
                 )}
               </CardContent>
@@ -673,13 +665,11 @@ export default function LiveBroadcastPage() {
                         .filter(d => d.type !== "8301")
                         .map((speaker) => {
                           const isEditing = editingSpeakerId === speaker.id;
-                          // Display as 0-10 level, store as 0-100%
                           const storedMaxVolume = speaker.maxVolume ?? 100;
                           const displayLevel = Math.round(storedMaxVolume / 10);
                           const localLevel = localMaxVolumes[speaker.id] !== undefined
                             ? Math.round(localMaxVolumes[speaker.id] / 10)
                             : displayLevel;
-                          // Get speaker status
                           const speakerStatus = speakerStatuses.find(s => s.speakerId === speaker.id);
 
                           return (
@@ -748,7 +738,6 @@ export default function LiveBroadcastPage() {
                                     value={localLevel}
                                     onChange={(e) => {
                                       const level = parseInt(e.target.value);
-                                      // Convert 0-10 to 0-100% for storage
                                       setLocalMaxVolumes(prev => ({
                                         ...prev,
                                         [speaker.id]: level * 10
@@ -770,7 +759,7 @@ export default function LiveBroadcastPage() {
                                           await updateDevice(speaker.id, { maxVolume: volumeToSave });
                                           speaker.maxVolume = volumeToSave;
                                           setEditingSpeakerId(null);
-                                          await loadData(); // Refresh devices
+                                          await loadData();
                                         } catch (error) {
                                           console.error("Failed to update max volume:", error);
                                           alert("Failed to save max volume");
@@ -810,7 +799,7 @@ export default function LiveBroadcastPage() {
                   </div>
                   <div>
                     <CardTitle>Detection Settings</CardTitle>
-                    {displayedIsCapturing && (
+                    {isCapturing && (
                       <span className="text-xs text-[var(--accent-green)]">Live adjustable</span>
                     )}
                   </div>
@@ -821,12 +810,12 @@ export default function LiveBroadcastPage() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <Label>Audio Threshold</Label>
-                    <span className="text-sm font-mono text-[var(--accent-blue)]">{displayedAudioThreshold}%</span>
+                    <span className="text-sm font-mono text-[var(--accent-blue)]">{audioThreshold}%</span>
                   </div>
                   <Slider
                     min={0}
                     max={50}
-                    value={displayedAudioThreshold}
+                    value={audioThreshold}
                     onChange={(e) => setAudioThreshold(parseInt(e.target.value))}
                   />
                   <p className="text-xs text-[var(--text-muted)]">
@@ -838,13 +827,13 @@ export default function LiveBroadcastPage() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <Label>Sustain Duration</Label>
-                    <span className="text-sm font-mono text-[var(--accent-blue)]">{displayedSustainDuration >= 1000 ? `${(displayedSustainDuration / 1000).toFixed(1)}s` : `${displayedSustainDuration}ms`}</span>
+                    <span className="text-sm font-mono text-[var(--accent-blue)]">{sustainDuration >= 1000 ? `${(sustainDuration / 1000).toFixed(1)}s` : `${sustainDuration}ms`}</span>
                   </div>
                   <Slider
                     min={10}
                     max={3000}
                     step={10}
-                    value={displayedSustainDuration}
+                    value={sustainDuration}
                     onChange={(e) => setSustainDuration(parseInt(e.target.value))}
                   />
                   <p className="text-xs text-[var(--text-muted)]">
@@ -852,122 +841,57 @@ export default function LiveBroadcastPage() {
                   </p>
                 </div>
 
-                {/* Disable Delay - Only show when playback is DISABLED */}
-                {!displayedPlaybackEnabled && (
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between">
-                      <Label>Disable Delay</Label>
-                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedDisableDelay / 1000).toFixed(0)}s</span>
-                    </div>
-                    <Slider
-                      min={1000}
-                      max={30000}
-                      step={1000}
-                      value={displayedDisableDelay}
-                      onChange={(e) => setDisableDelay(parseInt(e.target.value))}
-                    />
-                    <p className="text-xs text-[var(--text-muted)]">
-                      Wait before disabling speakers after silence
-                    </p>
-                  </div>
-                )}
-
-                {/* Playback Delay - Only show when playback is enabled */}
-                {displayedPlaybackEnabled && (
+                {/* Playback Delay */}
+                {playbackEnabled && (
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
                       <Label>Playback Delay</Label>
-                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedPlaybackDelay / 1000).toFixed(1)}s</span>
+                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(playbackDelay / 1000).toFixed(1)}s</span>
                     </div>
                     <Slider
                       min={0}
                       max={10000}
                       step={100}
-                      value={displayedPlaybackDelay}
+                      value={playbackDelay}
                       onChange={(e) => setPlaybackDelay(parseInt(e.target.value))}
                     />
                     <p className="text-xs text-[var(--text-muted)]">
                       Wait after paging device is ready before starting playback
                     </p>
-                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-green)]/10 border border-[var(--accent-green)]/30">
-                      <span className="text-xs">✅</span>
-                      <p className="text-xs text-[var(--text-secondary)]">
-                        <strong>Smart Shutdown:</strong> After starting playback, paging stays ON until playback completes, then automatically shuts down.
-                      </p>
-                    </div>
                   </div>
                 )}
 
-                {/* Playback Disable Delay - Only show when playback is enabled */}
-                {displayedPlaybackEnabled && (
+                {/* Silence Timeout - KEY DIFFERENTIATOR */}
+                {playbackEnabled && (
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
-                      <Label>Playback Disable Delay</Label>
-                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(displayedPlaybackDisableDelay / 1000).toFixed(1)}s</span>
+                      <Label className="flex items-center gap-2">
+                        Silence Timeout
+                        <Badge variant="default" className="text-xs">Clean Architecture</Badge>
+                      </Label>
+                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(silenceTimeout / 1000).toFixed(1)}s</span>
                     </div>
                     <Slider
                       min={0}
-                      max={10000}
-                      step={100}
-                      value={displayedPlaybackDisableDelay}
-                      onChange={(e) => setPlaybackDisableDelay(parseInt(e.target.value))}
+                      max={30000}
+                      step={1000}
+                      value={silenceTimeout}
+                      onChange={(e) => setSilenceTimeout(parseInt(e.target.value))}
                     />
                     <p className="text-xs text-[var(--text-muted)]">
-                      Wait after silence detected before stopping recording (replaces Disable Delay when playback enabled)
+                      How long to wait after silence before stopping batching. 0s = new session per pause, higher = more forgiving pauses in same session.
                     </p>
-                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-blue)]/10 border border-[var(--accent-blue)]/30">
-                      <span className="text-xs">💡</span>
-                      <p className="text-xs text-[var(--text-secondary)]">
-                        <strong>Smart Timing:</strong> This delay ensures complete audio capture for playback. Longer = more complete recordings, but slower shutdown.
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                {/* Grace Period Settings - Only show when playback is enabled */}
-                {displayedPlaybackEnabled && (
-                  <div className="space-y-6 pt-6 border-t border-[var(--border-color)]">
-                    <div className="text-sm font-semibold text-[var(--text-secondary)]">Grace Period Settings</div>
-
-                    {/* TailGuard Duration */}
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <Label>TailGuard Duration</Label>
-                        <span className="text-sm font-mono text-[var(--accent-purple)]">{displayedTailGuardDuration}ms</span>
-                      </div>
-                      <Slider
-                        min={0}
-                        max={10000}
-                        step={100}
-                        value={displayedTailGuardDuration}
-                        onChange={(e) => setTailGuardDuration(parseInt(e.target.value))}
-                      />
-                      <p className="text-xs text-[var(--text-muted)]">
-                        Grace window after silence timeout to catch late audio (e.g., "...HELP!")
-                      </p>
-                    </div>
-
-                    {/* Post-Playback Grace Duration */}
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <Label>Post-Playback Grace</Label>
-                        <span className="text-sm font-mono text-[var(--accent-orange)]">{displayedPostPlaybackGraceDuration}ms</span>
-                      </div>
-                      <Slider
-                        min={0}
-                        max={5000}
-                        step={50}
-                        value={displayedPostPlaybackGraceDuration}
-                        onChange={(e) => setPostPlaybackGraceDuration(parseInt(e.target.value))}
-                      />
-                      <p className="text-xs text-[var(--text-muted)]">
-                        Grace window after playback ends to catch quick responses (e.g., "Hello?")
-                      </p>
-                      <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-purple)]/10 border border-[var(--accent-purple)]/30">
-                        <span className="text-xs">🛡️</span>
-                        <p className="text-xs text-[var(--text-secondary)]">
-                          <strong>Extended Grace:</strong> Both grace periods stay active during hardware deactivation to catch audio spoken during shutdown.
-                        </p>
+                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-green)]/10 border border-[var(--accent-green)]/30">
+                      <span className="text-xs">✨</span>
+                      <div className="text-xs text-[var(--text-secondary)] space-y-1">
+                        <p><strong>Clean Architecture Benefits:</strong></p>
+                        <ul className="list-disc list-inside ml-2 space-y-0.5">
+                          <li>No TailGuard complexity</li>
+                          <li>No grace periods</li>
+                          <li>Recording never blocks on playback</li>
+                          <li>Playback never blocks on recording</li>
+                          <li>Natural session batching based on silence</li>
+                        </ul>
                       </div>
                     </div>
                   </div>
@@ -993,34 +917,53 @@ export default function LiveBroadcastPage() {
                       Log audio events to the activity viewer
                     </p>
                   </div>
-                  <Switch checked={displayedLoggingEnabled} onCheckedChange={setLoggingEnabled} />
+                  <Switch checked={loggingEnabled} onCheckedChange={setLoggingEnabled} />
                 </div>
 
                 <div className="flex items-center justify-between p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
                   <div>
                     <Label className="!text-[var(--text-primary)]">Save Recording</Label>
                     <p className="text-xs text-[var(--text-muted)]">
-                      {displayedRecordingEnabled
+                      {recordingEnabled
                         ? "Save audio clips to Firebase Storage"
                         : "Temporary only - recordings not saved"}
                     </p>
                   </div>
-                  <Switch checked={displayedRecordingEnabled} onCheckedChange={setRecordingEnabled} />
+                  <Switch checked={recordingEnabled} onCheckedChange={setRecordingEnabled} />
                 </div>
 
                 <div className="flex items-center justify-between p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
                   <div>
                     <Label className="!text-[var(--text-primary)]">Live Playback</Label>
                     <p className="text-xs text-[var(--text-muted)]">
-                      {displayedPlaybackEnabled
+                      {playbackEnabled
                         ? "Play recorded audio through system in real-time"
                         : "Disabled - no live playback"}
                     </p>
                   </div>
                   <Switch
-                    checked={displayedPlaybackEnabled}
+                    checked={playbackEnabled}
                     onCheckedChange={setPlaybackEnabled}
                   />
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Activity Log - View in /activity page or browser console */}
+            <Card>
+              <CardHeader>
+                <CardTitle>Activity Log</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-2 text-sm text-[var(--text-muted)]">
+                  <p>📊 Activity logs are available in:</p>
+                  <ul className="list-disc list-inside space-y-1 ml-2">
+                    <li>Browser Console (F12)</li>
+                    <li><Link href="/activity" className="text-[var(--accent-blue)] hover:underline">Activity Viewer Page</Link></li>
+                  </ul>
+                  <p className="text-xs mt-3">
+                    Using the same logging infrastructure as /live page for consistency.
+                  </p>
                 </div>
               </CardContent>
             </Card>
@@ -1211,13 +1154,17 @@ export default function LiveBroadcastPage() {
                 <div className="space-y-3 text-sm">
                   <div className="flex items-center justify-between">
                     <span className="text-[var(--text-muted)]">Status</span>
-                    <Badge variant={displayedIsCapturing ? "success" : "secondary"}>
-                      {displayedIsCapturing ? "Active" : "Inactive"}
+                    <Badge variant={isCapturing ? "success" : "secondary"}>
+                      {isCapturing ? "Active" : "Inactive"}
                     </Badge>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-[var(--text-muted)]">Devices</span>
                     <span className="font-semibold text-[var(--text-primary)]">{safeSelectedDevices.length} selected</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-[var(--text-muted)]">Architecture</span>
+                    <Badge variant="secondary">Producer/Consumer</Badge>
                   </div>
                 </div>
               </CardContent>
@@ -1237,15 +1184,20 @@ export default function LiveBroadcastPage() {
                     <div className="truncate" title={selectedInputDevice || 'Default'}>
                       Input: {selectedInputDevice || 'Default'}
                     </div>
-                    <div>Monitoring: {displayedIsCapturing ? 'Active' : 'Stopped'}</div>
+                    <div>Monitoring: {isCapturing ? 'Active' : 'Stopped'}</div>
+                    <div>Silence Timeout: {silenceTimeout}ms</div>
                   </div>
                 </CardContent>
               </Card>
             )}
           </div>
         </div>
-
       </div>
     </AppLayout>
   );
+}
+
+
+export default function LiveV2Page() {
+  return <LiveV2Content />;
 }

@@ -75,6 +75,7 @@ export interface SessionState {
   playbackRampDuration: number;
   playbackStartVolume: number;
   playbackMaxVolume: number;
+  playbackVolume: number;
 
   // Real-time audio state (for display only)
   audioLevel: number;

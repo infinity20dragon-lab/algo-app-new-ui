@@ -172,6 +172,8 @@ interface AudioMonitoringContextType {
   setPlaybackStartVolume: (volume: number) => void;
   playbackMaxVolume: number;
   setPlaybackMaxVolume: (volume: number) => void;
+  playbackVolume: number; // Used when ramp is disabled
+  setPlaybackVolume: (volume: number) => void;
 
   // Emergency Controls
   emergencyKillAll: () => Promise<void>;
@@ -181,6 +183,13 @@ interface AudioMonitoringContextType {
   // Speaker Status Tracking
   speakerStatuses: SpeakerStatus[];
   checkSpeakerConnectivity: () => Promise<void>;
+
+  // Emulation Mode (for testing without physical devices)
+  emulationMode: boolean;
+  setEmulationMode: (enabled: boolean) => void;
+  emulationNetworkDelay: number; // Network delay in ms (simulates slow polling)
+  setEmulationNetworkDelay: (delay: number) => void;
+  triggerTestCall: (durationSeconds?: number) => void;
 }
 
 const AudioMonitoringContext = createContext<AudioMonitoringContextType | null>(null);
@@ -292,6 +301,7 @@ const STORAGE_KEYS = {
   PLAYBACK_RAMP_DURATION: 'algo_live_playback_ramp_duration',
   PLAYBACK_START_VOLUME: 'algo_live_playback_start_volume',
   PLAYBACK_MAX_VOLUME: 'algo_live_playback_max_volume',
+  PLAYBACK_VOLUME: 'algo_live_playback_volume',
   LAST_CONSOLE_CLEAR: 'algo_live_last_console_clear',
 };
 
@@ -324,6 +334,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [playbackRampDuration, setPlaybackRampDuration] = useState(2000); // 2s default (was nightRampDuration in ms)
   const [playbackStartVolume, setPlaybackStartVolume] = useState(0); // 0 = silent start
   const [playbackMaxVolume, setPlaybackMaxVolume] = useState(1.0); // 1.0 = 100% volume
+  const [playbackVolume, setPlaybackVolume] = useState(0.6); // Used when ramp is disabled (0.6 = 60%)
 
   // Speaker status tracking
   const [speakerStatuses, setSpeakerStatuses] = useState<SpeakerStatus[]>([]);
@@ -337,6 +348,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   const [nightRampDuration, setNightRampDurationState] = useState(10); // 10 seconds for night
   const [sustainDuration, setSustainDurationState] = useState(50); // 50ms default for faster detection (in ms)
   const [disableDelay, setDisableDelayState] = useState(3000); // 3 seconds default (in ms)
+
+  // Emulation mode state
+  const [emulationMode, setEmulationModeState] = useState(false);
+  const [emulationNetworkDelay, setEmulationNetworkDelay] = useState(0); // Network delay in ms (0 = instant)
+  const testCallTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const testCallOscillatorRef = useRef<OscillatorNode | null>(null);
+  const testCallContextRef = useRef<AudioContext | null>(null);
 
   const audioDetectionTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const controllingSpakersRef = useRef<boolean>(false);
@@ -413,8 +431,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Always log to console for debugging
     debugLog(`[AudioLog] ${logEntry.message}`, logEntry);
 
-    // Only add to logs if logging is enabled AND user is NOT admin
-    if (!loggingEnabled || isAdmin) return;
+    // Only add to logs if logging is enabled (admins included now!)
+    if (!loggingEnabled) return;
 
     // Add to local state for backward compatibility
     setLogs(prev => {
@@ -426,8 +444,8 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       return newLogs;
     });
 
-    // Write to Firebase Realtime Database (only for non-admin users)
-    if (user && !isAdmin) {
+    // Write to Firebase Realtime Database (including admin users)
+    if (user) {
       const logRef = dbRef(realtimeDb, `logs/${user.uid}/${dateKey}`);
       const newLogRef = push(logRef);
 
@@ -1210,6 +1228,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setPlaybackMaxVolume(parseFloat(savedPlaybackMaxVolume));
       }
 
+      const savedPlaybackVolume = localStorage.getItem(STORAGE_KEYS.PLAYBACK_VOLUME);
+      if (savedPlaybackVolume !== null) {
+        setPlaybackVolume(parseFloat(savedPlaybackVolume));
+      }
+
       // Mark as restored
       setTimeout(() => {
         hasRestoredStateRef.current = true;
@@ -1377,6 +1400,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     localStorage.setItem(STORAGE_KEYS.PLAYBACK_MAX_VOLUME, playbackMaxVolume.toString());
   }, [playbackMaxVolume]);
 
+  useEffect(() => {
+    if (!hasRestoredStateRef.current) return;
+    debugLog('[AudioMonitoring] Saving playback volume (ramp disabled):', playbackVolume);
+    localStorage.setItem(STORAGE_KEYS.PLAYBACK_VOLUME, playbackVolume.toString());
+  }, [playbackVolume]);
+
   // Daily console clear for long-running sessions (clears at midnight PST)
   useEffect(() => {
     const checkConsoleClear = () => {
@@ -1399,10 +1428,17 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         localStorage.setItem(STORAGE_KEYS.LAST_CONSOLE_CLEAR, pstDateString);
 
         // Small delay to ensure logs are visible
-        setTimeout(() => {
+        setTimeout(async () => {
           console.clear();
           console.log('✅ [System] Console cleared at midnight PST - logs reset for new day');
           console.log(`📅 Date: ${pstDateString}`);
+
+          // Also clear the terminal where dev server is running
+          try {
+            await fetch('/api/clear-terminal', { method: 'POST' });
+          } catch (error) {
+            // Silently fail if API not available
+          }
         }, 1000);
       }
     };
@@ -1501,6 +1537,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       }
     }
 
+    // 🧪 EMULATION MODE: Skip actual network calls to speakers
+    if (emulationMode) {
+      debugLog(`[AudioMonitoring] 🧪 EMULATION: Simulated setting ${linkedSpeakerIds.size} speakers to ${volumePercent}%`);
+      return;
+    }
+
     debugLog(`[AudioMonitoring] setDevicesVolume(${volumePercent}%) - processing ${linkedSpeakerIds.size} speakers`);
 
     const volumePromises = Array.from(linkedSpeakerIds).map(async (speakerId) => {
@@ -1569,7 +1611,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     // Use allSettled to continue even if some speakers fail
     await Promise.allSettled(volumePromises);
     debugLog(`[AudioMonitoring] setDevicesVolume(${volumePercent}%) - completed`);
-  }, [selectedDevices, devices]);
+  }, [selectedDevices, devices, emulationMode, debugLog, getIdleVolumeString]);
 
   // Helper function to determine if it's currently daytime (supports half-hour intervals)
   const isDaytime = useCallback(() => {
@@ -1930,6 +1972,18 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     const multicastIP = active ? "224.0.2.60:50002" : "224.0.2.60:50022";
     const mode = active ? "active" : "idle";
 
+    // 🧪 EMULATION MODE: Skip actual API calls
+    if (emulationMode) {
+      debugLog(`[AudioMonitoring] 🧪 EMULATION: Simulating speaker IP change to ${mode} mode (${multicastIP})`);
+      if (emulationNetworkDelay > 0) {
+        debugLog(`[AudioMonitoring] 🧪 EMULATION: Simulating ${emulationNetworkDelay}ms network delay (polling)...`);
+      }
+      // Simulate network/polling delay
+      await new Promise(resolve => setTimeout(resolve, emulationNetworkDelay || 100));
+      debugLog(`[AudioMonitoring] 🧪 EMULATION: Speaker IP change complete`);
+      return;
+    }
+
     // DON'T touch paging devices - change speakers linked to selected paging devices!
     const selectedPagingDevices = devices.filter(d =>
       d.type === "8301" && selectedDevices.includes(d.id)
@@ -2063,7 +2117,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         message: `Speakers ${mode} mode activated (${multicastIP})${ipVerified ? ' (verified)' : ' (unverified)'}`,
       });
     }
-  }, [devices, selectedDevices, addLog]);
+  }, [devices, selectedDevices, addLog, emulationMode, emulationNetworkDelay]);
 
   // Wait for paging device to be ready by polling until mcast.mode = 1
   const waitForPagingReady = useCallback(async (): Promise<boolean> => {
@@ -2385,6 +2439,13 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
 
   // PoE Device Controls
   const controlPoEDevices = useCallback(async (enable: boolean) => {
+    // 🧪 EMULATION MODE: Skip actual API calls
+    if (emulationMode) {
+      debugLog(`[PoE Control] 🧪 EMULATION: Simulated ${enable ? 'enabling' : 'disabling'} PoE devices`);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      return;
+    }
+
     debugLog(`[PoE Control] Total PoE devices: ${poeDevices.length}`);
 
     // Get PoE devices in auto mode
@@ -2472,7 +2533,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     });
 
     await Promise.allSettled(promises);
-  }, [poeDevices, selectedDevices, devices, addLog]);
+  }, [poeDevices, selectedDevices, devices, addLog, emulationMode]);
 
   // Emergency Controls
   const emergencyKillAll = useCallback(async () => {
@@ -2573,6 +2634,152 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     }
   }, [devices, addLog]);
 
+  // ============================================================================
+  // EMULATION MODE - Testing without physical devices
+  // ============================================================================
+
+  /**
+   * Enable/disable emulation mode
+   * When enabled: Creates 12 fake speakers + 1 fake paging device
+   */
+  const setEmulationMode = useCallback((enabled: boolean) => {
+    setEmulationModeState(enabled);
+
+    if (enabled) {
+      // Generate fake devices
+      const now = new Date();
+      const fakePaging: AlgoDevice = {
+        id: 'emu-paging-1',
+        name: 'EMU Paging Device 8301',
+        type: '8301',
+        ipAddress: '192.168.1.100',
+        apiPassword: 'emu-pass',
+        authMethod: 'basic',
+        linkedSpeakerIds: [], // Will be populated with speaker IDs
+        ownerEmail: user?.email || '',
+        zone: null,
+        volume: 100,
+        isOnline: true,
+        lastSeen: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const fakeSpeakers: AlgoDevice[] = [];
+      for (let i = 1; i <= 12; i++) {
+        const isEven = i % 2 === 0;
+        fakeSpeakers.push({
+          id: `emu-speaker-${i}`,
+          name: `EMU Speaker ${isEven ? '8198' : '8180g2'}-${i}`,
+          type: isEven ? '8198' : '8180g2',
+          ipAddress: `192.168.1.${100 + i}`,
+          apiPassword: 'emu-pass',
+          authMethod: 'basic',
+          ownerEmail: user?.email || '',
+          zone: null,
+          volume: 100,
+          maxVolume: 100,
+          isOnline: true,
+          lastSeen: now,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+
+      // Link speakers to paging device
+      fakePaging.linkedSpeakerIds = fakeSpeakers.map(s => s.id);
+
+      // Set devices
+      setDevices([fakePaging, ...fakeSpeakers]);
+      setSelectedDevicesState([fakePaging.id]); // Auto-select paging device
+
+      addLog({
+        type: 'system',
+        message: '🧪 EMULATION MODE ENABLED: 1 paging device + 12 speakers created'
+      });
+
+      console.log('[Emulation] Generated devices:', { paging: fakePaging, speakers: fakeSpeakers });
+    } else {
+      // Clear fake devices
+      setDevices([]);
+      setSelectedDevicesState([]);
+
+      addLog({
+        type: 'system',
+        message: '🧪 EMULATION MODE DISABLED: Fake devices removed'
+      });
+    }
+  }, [setDevices, addLog]);
+
+  /**
+   * Trigger a test emergency call
+   * Simulates audio input for testing the system by injecting fake audio events
+   */
+  const triggerTestCall = useCallback((durationSeconds: number = 5) => {
+    if (!isCapturing) {
+      addLog({
+        type: 'system',
+        message: '⚠️ Cannot trigger test call: Monitoring not started'
+      });
+      return;
+    }
+
+    if (!batchCoordinatorRef.current) {
+      addLog({
+        type: 'system',
+        message: '⚠️ Cannot trigger test call: Batch coordinator not initialized'
+      });
+      return;
+    }
+
+    addLog({
+      type: 'system',
+      message: `🧪 TEST CALL TRIGGERED: ${durationSeconds}s simulated emergency audio`
+    });
+
+    console.log(`[Emulation] Test call started: ${durationSeconds}s`);
+
+    // Inject fake audio detection events
+    const coordinator = batchCoordinatorRef.current;
+    const injectionInterval = 100; // Inject events every 100ms
+    let elapsed = 0;
+
+    const injectionTimer = setInterval(() => {
+      elapsed += injectionInterval;
+
+      if (elapsed > durationSeconds * 1000) {
+        // Test call duration complete - trigger silence
+        clearInterval(injectionTimer);
+        coordinator.onSilence();
+
+        addLog({
+          type: 'system',
+          message: '🧪 TEST CALL ENDED - injected silence event'
+        });
+
+        console.log('[Emulation] Test call ended');
+        return;
+      }
+
+      // Inject fake audio detection (simulates sustained audio above threshold)
+      // Use variable level for realism (50-90%)
+      const fakeLevel = 0.5 + Math.random() * 0.4;
+      coordinator.onAudioDetected(fakeLevel);
+
+    }, injectionInterval);
+
+    // Store timeout ref for cleanup
+    if (testCallTimeoutRef.current) {
+      clearTimeout(testCallTimeoutRef.current);
+    }
+    testCallTimeoutRef.current = injectionTimer as unknown as NodeJS.Timeout;
+
+  }, [isCapturing, addLog]);
+
+  // ============================================================================
+  // END EMULATION MODE
+  // ============================================================================
+
   // Check connectivity of all linked speakers
   const checkSpeakerConnectivity = useCallback(async () => {
     const linkedSpeakerIds = new Set<string>();
@@ -2667,9 +2874,15 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
   }, [selectedDevices, devices, addLog]);
 
   // 🚀 NEW CALL COORDINATOR: Upload callback for saving recordings to Firebase
-  const uploadRecordingToFirebase = useCallback(async (blob: Blob, mimeType: string): Promise<string> => {
+  const uploadRecordingToFirebase = useCallback(async (blob: Blob, mimeType: string, firstAudioTimestamp: number, isPlayback?: boolean): Promise<string> => {
     if (!user) {
       throw new Error('No user logged in');
+    }
+
+    // Check if recording is enabled
+    if (!recordingEnabled) {
+      debugLog('[Upload] Recording disabled, skipping upload');
+      throw new Error('Recording disabled');
     }
 
     try {
@@ -2681,9 +2894,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         fileExtension = 'm4a';
       }
 
-      // Generate timestamp for filename
-      const now = new Date();
-      const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      // Use first audio detection timestamp (PST) for filename
+      const detectionTime = new Date(firstAudioTimestamp);
+      const pstTime = new Date(detectionTime.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
       const year = pstTime.getFullYear();
       const month = String(pstTime.getMonth() + 1).padStart(2, '0');
       const day = String(pstTime.getDate()).padStart(2, '0');
@@ -2695,27 +2908,34 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const hoursStr = String(hours).padStart(2, '0');
 
       const timestamp = `${year}-${month}-${day}-${hoursStr}-${minutes}-${seconds}-${ampm}`;
-      const filename = `recording-${timestamp}.${fileExtension}`;
 
-      // Create daily folder
-      const dailyFolder = `${year}-${month}-${day}-pst-recordings`;
-      const filePath = `audio-recordings/${user.uid}/${dailyFolder}/${filename}`;
+      // Append "-playback" suffix if this is a playback recording
+      const recordingType = isPlayback ? 'playback' : 'input';
+      const filenameSuffix = isPlayback ? '-playback' : '';
+      const filename = `recording-${timestamp}${filenameSuffix}.${fileExtension}`;
+
+      // Create daily folder (clean format: YYYY-MM-DD)
+      const dailyFolder = `${year}-${month}-${day}`;
+
+      // Use email instead of UID for folder structure
+      const userEmail = user.email || user.uid;
+      const filePath = `${userEmail}/${dailyFolder}/${filename}`;
 
       // Upload to Firebase Storage
-      debugLog(`[CallCoordinator] Uploading ${fileExtension.toUpperCase()} to ${filePath}`);
+      debugLog(`[CallCoordinator] Uploading ${recordingType.toUpperCase()} recording (${fileExtension.toUpperCase()}) to ${filePath}`);
       const fileRef = storageRef(storage, filePath);
       await uploadBytes(fileRef, blob);
 
       // Get download URL
       const downloadUrl = await getDownloadURL(fileRef);
-      debugLog('[CallCoordinator] Upload successful:', downloadUrl);
+      debugLog(`[CallCoordinator] ${recordingType.toUpperCase()} recording upload successful:`, downloadUrl);
 
       return downloadUrl;
     } catch (error) {
       console.error('[CallCoordinator] Upload failed:', error);
       throw error;
     }
-  }, [user]);
+  }, [user, recordingEnabled]);
 
   // 🚀 COORDINATOR SYSTEM: Initialize/update when config changes
   useEffect(() => {
@@ -2796,6 +3016,12 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       const speaker = devices.find(d => d.id === speakerId);
       if (!speaker || !speaker.ipAddress || !speaker.apiPassword) {
         debugLog(`[CallCoordinator] Speaker ${speakerId} not found or missing credentials`);
+        return;
+      }
+
+      // 🧪 EMULATION MODE: Skip actual API calls
+      if (emulationMode) {
+        debugLog(`[CallCoordinator] 🧪 EMULATION: Simulated setting ${speaker.name} volume to ${volumePercent.toFixed(0)}%`);
         return;
       }
 
@@ -2891,6 +3117,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         playbackRampDuration, // User-configurable ramp duration
         playbackStartVolume, // User-configurable start volume (0-2.0)
         playbackMaxVolume, // User-configurable max volume (0-2.0)
+        playbackVolume, // User-configurable volume when ramp is disabled (0-2.0)
         onPlaybackLevelUpdate: setPlaybackAudioLevel, // Real-time playback audio monitoring
       };
 
@@ -2960,6 +3187,7 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     poeDevices,
     controlPoEDevices,
     getIdleVolumeString,
+    emulationMode,
   ]);
 
   // Audio activity detection with sustained audio requirement
@@ -2969,6 +3197,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       if (sustainedAudioStartRef.current) {
         sustainedAudioStartRef.current = null;
       }
+      // 🔍 DEBUG: Log when audio detection is skipped due to not capturing
+      if (audioLevel > audioThreshold && audioLevel > 5) {
+        debugLog(`⚠️ Audio detected (${audioLevel.toFixed(0)}%) but NOT capturing - skipping coordinator call`);
+      }
       return;
     }
 
@@ -2976,6 +3208,10 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     if (USE_BATCH_SYSTEM && batchCoordinatorRef.current) {
       // BatchCoordinator system
       if (audioLevel > audioThreshold) {
+        // 🔍 DEBUG: Log every audio detection to help diagnose missing events
+        if (audioLevel > audioThreshold * 2) { // Only log significant audio to avoid spam
+          debugLog(`🔊 AudioMonitoring → BatchCoordinator.onAudioDetected(${audioLevel.toFixed(0)}%)`);
+        }
         batchCoordinatorRef.current.onAudioDetected(audioLevel);
       } else {
         batchCoordinatorRef.current.onSilence();
@@ -3573,6 +3809,11 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
     debugLog('[AudioMonitoring] Playback max volume set to:', volume.toFixed(2));
   }, []);
 
+  const setPlaybackVolumeCallback = useCallback((volume: number) => {
+    setPlaybackVolume(volume);
+    debugLog('[AudioMonitoring] Playback volume (ramp disabled) set to:', volume.toFixed(2));
+  }, []);
+
   const clearLogs = useCallback(() => {
     setLogs([]);
     debugLog('[AudioLog] Logs cleared');
@@ -3651,11 +3892,20 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
         setPlaybackStartVolume: setPlaybackStartVolumeCallback,
         playbackMaxVolume,
         setPlaybackMaxVolume: setPlaybackMaxVolumeCallback,
+        playbackVolume,
+        setPlaybackVolume: setPlaybackVolumeCallback,
         emergencyKillAll,
         emergencyEnableAll,
         controlSingleSpeaker,
         speakerStatuses,
         checkSpeakerConnectivity,
+
+        // Emulation Mode
+        emulationMode,
+        setEmulationMode,
+        emulationNetworkDelay,
+        setEmulationNetworkDelay: setEmulationNetworkDelay,
+        triggerTestCall,
       }}
     >
       {children}

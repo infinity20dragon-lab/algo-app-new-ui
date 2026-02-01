@@ -72,11 +72,14 @@ export interface AudioBatch {
 export interface CompletedSession {
   id: string;
   sessionNumber: number;
-  blob: Blob;
+  blob: Blob; // Input recording (raw microphone)
   mimeType: string;
   timestamp: number;
   uploaded: boolean;
   uploadUrl?: string;
+  playbackBlob?: Blob; // Playback recording (what actually played through speakers)
+  playbackUploaded?: boolean;
+  playbackUploadUrl?: string;
 }
 
 export interface BatchCoordinatorConfig {
@@ -100,6 +103,7 @@ export interface BatchCoordinatorConfig {
   playbackRampDuration?: number;           // Ramp duration in ms (default: 2000)
   playbackStartVolume?: number;            // Start volume 0-2.0 (default: 0 = silent)
   playbackMaxVolume?: number;              // Max volume 0-2.0 (default: 1.0 = 100%)
+  playbackVolume?: number;                 // Volume when ramp is disabled 0-2.0 (default: 0.6 = 60%)
 
   // Hardware control
   pagingDevice?: {
@@ -137,7 +141,7 @@ export interface BatchCoordinatorConfig {
 
   // Callbacks
   onLog: (entry: { type: string; message: string; audioLevel?: number }) => void;
-  onUpload: (blob: Blob, mimeType: string) => Promise<string>;
+  onUpload: (blob: Blob, mimeType: string, timestamp: number, isPlayback?: boolean) => Promise<string>;
   onError?: (error: Error) => void;
   onStateChange?: (state: string) => void;
   onPlaybackLevelUpdate?: (level: number) => void;  // Playback audio level monitoring
@@ -166,6 +170,7 @@ export class BatchCoordinator {
   private lastAudioTime: number = 0;
   private silenceCheckInterval: number | null = null;
   private sessionStartTime: number = 0;
+  private firstAudioDetectionTime: number = 0; // PST timestamp when audio first detected
   private initSegment: Blob | null = null; // First chunk with headers for playback
 
   // Web Audio API for playback
@@ -176,10 +181,17 @@ export class BatchCoordinator {
   private currentPlaybackSource: AudioBufferSourceNode | null = null;
   private playbackGainNode: GainNode | null = null; // For volume ramping (no network requests!)
 
+  // Playback output recording (captures what speakers actually play)
+  private playbackDestination: MediaStreamAudioDestinationNode | null = null;
+  private playbackRecorder: MediaRecorder | null = null;
+  private playbackRecordedChunks: Blob[] = [];
+  private playbackRecordingActive: boolean = false;
+
   // Hardware state
   private pagingActive: boolean = false;      // Zone 1 active
   private hardwareReady: boolean = false;     // Speakers ramped, PoE enabled
   private isInZone1: boolean = false;         // Track zone for subsequent calls
+  private speakerVolumesInitialized: boolean = false; // Volumes set once at monitoring start
 
   // Validation
   private audioValidated: boolean = false;
@@ -224,10 +236,13 @@ export class BatchCoordinator {
   private playbackRampDuration: number; // Ramp duration in ms
   private playbackStartVolume: number; // Start volume (0-2.0)
   private playbackMaxVolume: number; // Max volume (0-2.0)
+  private playbackVolume: number; // Volume when ramp disabled (0-2.0)
 
   // Hardware thrash protection (prevent infinite reactivation loops)
-  private reactivationAttempts: number = 0;
-  private maxReactivationAttempts: number = 1; // Allow 1 re-activation per finish cycle
+  // 🔥 REMOVED: No limit on hardware re-activations for PA/VOX systems
+  // Life-safety priority: If someone speaks, hardware MUST activate - no exceptions
+  // PA systems are VOX-based, people naturally stop talking (won't loop forever)
+  // Even worst-case 1hr continuous speech is fine - just keep recording/playing batches
 
   constructor(config: BatchCoordinatorConfig) {
     this.config = config;
@@ -241,6 +256,7 @@ export class BatchCoordinator {
     this.playbackRampDuration = config.playbackRampDuration ?? 2000; // Default: 2s
     this.playbackStartVolume = config.playbackStartVolume ?? 0; // Default: silent start
     this.playbackMaxVolume = config.playbackMaxVolume ?? 1.0; // Default: 100% volume
+    this.playbackVolume = config.playbackVolume ?? 0.6; // Default: 60% when ramp disabled
   }
 
   // ============================================================================
@@ -281,24 +297,45 @@ export class BatchCoordinator {
       this.playbackAnalyser = this.audioContext.createAnalyser();
       this.playbackAnalyser.fftSize = 256;
 
-      // Connect: GainNode → Analyser → Destination
+      // Create MediaStreamDestination for recording playback output
+      this.playbackDestination = this.audioContext.createMediaStreamDestination();
+
+      // Connect: GainNode → Analyser → [Destination (speakers) + MediaStreamDestination (recording)]
       this.playbackGainNode.connect(this.playbackAnalyser);
       this.playbackAnalyser.connect(this.audioContext.destination);
-      this.log('🎵 Audio chain: Source → Gain (ramp) → Analyser (monitor) → Destination (speakers)');
+      this.playbackAnalyser.connect(this.playbackDestination); // Also route to recording destination
+      this.log('🎵 Audio chain: Source → Gain (ramp) → Analyser (monitor) → [Speakers + Recorder]');
 
       // Start playback level monitoring
       this.startPlaybackMonitoring();
+
+      // 🔥 Setup page visibility listener to resume AudioContext when page becomes visible
+      this.setupVisibilityListener();
     } else {
       // Reset timeline for new session
       this.nextPlaybackTime = this.audioContext.currentTime;
       this.log('Web Audio timeline reset for new session');
+
+      // Resume if suspended
+      this.resumeAudioContextIfNeeded();
     }
 
     // 🔥 Capture silent pre-roll for init segment (if not already captured)
+    // IMPORTANT: Make sure monitoring is started when quiet (no "eh" sounds)!
+    // This 200ms of silence becomes the init segment for ALL batches
     if (!this.initSegment) {
       await this.captureSilentPreRoll();
     } else {
       this.log('Using existing silent pre-roll from previous session');
+    }
+
+    // 🔊 Initialize speaker volumes ONCE at monitoring start
+    // After this, we NEVER touch speaker volumes again - only change multicast IP!
+    if (!this.speakerVolumesInitialized && this.config.linkedSpeakers.length > 0 && this.config.playbackEnabled) {
+      this.log('🔊 Initializing speaker volumes (one-time setup)...');
+      await this.setSpeakersToTargetVolume();
+      this.speakerVolumesInitialized = true;
+      this.log('  ✓ Speaker volumes initialized - will not change during sessions');
     }
 
     // Don't start recording yet - wait for audio validation
@@ -311,48 +348,105 @@ export class BatchCoordinator {
   onAudioDetected(level: number): void {
     this.lastAudioTime = Date.now();
 
+    // 🔍 DEBUG: Log ALL audio detection calls
+    if (this.isFinishing || this.postPlaybackGraceActive || this.tailGuardActive) {
+      this.log(`🔍 DEBUG: onAudioDetected called - level: ${(level * 100).toFixed(0)}%, isFinishing: ${this.isFinishing}, grace: ${this.postPlaybackGraceActive}, tailGuard: ${this.tailGuardActive}, validated: ${this.audioValidated}`);
+    }
+
     // 🔒 POST-PLAYBACK GRACE: Audio detected right after playback!
     // This is the "hello" we were waiting for - promote standby batch
     if (this.postPlaybackGraceActive) {
-      // Validate sustained audio during grace period
-      if (!this.audioValidated && !this.validationStartTime) {
-        this.validationStartTime = Date.now();
-        this.log(`🔒 Grace: Emergency audio detected (${(level * 100).toFixed(0)}%) right after playback, validating...`);
-      }
+      // 🚨🚨🚨 LIFE-SAFETY MODE: ZERO TOLERANCE 🚨🚨🚨
+      // Any audio during grace = immediate hot restart, no validation delay
+      // Grace period is for capturing urgent responses like "HELP!" or "FIRE!"
+      // Can't afford to miss even 50ms bursts - lives are at stake
+      if (!this.audioValidated) {
+        this.audioValidated = true; // Immediate validation
 
-      if (!this.audioValidated && this.validationStartTime) {
-        const elapsed = Date.now() - this.validationStartTime;
-        if (elapsed >= this.sustainDuration) {
-          this.audioValidated = true;
-          this.log(`🔒 Grace: Audio validated (${elapsed}ms) - PROMOTING standby batch to new session`);
+        const elapsed = this.validationStartTime ? Date.now() - this.validationStartTime : 0;
+        this.log(`🔒 Grace: Emergency audio detected (${(level * 100).toFixed(0)}%) - IMMEDIATE HOT RESTART`);
+        this.log(`   🚨 LIFE-SAFETY: Zero validation delay (${elapsed}ms detection) - ANY audio = emergency`);
 
-          // Cancel grace timer - we're promoting
-          this.cancelPostPlaybackGrace();
+        // Cancel grace timer
+        this.cancelPostPlaybackGrace();
 
-          // 🔥 CRITICAL: Restart silence monitoring for the promoted session
-          // This ensures the promoted session has a fresh 8s silence countdown
-          if (this.silenceCheckInterval) {
-            clearInterval(this.silenceCheckInterval);
-            this.silenceCheckInterval = null;
-          }
-          this.onSilence(); // Start fresh silence monitoring with updated lastAudioTime
+        // 🔥 HOT RESTART: Finish previous session, start fresh new session
+        this.log(`🔒 Grace: Step 1 - Finishing previous session (queuing for upload)`);
 
-          // finishSession will detect audioValidated and abort deactivation
-          // The standby batch will be promoted in cleanup()
-          this.log(`🔒 Grace promotion: Hardware will stay active, session continues`);
+        // Save batches from previous session
+        const previousSessionBatches = [...this.batches];
+
+        // Enqueue previous session for upload (non-blocking)
+        if (previousSessionBatches.length > 0) {
+          this.finishingSessionBatches = previousSessionBatches;
+          this.enqueueSessionUpload();
         }
+
+        // 🔥 START FRESH SESSION
+        this.sessionId++; // New session ID
+        // 🔥 CRITICAL: Do NOT increment playbackGeneration - let current playback complete!
+        // Incrementing it would abort all queued batches from the previous session
+        // this.playbackGeneration++; // ← REMOVED - causes batches to be discarded
+        this.batches = []; // Clear batches for new session
+        // 🔥 CRITICAL: Do NOT clear playback queue - let previous session's batches finish playing!
+        // The new grace batch will be queued AFTER the existing batches complete
+        // this.playbackQueue = []; // ← REMOVED - causes loss of user's audio
+        // this.isPlaying = false; // ← REMOVED - playback is already happening
+        this.isFinishing = false;
+        this.firstAudioDetectionTime = Date.now(); // New timestamp for this session
+
+        this.log(`🔒 Grace: Step 2 - New session started (session ${this.sessionId}), playback queue preserved (${this.playbackQueue.length} batches)`);
+
+        // Start new batch for the new session (standby batch becomes first batch)
+        if (this.currentBatch && this.currentBatch.state === BatchState.Recording) {
+          this.log(`🔒 Grace: Converting standby batch to first batch of new session`);
+          this.batches.push(this.currentBatch);
+        }
+
+        // 🔥 STEP 3: FORCE HARDWARE RESET - Set ALL speakers to Zone 1 (224.0.2.60:50002)
+        // Don't care about current state - just force everything active and poll to verify
+        this.log(`🔒 Grace: Step 3 - Forcing ALL speakers to mcast.zone1 = 224.0.2.60:50002 (active state)`);
+        this.hardwareReady = false; // Reset hardware state
+
+        // Trigger hardware activation (will set speakers, poll, then enable playback)
+        // This is non-blocking - recording continues while hardware resets
+        this.activateHardware().then(() => {
+          this.log(`🔒 Grace: Step 4 - Hardware reset complete, ready for playback`);
+          // Playback will start after playback delay (handled in activateHardware)
+        }).catch((error) => {
+          this.log(`🔒 Grace: Hardware reset failed: ${error}`);
+          if (this.config.onError) {
+            this.config.onError(error);
+          }
+        });
+
+        // 🔥 CRITICAL: Restart silence monitoring for new session
+        if (this.silenceCheckInterval) {
+          clearInterval(this.silenceCheckInterval);
+          this.silenceCheckInterval = null;
+        }
+        this.onSilence(); // Start fresh silence monitoring
+
+        this.log(`🔒 Grace: Recording continues while hardware resets (non-blocking)`);
+
+        // 🔥 CRITICAL: Clear grace flag so subsequent audio goes to normal handling
+        // Without this, all subsequent detections return early and audio is lost!
+        this.postPlaybackGraceActive = false;
+        this.log('🔒 Grace: Flag cleared - subsequent audio will use normal validation path');
+
+        return; // Hot restart complete, grace handled this audio
+      } else {
+        // 🚨 BUG FIX: Audio detected during grace but already validated
+        // This happens when user keeps speaking after hot restart triggered
+        // Clear grace flag and let it fall through to normal handling (TailGuard, etc.)
+        this.log(`🔒 Grace: Audio detected but already validated - clearing grace and passing to normal handlers`);
+        this.postPlaybackGraceActive = false;
+        // Don't return - fall through to TailGuard/normal validation
       }
-
-      return; // Grace is handling this audio
     }
 
-    // 🎯 BLOCK: Don't start new session while previous session is finishing
-    // This prevents overlapping sessions during upload/cleanup
-    if (this.isFinishing && !this.tailGuardActive && !this.postPlaybackGraceActive) {
-      // Session is finishing, audio will be captured in standby batch
-      // and validated/promoted in cleanup() if sustained
-      return;
-    }
+    // 🚨 OLD BLOCKING CODE REMOVED - Prevented LIFE-SAFETY mode from working!
+    // Previously blocked audio during finish phase, now LIFE-SAFETY handles it below
 
     // 🛡️ TAILGUARD PROMOTION: If TailGuard is active, promote to new session
     if (this.tailGuardActive) {
@@ -399,23 +493,17 @@ export class BatchCoordinator {
       return; // TailGuard is handling this audio
     }
 
-    // 🎯 PURIST MODE: Audio during finish phase
-    // MediaRecorder is already running into standby batch - just validate
+    // 🚨 LIFE-SAFETY MODE: Audio during finish phase
+    // MediaRecorder is already running into standby batch
     if (this.isFinishing) {
-      // Start validation if not already started
-      if (!this.validationStartTime) {
-        this.validationStartTime = Date.now();
-        this.log(`🎯 Audio detected during finish phase (${(level * 100).toFixed(0)}%) - validating standby batch`);
+      // 🚨🚨🚨 ZERO TOLERANCE FOR AUDIO LOSS 🚨🚨🚨
+      // During active emergency sessions, ANY audio detection = IMMEDIATE promotion
+      // No validation threshold - this is a life-safety system, false positives are acceptable
+      if (!this.audioValidated) {
+        this.audioValidated = true; // Immediate validation, no waiting
+        this.log(`🚨🚨🚨 LIFE-SAFETY: Audio detected during finish phase (${(level * 100).toFixed(0)}%)`);
+        this.log('   🚨 ZERO-TOLERANCE MODE: Immediate promotion (no validation delay)');
         this.log('   MediaRecorder already capturing - no restart needed (purist mode)');
-      }
-
-      // Continue validation
-      if (!this.audioValidated && this.validationStartTime) {
-        const elapsed = Date.now() - this.validationStartTime;
-        if (elapsed >= this.sustainDuration) {
-          this.audioValidated = true;
-          this.log(`✓ Standby batch validated (${elapsed}ms) - will promote to new session in cleanup()`);
-        }
       }
 
       return; // Let cleanup() handle promotion
@@ -444,6 +532,12 @@ export class BatchCoordinator {
       if (elapsed >= this.sustainDuration) {
         this.audioValidated = true;
         this.isPreBuffering = false;
+
+        // Capture first audio detection time (PST) - only set once per session
+        if (this.firstAudioDetectionTime === 0) {
+          this.firstAudioDetectionTime = Date.now();
+        }
+
         this.log(`✓ Audio validated (${elapsed}ms above threshold) - pre-buffer committed`);
 
         // Trigger hardware activation
@@ -533,22 +627,35 @@ export class BatchCoordinator {
           // ============================================================
           this.log(`Silence timeout (${this.silenceTimeout}ms) reached`);
 
-          // Complete current batch if recording
-          if (this.currentBatch && this.currentBatch.state === BatchState.Recording) {
+          // Complete current batch if recording (but not during finish phase)
+          if (this.currentBatch && this.currentBatch.state === BatchState.Recording && !this.isFinishing) {
             this.log('Completing final batch');
             this.completeBatch();
+          } else if (this.isFinishing) {
+            this.log('🎯 During finish phase - letting standby batch continue (will be promoted if validated)');
           }
 
           // 🛡️ ACTIVATE TAILGUARD: Keep MediaRecorder running for emergency audio
           this.tailGuardActive = true;
           this.tailGuardStartTime = Date.now();
+
+          // 🔥 CRITICAL: Reset validation state so TailGuard can validate audio
+          // Without this, audioValidated=true from previous session prevents TailGuard validation!
+          this.audioValidated = false;
+          this.validationStartTime = 0;
+
           this.log(`🛡️ TailGuard ACTIVATED (${this.tailGuardDuration}ms window)`);
           this.log('   MediaRecorder stays active - listening for emergency audio');
+          this.log(`   🎯 Validation state reset (audioValidated=${this.audioValidated}) - ready to detect emergency audio`);
 
-          // Start TailGuard batch to capture any emergency audio
+          // Start TailGuard batch to capture any emergency audio (but not during finish phase)
           // This will be discarded if no audio detected, or promoted if audio validated
-          this.startBatchRecording();
-          this.log('🛡️ TailGuard batch started (will discard if no audio, promote if validated)');
+          if (!this.isFinishing) {
+            this.startBatchRecording();
+            this.log('🛡️ TailGuard batch started (will discard if no audio, promote if validated)');
+          } else {
+            this.log('🛡️ TailGuard activated during finish phase - standby batch continues');
+          }
 
           // Don't clear interval - keep checking for TailGuard expiration
           // Don't finish session yet - TailGuard is active
@@ -567,16 +674,22 @@ export class BatchCoordinator {
             // This ensures chunks always have somewhere to go
             this.log('🎯 MediaRecorder continues running (purist mode - always listening)');
 
-            // Complete TailGuard batch (no longer needed)
-            if (this.currentBatch && this.currentBatch.state === BatchState.Recording) {
+            // Complete TailGuard batch (no longer needed) - but not during finish phase
+            if (this.currentBatch && this.currentBatch.state === BatchState.Recording && !this.isFinishing) {
               this.log('🎯 Completing TailGuard batch (no emergency audio)');
               this.completeBatch();
+            } else if (this.isFinishing) {
+              this.log('🎯 During finish phase - letting standby batch continue (will be promoted if validated)');
             }
 
-            // 🎯 CRITICAL: Start new standby batch immediately
+            // 🎯 CRITICAL: Start new standby batch immediately (but not during finish phase)
             // MediaRecorder is still firing ondataavailable events - chunks need a home!
-            this.startBatchRecording();
-            this.log('🎯 Standby batch started (MediaRecorder chunks continue flowing)');
+            if (!this.isFinishing) {
+              this.startBatchRecording();
+              this.log('🎯 Standby batch started (MediaRecorder chunks continue flowing)');
+            } else {
+              this.log('🎯 During finish phase - standby batch continues (no new batch needed)');
+            }
 
             // Clear interval
             clearInterval(this.silenceCheckInterval!);
@@ -793,9 +906,10 @@ export class BatchCoordinator {
     if (!this.currentBatch) return;
 
     // 🎯 PURIST MODE: This should never be called during finish
-    // (onChunkRecorded now blocks completeBatch during finish phase)
+    // (onChunkRecorded + silence timeout + TailGuard all skip completeBatch during finish phase)
     if (this.isFinishing) {
-      this.log('⚠️ UNEXPECTED: completeBatch called during session finish');
+      this.log('⚠️ BUG: completeBatch called during session finish (this should never happen!)');
+      this.log('   Please report this if you see it - batches should continue during finish, not complete');
       return;
     }
 
@@ -908,11 +1022,31 @@ export class BatchCoordinator {
         throw new Error('AudioContext not initialized');
       }
 
+      // 🔥 Resume AudioContext if suspended (e.g., after navigating away and back)
+      await this.resumeAudioContextIfNeeded();
+
       // 🎵 Step 1: Decode blob to AudioBuffer
       const arrayBuffer = await batch.blob!.arrayBuffer();
       const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
 
       this.log(`Decoded batch ${batchIndex}: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.numberOfChannels}ch`);
+
+      // 🔍 DEBUG: Check AudioContext state
+      this.log(`🔍 AudioContext state: ${this.audioContext.state}`);
+      if (this.audioContext.state === 'suspended') {
+        this.log(`⚠️ WARNING: AudioContext is SUSPENDED - audio will not play!`);
+      }
+
+      // 🔍 DEBUG: Check if audio buffer contains actual sound (not silence)
+      const channelData = audioBuffer.getChannelData(0);
+      let sumSquares = 0;
+      const sampleCount = Math.min(channelData.length, 48000); // Check first 1 second
+      for (let i = 0; i < sampleCount; i++) {
+        sumSquares += channelData[i] * channelData[i];
+      }
+      const rms = Math.sqrt(sumSquares / sampleCount);
+      const dbFS = 20 * Math.log10(rms);
+      this.log(`🔍 Audio content RMS: ${rms.toFixed(6)} (${dbFS.toFixed(1)} dBFS) ${rms < 0.0001 ? '🔇 SILENCE!' : '✓ has sound'}`);
 
       // 🔥 Gate: Check playback generation STILL valid after async decode
       if (myGeneration !== this.playbackGeneration) {
@@ -928,9 +1062,14 @@ export class BatchCoordinator {
       // Connect to gain node (for volume ramping)
       if (this.playbackGainNode) {
         source.connect(this.playbackGainNode);
+
+        // 🔍 DEBUG: Check gain level during playback
+        const currentGain = this.playbackGainNode.gain.value;
+        this.log(`🔊 Batch ${batchIndex} playback gain: ${currentGain.toFixed(2)} (${currentGain === 0 ? '🔇 MUTED!' : '✓ audible'})`);
       } else {
         // Fallback: direct connection if gain node not available
         source.connect(this.audioContext.destination);
+        this.log(`🔊 Batch ${batchIndex} connected directly to destination (no gain node)`);
       }
 
       // 🎵 Step 3: Calculate playback time (sample-accurate scheduling)
@@ -938,20 +1077,51 @@ export class BatchCoordinator {
       const playTime = Math.max(this.nextPlaybackTime, now);
 
       // 🎵 Step 4: Set up completion handler
-      source.onended = () => {
+      let hasCompleted = false; // Guard against multiple callbacks
+      let safetyTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+      const completePlayback = (reason: string) => {
+        if (hasCompleted) return; // Already handled
+        hasCompleted = true;
+
+        // Clear safety timeout
+        if (safetyTimeoutId !== null) {
+          clearTimeout(safetyTimeoutId);
+          safetyTimeoutId = null;
+        }
+
         // 🔥 Guard: Only proceed if this is still the current playback generation
         if (myGeneration !== this.playbackGeneration) {
-          this.log(`Batch ${batchIndex} onended from old generation, ignoring`);
+          this.log(`Batch ${batchIndex} ${reason} from old generation, ignoring`);
           return;
         }
 
-        this.log(`Batch ${batchIndex} playback complete`);
+        this.log(`Batch ${batchIndex} playback complete (${reason})`);
         batch.state = BatchState.Complete;
 
         // No cleanup needed - Web Audio handles everything
         // Play next batch
         this.playNextBatch();
       };
+
+      source.onended = () => completePlayback('onended');
+
+      // 🎵 Step 4b: Add error handler (critical for reliability!)
+      // Without this, playback errors cause queue to stall forever
+      // @ts-ignore - onended exists but TypeScript doesn't know about onerror on AudioScheduledSourceNode
+      source.onerror = (error: Event) => {
+        this.log(`⚠️ Batch ${batchIndex} playback error: ${error}`);
+        completePlayback('onerror');
+      };
+
+      // 🎵 Step 4c: Safety timeout - force completion after duration + 5s buffer
+      // Ensures we never get stuck waiting for onended that never fires
+      safetyTimeoutId = setTimeout(() => {
+        if (!hasCompleted) {
+          this.log(`⚠️ Batch ${batchIndex} safety timeout triggered (onended didn't fire)`);
+          completePlayback('timeout');
+        }
+      }, (audioBuffer.duration + 5) * 1000);
 
       // 🎵 Step 5: Start playback at scheduled time
       source.start(playTime);
@@ -989,22 +1159,62 @@ export class BatchCoordinator {
         return;
       }
 
-      this.log('Waiting for playback to complete...');
+      // 🎵 Calculate expected playback time based on queued batches
+      // This prevents false timeouts when you have multiple long batches
+      let estimatedDuration = 0;
+
+      // Add duration of all queued batches
+      for (const batch of this.playbackQueue) {
+        if (batch.blob) {
+          // Rough estimate: ~20ms per kilobyte for opus audio
+          estimatedDuration += (batch.blob.size / 1024) * 20;
+        } else {
+          // Fallback: use batch.duration if blob not ready yet
+          estimatedDuration += batch.duration;
+        }
+      }
+
+      // If currently playing, estimate remaining time
+      // (We don't know exact position, so add max batch duration as buffer)
+      if (this.isPlaying) {
+        estimatedDuration += this.batchDuration;
+      }
+
+      // Add generous buffer for:
+      // - Decoding: ~1-2s per batch
+      // - Hardware activation: up to 25s (21s network delay + 4s stabilization)
+      // - Scheduling delays: ~1-2s
+      // Total buffer: 30s + estimated duration
+      const hardwareBuffer = 30000; // Covers worst-case hardware activation
+      const timeoutDuration = estimatedDuration + hardwareBuffer;
+
+      this.log(`Waiting for playback to complete... (est. ${(estimatedDuration / 1000).toFixed(1)}s, timeout in ${(timeoutDuration / 1000).toFixed(1)}s)`);
 
       const checkInterval = setInterval(() => {
+        // 🔥 LIFE-SAFETY: Exit early if audio validated during finish phase
+        // This allows immediate transition to grace period without waiting
+        if (this.audioValidated && this.isFinishing) {
+          clearInterval(checkInterval);
+          clearTimeout(timeoutId);
+          this.log('🚨 Playback wait cancelled - LIFE-SAFETY audio validated during finish phase');
+          resolve();
+          return;
+        }
+
         if (this.playbackQueue.length === 0 && !this.isPlaying) {
           clearInterval(checkInterval);
+          clearTimeout(timeoutId); // 🔥 Cancel timeout when playback completes
           this.log('✓ Playback complete');
           resolve();
         }
       }, 100);
 
-      // Timeout after 30 seconds
-      setTimeout(() => {
+      // Dynamic timeout based on queue length
+      const timeoutId = setTimeout(() => {
         clearInterval(checkInterval);
-        this.log('⚠️ Playback completion timeout');
+        this.log(`⚠️ Playback completion timeout (waited ${(timeoutDuration / 1000).toFixed(1)}s)`);
         resolve();
-      }, 30000);
+      }, timeoutDuration);
     });
   }
 
@@ -1068,12 +1278,9 @@ export class BatchCoordinator {
         this.pagingActive = true;
       }
 
-      // Step 2: Set speaker volumes instantly (no ramp, no repeated network requests!)
-      if (this.config.linkedSpeakers.length > 0 && this.config.playbackEnabled) {
-        this.log('Step 2: Setting speaker volumes to target...');
-        await this.setSpeakersToTargetVolume();
-        this.log('  ✓ Speakers set to target volume');
-      }
+      // Step 2: Speaker volumes - SKIP! (already set at monitoring start)
+      // We NEVER touch speaker volumes during sessions - only at initialization
+      // This prevents network thrashing and ensures smooth operation
 
       // Step 2.5: Ramp playback gain node (fast, smooth, no network!)
       if (this.config.playbackEnabled && this.config.rampEnabled) {
@@ -1092,9 +1299,10 @@ export class BatchCoordinator {
           }
         }
       } else {
-        // Ramp disabled, set gain to max immediately
+        // Ramp disabled, use playbackVolume setting (not max!)
         if (this.playbackGainNode) {
-          this.playbackGainNode.gain.value = this.playbackMaxVolume;
+          this.playbackGainNode.gain.value = this.playbackVolume;
+          this.log(`Step 2.5: Ramp disabled - using playback volume (${this.playbackVolume.toFixed(2)})`);
         }
       }
 
@@ -1104,6 +1312,11 @@ export class BatchCoordinator {
         this.log('Step 3: Enabling PoE devices...');
         await this.config.controlPoEDevices(autoPoEDevices.map(d => d.id), 'on');
         this.log(`  ✓ Enabled ${autoPoEDevices.length} PoE device(s)`);
+      }
+
+      // Step 4: Start recording playback output (what actually plays through speakers)
+      if (this.config.playbackEnabled && this.playbackDestination) {
+        this.startPlaybackRecording();
       }
 
       this.hardwareReady = true;
@@ -1126,6 +1339,11 @@ export class BatchCoordinator {
         this.log('Step 1: Ramping playback gain down...');
         await this.rampPlaybackGain(this.playbackStartVolume, 1000); // Quick fade down (1s)
         this.log('  ✓ Playback gain ramped down');
+      }
+
+      // Step 1.5: Stop recording playback output
+      if (this.playbackRecordingActive) {
+        this.stopPlaybackRecording();
       }
 
       // Step 2: Disable PoE devices in auto mode
@@ -1157,6 +1375,63 @@ export class BatchCoordinator {
     } catch (error) {
       this.log(`Hardware deactivation error: ${error}`);
       // Continue anyway - best effort
+    }
+  }
+
+  /**
+   * Start recording playback output (what actually plays through speakers)
+   * Non-blocking - runs in parallel with playback
+   */
+  private startPlaybackRecording(): void {
+    if (!this.playbackDestination || this.playbackRecordingActive) {
+      return;
+    }
+
+    try {
+      const stream = this.playbackDestination.stream;
+      const mimeType = this.getBestMimeType();
+
+      this.playbackRecorder = new MediaRecorder(stream, { mimeType });
+      this.playbackRecordedChunks = [];
+
+      this.playbackRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          this.playbackRecordedChunks.push(event.data);
+        }
+      };
+
+      this.playbackRecorder.onerror = (error) => {
+        this.log(`📼 Playback recorder error: ${error}`);
+      };
+
+      this.playbackRecorder.start(100); // 100ms chunks
+      this.playbackRecordingActive = true;
+
+      this.log('📼 Started recording playback output (capturing what speakers play)');
+    } catch (error) {
+      this.log(`📼 Failed to start playback recording: ${error}`);
+    }
+  }
+
+  /**
+   * Stop recording playback output
+   * Non-blocking - chunks are saved for upload
+   */
+  private stopPlaybackRecording(): void {
+    if (!this.playbackRecorder || !this.playbackRecordingActive) {
+      return;
+    }
+
+    try {
+      if (this.playbackRecorder.state !== 'inactive') {
+        this.playbackRecorder.stop();
+      }
+
+      this.playbackRecordingActive = false;
+
+      this.log(`📼 Stopped playback recording (${this.playbackRecordedChunks.length} chunks captured)`);
+    } catch (error) {
+      this.log(`📼 Error stopping playback recording: ${error}`);
     }
   }
 
@@ -1374,6 +1649,52 @@ export class BatchCoordinator {
     if (this.audioValidated) {
       this.postPlaybackGraceActive = false;
       this.log('🚨 Grace period audio validated - session promoted, hardware stays active');
+
+      // 🔥 CRITICAL: Complete and queue the standby batch that contains the validated audio!
+      if (this.currentBatch && this.currentBatch.state === BatchState.Recording) {
+        const standbyBatch = this.currentBatch;
+        standbyBatch.endTime = Date.now();
+        standbyBatch.state = BatchState.Ready;
+
+        // Create blob from chunks
+        const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
+        if (this.initSegment) {
+          standbyBatch.blob = new Blob([this.initSegment, ...standbyBatch.chunks], { type: mimeType });
+          this.log(`🎯 Promoted batch: Added silent pre-roll (${this.initSegment.size} bytes) for standalone playback`);
+        } else {
+          standbyBatch.blob = new Blob(standbyBatch.chunks, { type: mimeType });
+          this.log(`⚠️ Promoted batch: No init segment available, using chunks only`);
+        }
+
+        this.log(`🎯 Promoted batch complete: ${standbyBatch.duration}ms, ${standbyBatch.blob.size} bytes`);
+
+        // Queue for playback
+        if (this.config.playbackEnabled) {
+          this.playbackQueue.push(standbyBatch);
+          standbyBatch.state = BatchState.Queued;
+          this.log(`🎯 Promoted batch queued for playback`);
+
+          // Start playback if not already playing
+          if (!this.isPlaying) {
+            this.playNextBatch();
+          }
+        }
+
+        // Start new batch for the promoted session
+        this.startBatchRecording();
+        this.log('🎯 Started new batch for promoted session');
+      }
+
+      // 🔥 LIFE-SAFETY: DO NOT reset audio validation for grace period promotion!
+      // We already detected emergency audio (that's why we're promoting)
+      // The promoted standby batch might be mostly empty - user's audio is in the NEXT batch
+      // If we reset validation, next batch will require fresh validation → lost audio
+      // Keep audioValidated=true so next batch is immediately queued when complete
+      // this.audioValidated = false;  // ❌ DISABLED for grace period promotion
+      // this.validationStartTime = 0;
+      this.log('🔥 LIFE-SAFETY: Keeping audioValidated=true for grace period promotion');
+      this.log(`   audioValidated=${this.audioValidated}, validationStartTime=${this.validationStartTime}`);
+
       // Don't finish - audio promoted standby batch to new session
       this.isFinishing = false;
       return;
@@ -1392,47 +1713,90 @@ export class BatchCoordinator {
     if (this.audioValidated) {
       this.postPlaybackGraceActive = false;
 
-      // 🛡️ HARDWARE THRASH PROTECTION: Limit re-activations to prevent infinite loops
-      if (this.reactivationAttempts >= this.maxReactivationAttempts) {
-        this.log('⚠️ Max re-activation attempts reached - allowing deactivation to complete');
-        this.log('   Next audio will trigger fresh session (predictable failure mode)');
+      // 🔥 LIFE-SAFETY: Always re-activate hardware when audio is detected
+      // No limits - this is a PA/VOX system, if someone speaks, they MUST be heard
+      this.log(`🚨 Audio detected during hardware deactivation - RE-ACTIVATING`);
 
-        // Let deactivation complete - don't re-activate
-        // Any future audio will be a fresh session with full activation cycle
-        this.postPlaybackGraceActive = false;
-        // Continue to cleanup below (don't return early)
-      } else {
-        this.reactivationAttempts++;
-        this.log(`🚨 Audio detected during hardware deactivation - RE-ACTIVATING (attempt ${this.reactivationAttempts}/${this.maxReactivationAttempts})`);
+      // 🚀 CRITICAL: Enqueue old session for upload BEFORE re-activating
+      // The old session is complete - save it to upload queue (non-blocking)
+      this.log('📦 Enqueueing completed session before re-activation');
+      this.enqueueSessionUpload();
 
-        // 🚀 CRITICAL: Enqueue old session for upload BEFORE re-activating
-        // The old session is complete - save it to upload queue (non-blocking)
-        this.log('📦 Enqueueing completed session before re-activation');
-        this.enqueueSessionUpload();
+      // Hardware was just deactivated, need to re-activate
+      await this.activateHardware();
 
-        // Hardware was just deactivated, need to re-activate
-        await this.activateHardware();
+      // 🔊 PHYSICAL DELAY: Wait for speakers to physically stabilize
+      // Even though IP is changed, reloaded, and polled - speakers need time to warm up!
+      this.log(`🔊 Waiting ${this.config.playbackDelay}ms for speakers to physically stabilize...`);
+      await new Promise(resolve => setTimeout(resolve, this.config.playbackDelay));
+      this.log('🔊 Speakers ready - proceeding with playback');
 
-        // 🔥 CRITICAL: Restart silence monitoring for the re-activated session
-        // This ensures the re-activated session has a fresh 8s silence countdown
-        if (this.silenceCheckInterval) {
-          clearInterval(this.silenceCheckInterval);
-          this.silenceCheckInterval = null;
-        }
-        this.onSilence(); // Start fresh silence monitoring with updated lastAudioTime
-
-        // 🎯 Prepare for new session: Clear old batches, keep standby batch
-        // The standby batch will be promoted to batch 1 of the new session
-        const standbyBatch = this.currentBatch; // Save standby batch
-        this.batches = standbyBatch ? [standbyBatch] : [];
-        this.playbackQueue = [];
-        this.isPlaying = false;
-        this.finishingSessionBatches = [];
-
-        // Don't finish - audio promoted standby batch to new session
-        this.isFinishing = false;
-        return;
+      // 🔥 CRITICAL: Restart silence monitoring for the re-activated session
+      // This ensures the re-activated session has a fresh 8s silence countdown
+      if (this.silenceCheckInterval) {
+        clearInterval(this.silenceCheckInterval);
+        this.silenceCheckInterval = null;
       }
+      this.onSilence(); // Start fresh silence monitoring with updated lastAudioTime
+
+      // 🎯 Prepare for new session: Complete and queue standby batch
+      if (this.currentBatch && this.currentBatch.state === BatchState.Recording) {
+        const standbyBatch = this.currentBatch;
+        standbyBatch.endTime = Date.now();
+        standbyBatch.state = BatchState.Ready;
+
+        // Create blob from chunks
+        const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
+        if (this.initSegment) {
+          standbyBatch.blob = new Blob([this.initSegment, ...standbyBatch.chunks], { type: mimeType });
+          this.log(`🎯 Promoted batch: Added silent pre-roll (${this.initSegment.size} bytes) for standalone playback`);
+        } else {
+          standbyBatch.blob = new Blob(standbyBatch.chunks, { type: mimeType });
+          this.log(`⚠️ Promoted batch: No init segment available, using chunks only`);
+        }
+
+        this.log(`🎯 Promoted batch complete: ${standbyBatch.duration}ms, ${standbyBatch.blob.size} bytes`);
+
+        // Keep standby batch for new session
+        this.batches = [standbyBatch];
+
+        // Queue for playback
+        this.playbackQueue = [];
+        if (this.config.playbackEnabled) {
+          this.playbackQueue.push(standbyBatch);
+          standbyBatch.state = BatchState.Queued;
+          this.log(`🎯 Promoted batch queued for playback`);
+
+          // Start playback if not already playing
+          if (!this.isPlaying) {
+            this.playNextBatch();
+          }
+        }
+
+        // Start new batch for the promoted session
+        this.startBatchRecording();
+        this.log('🎯 Started new batch for promoted session');
+      } else {
+        this.batches = [];
+        this.playbackQueue = [];
+      }
+
+      this.isPlaying = false;
+      this.finishingSessionBatches = [];
+
+      // 🔥 LIFE-SAFETY: DO NOT reset audio validation after extended grace hot restart!
+      // We already detected emergency audio (that's why we're restarting)
+      // The promoted standby batch is mostly empty - user's audio is in the NEW batch
+      // If we reset validation, batch 2 will require fresh validation → cascade of new sessions
+      // Keep audioValidated=true so batch 2 is immediately queued when complete
+      // this.audioValidated = false;  // ❌ DISABLED for extended grace hot restart
+      // this.validationStartTime = 0;
+      this.log('🔥 LIFE-SAFETY: Keeping audioValidated=true for extended grace hot restart');
+      this.log(`   audioValidated=${this.audioValidated}, validationStartTime=${this.validationStartTime}`);
+
+      // Don't finish - audio promoted standby batch to new session
+      this.isFinishing = false;
+      return;
     }
 
     // All clear - no audio during grace or deactivation
@@ -1450,6 +1814,13 @@ export class BatchCoordinator {
 
     // Clear console after session complete for clean slate
     console.clear();
+
+    // Also clear the terminal where dev server is running
+    try {
+      await fetch('/api/clear-terminal', { method: 'POST' });
+    } catch (error) {
+      // Silently fail if API not available (production builds)
+    }
   }
 
   /**
@@ -1470,28 +1841,54 @@ export class BatchCoordinator {
     }
 
     // Combine all batches into single blob (fast, in-memory operation)
-    const allChunks = batchesToUpload.flatMap(b => b.chunks);
+    // For upload, we want: silent init segment + all audio chunks (no duplicate inits)
     const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
-    const combinedBlob = new Blob(allChunks, { type: mimeType });
+
+    let combinedBlob: Blob;
+
+    if (batchesToUpload.length === 1) {
+      // Single batch: use blob directly (already has silent init segment prepended)
+      combinedBlob = batchesToUpload[0].blob || new Blob(batchesToUpload[0].chunks, { type: mimeType });
+    } else {
+      // Multiple batches: use silent init segment once + all raw chunks
+      // This avoids duplicate init segments in the final recording
+      const allChunks = batchesToUpload.flatMap(b => b.chunks);
+      combinedBlob = this.initSegment
+        ? new Blob([this.initSegment, ...allChunks], { type: mimeType })
+        : new Blob(allChunks, { type: mimeType });
+    }
+
+    // Create playback recording blob if chunks exist
+    let playbackBlob: Blob | undefined = undefined;
+    if (this.playbackRecordedChunks.length > 0) {
+      playbackBlob = new Blob(this.playbackRecordedChunks, { type: mimeType });
+      this.log(`📼 Playback recording: ${playbackBlob.size} bytes (${this.playbackRecordedChunks.length} chunks)`);
+    }
 
     // Create completed session record
     const session: CompletedSession = {
       id: `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       sessionNumber: this.sessionId,
-      blob: combinedBlob,
+      blob: combinedBlob, // Input recording (raw microphone)
       mimeType: mimeType,
-      timestamp: Date.now(),
-      uploaded: false
+      timestamp: this.firstAudioDetectionTime || Date.now(), // Use first audio detection time (PST)
+      uploaded: false,
+      playbackBlob, // Playback recording (what actually played)
+      playbackUploaded: false,
     };
 
     // Add to queue
     this.completedSessions.push(session);
 
-    this.log(`📦 Session queued for upload: ${combinedBlob.size} bytes (${batchesToUpload.length} batches)`);
+    this.log(`📦 Input recording queued: ${combinedBlob.size} bytes (${batchesToUpload.length} batches)`);
+    if (playbackBlob) {
+      this.log(`📦 Playback recording queued: ${playbackBlob.size} bytes`);
+    }
     this.log(`   Queue size: ${this.completedSessions.length} session(s)`);
 
-    // Clear finishingSessionBatches
+    // Clear finishingSessionBatches and playback chunks
     this.finishingSessionBatches = [];
+    this.playbackRecordedChunks = [];
 
     // Start background upload worker if not already running
     if (!this.uploadInProgress) {
@@ -1525,35 +1922,62 @@ export class BatchCoordinator {
         break;
       }
 
-      this.log(`⬆️ Uploading session ${session.id} (${session.blob.size} bytes)...`);
+      // Upload input recording (raw microphone)
+      if (!session.uploaded) {
+        this.log(`⬆️ Uploading INPUT recording ${session.id} (${session.blob.size} bytes)...`);
 
-      try {
-        // Upload to Firebase (this is the slow part, but it's non-blocking now!)
-        const url = await this.config.onUpload(session.blob, session.mimeType);
+        try {
+          const url = await this.config.onUpload(session.blob, session.mimeType, session.timestamp);
 
-        session.uploaded = true;
-        session.uploadUrl = url;
+          session.uploaded = true;
+          session.uploadUrl = url;
 
-        this.log(`✓ Background upload complete: ${url}`);
+          this.log(`✓ Input recording uploaded: ${url}`);
 
-        this.config.onLog({
-          type: 'volume_change',
-          message: `🎙️ Recording saved: ${url}`
-        });
+          this.config.onLog({
+            type: 'volume_change',
+            message: `🎙️ Input recording saved: ${url}`
+          });
 
-        // Remove from queue after successful upload (optional - keep for retry)
-        // this.completedSessions = this.completedSessions.filter(s => s.id !== session.id);
+        } catch (error) {
+          this.log(`⚠️ Input recording upload failed: ${error}`);
 
-      } catch (error) {
-        this.log(`⚠️ Upload failed: ${error}`);
+          if (this.config.onError) {
+            this.config.onError(error as Error);
+          }
 
-        if (this.config.onError) {
-          this.config.onError(error as Error);
+          // Don't remove from queue - will retry on next worker start
+          break;
         }
+      }
 
-        // Don't remove from queue - will retry on next worker start
-        // Break out of loop to allow other operations to proceed
-        break;
+      // Upload playback recording (what actually played through speakers)
+      if (session.playbackBlob && !session.playbackUploaded) {
+        this.log(`⬆️ Uploading PLAYBACK recording ${session.id} (${session.playbackBlob.size} bytes)...`);
+
+        try {
+          // Use same timestamp but pass isPlayback=true to append "-playback" suffix
+          const url = await this.config.onUpload(session.playbackBlob, session.mimeType, session.timestamp, true);
+
+          session.playbackUploaded = true;
+          session.playbackUploadUrl = url;
+
+          this.log(`✓ Playback recording uploaded: ${url}`);
+
+          this.config.onLog({
+            type: 'volume_change',
+            message: `🔊 Playback recording saved: ${url}`
+          });
+
+        } catch (error) {
+          this.log(`⚠️ Playback recording upload failed: ${error}`);
+
+          if (this.config.onError) {
+            this.config.onError(error as Error);
+          }
+
+          // Continue - don't block if playback upload fails
+        }
       }
     }
 
@@ -1586,9 +2010,33 @@ export class BatchCoordinator {
       // Audio was validated during finish phase → promote to new session
       this.log(`🎯 Standby batch promoted to new session (emergency audio validated)`);
 
-      // Keep current batch (it's the first batch of the new session)
-      // Clear old batches from finished session
-      this.batches = [this.currentBatch!]; // Non-null assertion: hasStandbyBatch ensures currentBatch exists
+      // 🔥 CRITICAL: Complete the standby batch and queue it for playback!
+      // The standby batch has accumulated chunks during finish phase but hasn't been completed yet
+      const standbyBatch = this.currentBatch!;
+      standbyBatch.endTime = Date.now();
+      standbyBatch.state = BatchState.Ready;
+
+      // Create blob from chunks
+      const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
+      if (this.initSegment) {
+        standbyBatch.blob = new Blob([this.initSegment, ...standbyBatch.chunks], { type: mimeType });
+        this.log(`🎯 Promoted batch: Added silent pre-roll (${this.initSegment.size} bytes) for standalone playback`);
+      } else {
+        standbyBatch.blob = new Blob(standbyBatch.chunks, { type: mimeType });
+        this.log(`⚠️ Promoted batch: No init segment available, using chunks only`);
+      }
+
+      this.log(`🎯 Promoted batch complete: ${standbyBatch.duration}ms, ${standbyBatch.blob.size} bytes`);
+
+      // Keep current batch as the promoted session
+      this.batches = [standbyBatch];
+
+      // 🔥 CRITICAL: Queue the promoted batch for playback!
+      if (this.config.playbackEnabled) {
+        this.playbackQueue.push(standbyBatch);
+        standbyBatch.state = BatchState.Queued;
+        this.log(`🎯 Promoted batch queued for playback`);
+      }
 
       // Increment session ID for new session
       this.sessionId++;
@@ -1607,8 +2055,12 @@ export class BatchCoordinator {
       this.currentBatch = null;
     }
 
-    // Clear playback state
-    this.playbackQueue = [];
+    // Clear playback state (but keep promoted batch if queued!)
+    if (!hasStandbyBatch || !this.audioValidated) {
+      this.playbackQueue = [];
+    } else {
+      this.log(`🎯 Playback queue preserved for promoted batch (${this.playbackQueue.length} batch(es))`);
+    }
     this.isPlaying = false;
     this.hardwareReady = false;
     this.pagingActive = false;
@@ -1649,10 +2101,6 @@ export class BatchCoordinator {
       this.startBatchRecording();
       this.log('🎯 Idle standby batch started (capturing chunks silently)');
     }
-
-    // 🛡️ HARDWARE THRASH PROTECTION: Reset counter when reaching idle
-    // This allows re-activation on the NEXT session cycle
-    this.reactivationAttempts = 0;
 
     this.log('🎯 System in idle standby state (ready for next session)');
   }
@@ -1728,22 +2176,97 @@ export class BatchCoordinator {
     return 'audio/webm'; // Fallback
   }
 
+  /**
+   * Setup page visibility listener to resume AudioContext when page becomes visible
+   * This fixes playback issues when navigating away and back
+   */
+  private setupVisibilityListener(): void {
+    if (typeof document === 'undefined') return; // Server-side guard
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden && this.audioContext) {
+        this.resumeAudioContextIfNeeded();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // Cleanup on abort
+    const originalAbort = this.abort.bind(this);
+    this.abort = async () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      await originalAbort();
+    };
+
+    this.log('🎵 Page visibility listener setup (auto-resume when returning to page)');
+  }
+
+  /**
+   * Resume AudioContext if suspended
+   * Fixes playback issues when navigating between pages
+   */
+  private async resumeAudioContextIfNeeded(): Promise<void> {
+    if (!this.audioContext) return;
+
+    if (this.audioContext.state === 'suspended') {
+      this.log('⚠️ AudioContext suspended, resuming...');
+      try {
+        await this.audioContext.resume();
+        this.log('✓ AudioContext resumed successfully');
+      } catch (error) {
+        this.log(`⚠️ Failed to resume AudioContext: ${error}`);
+      }
+    } else if (this.audioContext.state === 'running') {
+      // Already running, no action needed
+    } else {
+      this.log(`⚠️ AudioContext state: ${this.audioContext.state}`);
+    }
+  }
+
   private log(message: string): void {
     // 🎨 Color-coded logs for different system states
 
+    // 🎵 Playback Events: Magenta (easy to spot when playback starts/ends)
+    if (message.includes('Playing batch') ||
+        message.includes('Playback complete') ||
+        message.includes('playback complete')) {
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #ff00ff; font-weight: bold; font-size: 14px');
+    }
+    // 🔥 Hot Restart / Hardware Reset: Red (critical system events)
+    else if (message.includes('HOT RESTART') ||
+             message.includes('Hardware reset') ||
+             message.includes('Forcing ALL speakers') ||
+             message.includes('Step 1') ||
+             message.includes('Step 2') ||
+             message.includes('Step 3') ||
+             message.includes('Step 4')) {
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #ff0000; font-weight: bold; font-size: 14px');
+    }
+    // 📼 Recording Status: Yellow (shows recording is active)
+    else if (message.includes('Recording continues') ||
+             message.includes('Batch') && message.includes('complete:') ||
+             message.includes('Started recording')) {
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #ffff00; font-weight: bold');
+    }
     // 🛡️ TailGuard: Orange (watching for emergency audio after silence)
-    if (message.includes('TailGuard') || message.includes('🛡️')) {
+    else if (message.includes('TailGuard') || message.includes('🛡️')) {
       console.log(`%c[BatchCoordinator] ${message}`, 'color: #ff9500; font-weight: bold');
     }
     // 🔒 Grace Period: Cyan (post-playback window for "hello" responses)
     else if (message.includes('Grace') || message.includes('grace') || message.includes('🔒')) {
-      console.log(`%c[BatchCoordinator] ${message}`, 'color: #00d4ff; font-weight: bold');
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #00d4ff; font-weight: bold; font-size: 13px');
     }
     // 🟢 Idle Standby: Green (system ready, listening)
     else if (message.includes('System in idle standby state') ||
         message.includes('Idle standby batch started') ||
         message.includes('Session complete')) {
       console.log(`%c[BatchCoordinator] ${message}`, 'color: #00ff00; font-weight: bold');
+    }
+    // 📦 Upload Events: Blue (background uploads)
+    else if (message.includes('queued for upload') ||
+             message.includes('Upload') ||
+             message.includes('upload')) {
+      console.log(`%c[BatchCoordinator] ${message}`, 'color: #0099ff; font-weight: bold');
     }
     // Default: White
     else {
