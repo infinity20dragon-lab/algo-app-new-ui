@@ -49,6 +49,8 @@ interface SimpleRecorderConfig {
   silenceTimeout?: number; // CONFIGURABLE: 0-30000ms (when to stop batching after silence)
                           // 0ms = stop immediately (new session per pause)
                           // Higher = more forgiving pauses in same session
+  audioThreshold?: number; // Audio level threshold (0-100) to trigger voice detection (default: 5)
+  sustainDuration?: number; // How long audio must stay above threshold (ms) before triggering (default: 500)
 
   // Hardware settings
   linkedSpeakers: any[]; // Algo speakers to control
@@ -56,10 +58,14 @@ interface SimpleRecorderConfig {
   playbackDelay?: number; // Delay before playback starts (for speaker stabilization)
 
   // Playback Volume Ramping (Web Audio API - non-blocking)
+  playbackVolume?: number; // Static playback volume (0.0 - 2.0) when NOT ramping
   playbackRampEnabled?: boolean; // Enable volume ramping per session
   playbackRampStartVolume?: number; // Starting volume (0.0 - 2.0)
   playbackRampTargetVolume?: number; // Target volume (0.0 - 2.0)
   playbackRampDuration?: number; // Ramp duration in ms
+  playbackRampScheduleEnabled?: boolean; // Enable time-based ramping schedule
+  playbackRampStartHour?: number; // Start hour for ramping (0-23.5, supports half hours)
+  playbackRampEndHour?: number; // End hour for ramping (0-23.5, supports half hours)
 
   // Emulation Mode (for testing without physical devices)
   emulationMode?: boolean; // Skip actual network calls
@@ -104,6 +110,7 @@ export class SimpleRecorder {
   private playbackAnalyserNode: AnalyserNode | null = null;
   private playbackGainNode: GainNode | null = null;
   private playbackLevelInterval: number | null = null;
+  private desiredPlaybackVolume: number = 1.0; // Track desired volume even when GainNode doesn't exist
 
   // Recording Loop State
   private isMonitoring: boolean = false;
@@ -139,6 +146,10 @@ export class SimpleRecorder {
   // Silence detection
   private silenceCheckInterval: number | null = null;
 
+  // Audio threshold and sustain detection
+  private audioAboveThresholdStart: number | null = null; // When audio first went above threshold
+  private isAudioSustained: boolean = false; // Has audio been sustained long enough?
+
   // Status logging
   private statusLogInterval: number | null = null;
   private lastLoggedAudioLevel: number = 0;
@@ -148,11 +159,16 @@ export class SimpleRecorder {
       batchDuration: 5000,
       silenceTimeout: 8000,
       playbackDelay: 4000,
+      audioThreshold: 0, // 0 = capture everything (no threshold)
+      sustainDuration: 0, // 0ms = no delay (instant trigger)
       saveRecording: true,
       emulationMode: false,
       emulationNetworkDelay: 0,
       ...config,
     };
+
+    // Initialize desired playback volume from config (defaults to 1.0 if not provided)
+    this.desiredPlaybackVolume = this.config.playbackVolume ?? 1.0;
   }
 
   // ============================================================================
@@ -191,7 +207,8 @@ export class SimpleRecorder {
 
     // Set up GainNode for volume control
     this.playbackGainNode = this.audioContext.createGain();
-    this.playbackGainNode.gain.value = 1.0; // Default 100% volume
+    this.playbackGainNode.gain.value = this.desiredPlaybackVolume; // Use saved volume from slider
+    this.log(`🔊 Playback GainNode initialized at ${(this.desiredPlaybackVolume * 100).toFixed(0)}%`);
 
     // 🔥 Capture 200ms silent pre-roll for init segment (LIKE BATCH COORDINATOR)
     // IMPORTANT: Start monitoring when quiet (no "eh" sounds)!
@@ -334,9 +351,48 @@ export class SimpleRecorder {
 
   // Set playback volume (0.0 = mute, 1.0 = 100%, 2.0 = 200%)
   setPlaybackVolume(volume: number): void {
+    // Save desired volume
+    this.desiredPlaybackVolume = volume;
+
+    // Apply immediately if GainNode exists
     if (this.playbackGainNode) {
       this.playbackGainNode.gain.value = volume;
       this.log(`🔊 Playback volume updated: ${(volume * 100).toFixed(0)}%`);
+    } else {
+      this.log(`🔊 Playback volume saved: ${(volume * 100).toFixed(0)}% (will apply when monitoring starts)`);
+    }
+  }
+
+  // Check if current time is within the ramp time window (PST timezone)
+  private isWithinRampWindow(): boolean {
+    // If schedule not enabled, always allow ramping (if playbackRampEnabled is true)
+    if (!this.config.playbackRampScheduleEnabled) {
+      return true;
+    }
+
+    // Get current PST time
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: false,
+    });
+    const parts = formatter.formatToParts(now);
+    const hour = parseInt(parts.find(p => p.type === 'hour')?.value || '0');
+    const minute = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
+    const currentTime = hour + (minute / 60); // Convert to decimal hours (e.g., 18.5 = 6:30 PM)
+
+    const startHour = this.config.playbackRampStartHour ?? 18; // Default 6:00 PM
+    const endHour = this.config.playbackRampEndHour ?? 6; // Default 6:00 AM
+
+    // Check if we're within the window (handles overnight ranges like 18:00 - 6:00)
+    if (startHour < endHour) {
+      // Same day range (e.g., 8:00 AM - 5:00 PM)
+      return currentTime >= startHour && currentTime < endHour;
+    } else {
+      // Overnight range (e.g., 6:00 PM - 6:00 AM)
+      return currentTime >= startHour || currentTime < endHour;
     }
   }
 
@@ -482,9 +538,51 @@ export class SimpleRecorder {
       const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
       const level = Math.round((average / 255) * 100);
 
+      const threshold = this.config.audioThreshold ?? 0;
+      const sustainDuration = this.config.sustainDuration ?? 0;
+
+      // Check if audio is above threshold
+      const isAboveThreshold = level > threshold;
+
+      // Track sustain duration
+      const now = Date.now();
+      if (isAboveThreshold) {
+        if (!this.audioAboveThresholdStart) {
+          // Audio just went above threshold
+          this.audioAboveThresholdStart = now;
+
+          // If sustain duration is 0ms, trigger immediately
+          if (sustainDuration === 0) {
+            this.isAudioSustained = true;
+          } else {
+            this.isAudioSustained = false;
+          }
+        } else if (!this.isAudioSustained && sustainDuration > 0) {
+          // Check if sustained long enough
+          const duration = now - this.audioAboveThresholdStart;
+          if (duration >= sustainDuration) {
+            this.isAudioSustained = true;
+            this.log(`🎤 Audio sustained for ${duration}ms - VOICE DETECTED (threshold: ${threshold}%, sustain: ${sustainDuration}ms)`);
+          }
+        }
+      } else {
+        // Audio dropped below threshold - reset
+        this.audioAboveThresholdStart = null;
+        this.isAudioSustained = false;
+      }
+
       // Log significant audio level changes
       if (Math.abs(level - this.lastLoggedAudioLevel) > 10) {
-        this.log(`🎤 Audio Level: ${level}% ${level > 5 ? '(VOICE DETECTED)' : '(quiet)'}`);
+        let status = '(quiet)';
+        if (isAboveThreshold) {
+          if (this.isAudioSustained) {
+            status = '(VOICE DETECTED)';
+          } else if (sustainDuration > 0) {
+            const elapsed = this.audioAboveThresholdStart ? now - this.audioAboveThresholdStart : 0;
+            status = `(sustaining... ${elapsed}ms/${sustainDuration}ms)`;
+          }
+        }
+        this.log(`🎤 Audio Level: ${level}% ${status}`);
         this.lastLoggedAudioLevel = level;
       }
 
@@ -493,8 +591,8 @@ export class SimpleRecorder {
         this.config.onAudioLevel(level);
       }
 
-      // Auto-trigger onAudioDetected for batching
-      if (level > 0) {
+      // Auto-trigger onAudioDetected for batching if sustained
+      if (this.isAudioSustained) {
         this.onAudioDetected(level);
       }
     }, 50); // Check every 50ms
@@ -950,8 +1048,10 @@ export class SimpleRecorder {
       this.playbackGainNode!.connect(this.playbackAnalyserNode);
       this.playbackAnalyserNode.connect(this.audioContext.destination);
 
-      // 🎚️ Apply volume ramping if enabled and first batch of session
-      if (this.config.playbackRampEnabled && isFirstBatchOfSession) {
+      // 🎚️ Apply volume ramping if enabled, first batch of session, AND within time window
+      const shouldRamp = this.config.playbackRampEnabled && isFirstBatchOfSession && this.isWithinRampWindow();
+
+      if (shouldRamp) {
         const startVol = this.config.playbackRampStartVolume ?? 0;
         const targetVol = this.config.playbackRampTargetVolume ?? 1.0;
         const rampDuration = (this.config.playbackRampDuration ?? 2000) / 1000; // Convert to seconds
@@ -967,7 +1067,14 @@ export class SimpleRecorder {
 
         this.log(`🎚️ RAMPING: ${(startVol * 100).toFixed(0)}% → ${(targetVol * 100).toFixed(0)}% over ${rampDuration.toFixed(1)}s`);
       } else {
-        this.log(`🔊 Volume: ${(this.playbackGainNode!.gain.value * 100).toFixed(0)}%`);
+        // NOT ramping - ensure volume is at the current playback volume setting
+        // (The user controls this via the playback volume slider, which calls setPlaybackVolume)
+        // The gain node keeps its current value, which is updated by setPlaybackVolume() when the slider changes
+
+        if (this.config.playbackRampEnabled && isFirstBatchOfSession && !this.isWithinRampWindow()) {
+          this.log(`🕐 Outside ramp window - using static volume`);
+        }
+        this.log(`🔊 Static Volume: ${(this.playbackGainNode!.gain.value * 100).toFixed(0)}%`);
       }
 
       this.log(`▶️  Starting playback...`);
@@ -1006,8 +1113,8 @@ export class SimpleRecorder {
   private async finalizePlaybackSession(sessionId: string): Promise<void> {
     this.log(`🏁 FINALIZING PLAYBACK SESSION: ${sessionId}`);
 
-    // Reset volume to start volume if ramping is enabled
-    if (this.config.playbackRampEnabled && this.playbackGainNode && this.audioContext) {
+    // Reset volume to start volume if ramping is enabled AND within time window
+    if (this.config.playbackRampEnabled && this.isWithinRampWindow() && this.playbackGainNode && this.audioContext) {
       const startVol = this.config.playbackRampStartVolume ?? 0;
       this.playbackGainNode.gain.setValueAtTime(startVol, this.audioContext.currentTime);
       this.log(`🎚️ Volume reset to ${(startVol * 100).toFixed(0)}% (ready for next session)`);

@@ -61,6 +61,9 @@ interface SimpleMonitoringContextType {
   playbackRampStartVolume: number;
   playbackRampTargetVolume: number;
   playbackSessionRampDuration: number;
+  playbackRampScheduleEnabled: boolean;
+  playbackRampStartHour: number;
+  playbackRampEndHour: number;
 
   // Recording & Playback
   saveRecording: boolean;
@@ -103,6 +106,9 @@ interface SimpleMonitoringContextType {
   setPlaybackRampStartVolume: (value: number) => void;
   setPlaybackRampTargetVolume: (value: number) => void;
   setPlaybackSessionRampDuration: (ms: number) => void;
+  setPlaybackRampScheduleEnabled: (enabled: boolean) => void;
+  setPlaybackRampStartHour: (hour: number) => void;
+  setPlaybackRampEndHour: (hour: number) => void;
   setSaveRecording: (enabled: boolean) => void;
   setRecordingEnabled: (enabled: boolean) => void;
   setLoggingEnabled: (enabled: boolean) => void;
@@ -143,8 +149,8 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   const [batchDuration, setBatchDuration] = useState(5000);
   const [silenceTimeout, setSilenceTimeout] = useState(8000);
   const [playbackDelay, setPlaybackDelay] = useState(4000);
-  const [audioThreshold, setAudioThreshold] = useState(5);
-  const [sustainDuration, setSustainDuration] = useState(500);
+  const [audioThreshold, setAudioThreshold] = useState(0);
+  const [sustainDuration, setSustainDuration] = useState(0);
   const [disableDelay, setDisableDelay] = useState(8000);
 
   // Volume & Ramp Settings
@@ -167,6 +173,9 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   const [playbackRampStartVolume, setPlaybackRampStartVolume] = useState(0);
   const [playbackRampTargetVolume, setPlaybackRampTargetVolume] = useState(2.0);
   const [playbackSessionRampDuration, setPlaybackSessionRampDuration] = useState(2000);
+  const [playbackRampScheduleEnabled, setPlaybackRampScheduleEnabled] = useState(false);
+  const [playbackRampStartHour, setPlaybackRampStartHour] = useState(18); // 6:00 PM
+  const [playbackRampEndHour, setPlaybackRampEndHour] = useState(6); // 6:00 AM
 
   // Recording & Playback
   const [saveRecording, setSaveRecording] = useState(true);
@@ -233,6 +242,9 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     if (sessionState.playbackRampStartVolume !== undefined) setPlaybackRampStartVolume(sessionState.playbackRampStartVolume);
     if (sessionState.playbackRampTargetVolume !== undefined) setPlaybackRampTargetVolume(sessionState.playbackRampTargetVolume);
     if (sessionState.playbackSessionRampDuration !== undefined) setPlaybackSessionRampDuration(sessionState.playbackSessionRampDuration);
+    if (sessionState.playbackRampScheduleEnabled !== undefined) setPlaybackRampScheduleEnabled(sessionState.playbackRampScheduleEnabled);
+    if (sessionState.playbackRampStartHour !== undefined) setPlaybackRampStartHour(sessionState.playbackRampStartHour);
+    if (sessionState.playbackRampEndHour !== undefined) setPlaybackRampEndHour(sessionState.playbackRampEndHour);
 
     // Load recording/playback settings
     if (sessionState.saveRecording !== undefined) setSaveRecording(sessionState.saveRecording);
@@ -270,6 +282,9 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
       playbackRampStartVolume,
       playbackRampTargetVolume,
       playbackSessionRampDuration,
+      playbackRampScheduleEnabled,
+      playbackRampStartHour,
+      playbackRampEndHour,
       saveRecording,
       loggingEnabled,
       playbackEnabled,
@@ -283,6 +298,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     targetVolume, rampEnabled, rampDuration, dayNightMode, dayStartHour, dayEndHour, nightRampDuration,
     playbackRampDuration, playbackStartVolume, playbackMaxVolume, playbackVolume,
     playbackRampEnabled, playbackRampStartVolume, playbackRampTargetVolume, playbackSessionRampDuration,
+    playbackRampScheduleEnabled, playbackRampStartHour, playbackRampEndHour,
     saveRecording, loggingEnabled, playbackEnabled, emulationMode, emulationNetworkDelay,
     syncSessionState,
   ]);
@@ -357,15 +373,21 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
         batchDuration,
         silenceTimeout,
         playbackDelay,
+        audioThreshold,
+        sustainDuration,
         linkedSpeakers,
         pagingDevice,
         saveRecording,
         emulationMode,
         emulationNetworkDelay,
+        playbackVolume,
         playbackRampEnabled,
         playbackRampStartVolume,
         playbackRampTargetVolume,
         playbackRampDuration: playbackSessionRampDuration,
+        playbackRampScheduleEnabled,
+        playbackRampStartHour,
+        playbackRampEndHour,
         uploadCallback: async (blob, filename) => {
           try {
             addLog(`Uploading ${filename} (${(blob.size / 1024).toFixed(2)} KB)...`, 'info');
@@ -677,6 +699,9 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     playbackRampStartVolume,
     playbackRampTargetVolume,
     playbackSessionRampDuration,
+    playbackRampScheduleEnabled,
+    playbackRampStartHour,
+    playbackRampEndHour,
 
     // Recording & Playback
     saveRecording,
@@ -719,6 +744,9 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     setPlaybackRampStartVolume,
     setPlaybackRampTargetVolume,
     setPlaybackSessionRampDuration,
+    setPlaybackRampScheduleEnabled,
+    setPlaybackRampStartHour,
+    setPlaybackRampEndHour,
     setSaveRecording,
     setRecordingEnabled: setSaveRecording, // Alias
     setLoggingEnabled,

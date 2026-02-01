@@ -98,6 +98,12 @@ function LiveV2Content() {
     setPlaybackRampTargetVolume,
     playbackSessionRampDuration,
     setPlaybackSessionRampDuration,
+    playbackRampScheduleEnabled,
+    setPlaybackRampScheduleEnabled,
+    playbackRampStartHour,
+    setPlaybackRampStartHour,
+    playbackRampEndHour,
+    setPlaybackRampEndHour,
     devices: contextDevices,
     setDevices: setContextDevices,
     setPoeDevices,
@@ -448,6 +454,69 @@ function LiveV2Content() {
                               value={playbackSessionRampDuration}
                               onChange={(e) => setPlaybackSessionRampDuration(parseInt(e.target.value))}
                             />
+                          </div>
+
+                          {/* Time-Based Schedule */}
+                          <div className="mt-4 pt-4 border-t border-[var(--accent-blue)]/20">
+                            <div className="flex items-center justify-between mb-3">
+                              <div>
+                                <Label className="text-xs">Schedule Ramping</Label>
+                                <p className="text-xs text-[var(--text-muted)]">Only ramp during specific hours</p>
+                              </div>
+                              <Switch
+                                checked={playbackRampScheduleEnabled}
+                                onCheckedChange={setPlaybackRampScheduleEnabled}
+                              />
+                            </div>
+
+                            {playbackRampScheduleEnabled && (
+                              <div className="space-y-3">
+                                {/* Start Time */}
+                                <div>
+                                  <Label className="text-xs">Start Time (Ramp Enabled)</Label>
+                                  <select
+                                    className="w-full mt-1 px-3 py-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border-color)] text-sm"
+                                    value={playbackRampStartHour}
+                                    onChange={(e) => setPlaybackRampStartHour(parseFloat(e.target.value))}
+                                  >
+                                    {Array.from({ length: 48 }, (_, i) => i * 0.5).map(hour => {
+                                      const h = Math.floor(hour);
+                                      const m = (hour % 1) * 60;
+                                      const ampm = h >= 12 ? 'PM' : 'AM';
+                                      const displayHour = h % 12 || 12;
+                                      const time = `${displayHour}:${m === 0 ? '00' : '30'} ${ampm}`;
+                                      return <option key={hour} value={hour}>{time}</option>;
+                                    })}
+                                  </select>
+                                </div>
+
+                                {/* End Time */}
+                                <div>
+                                  <Label className="text-xs">End Time (Ramp Disabled)</Label>
+                                  <select
+                                    className="w-full mt-1 px-3 py-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border-color)] text-sm"
+                                    value={playbackRampEndHour}
+                                    onChange={(e) => setPlaybackRampEndHour(parseFloat(e.target.value))}
+                                  >
+                                    {Array.from({ length: 48 }, (_, i) => i * 0.5).map(hour => {
+                                      const h = Math.floor(hour);
+                                      const m = (hour % 1) * 60;
+                                      const ampm = h >= 12 ? 'PM' : 'AM';
+                                      const displayHour = h % 12 || 12;
+                                      const time = `${displayHour}:${m === 0 ? '00' : '30'} ${ampm}`;
+                                      return <option key={hour} value={hour}>{time}</option>;
+                                    })}
+                                  </select>
+                                </div>
+
+                                <div className="flex items-start gap-2 p-2 rounded bg-[var(--accent-purple)]/10">
+                                  <span className="text-xs">🕐</span>
+                                  <p className="text-xs text-[var(--text-secondary)]">
+                                    <strong>Example:</strong> 6:00 PM - 7:30 AM = ramp enabled at night, static volume during day
+                                  </p>
+                                </div>
+                              </div>
+                            )}
                           </div>
 
                           <div className="flex items-start gap-2 p-2 rounded bg-[var(--accent-blue)]/10">
@@ -827,17 +896,17 @@ function LiveV2Content() {
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <Label>Sustain Duration</Label>
-                    <span className="text-sm font-mono text-[var(--accent-blue)]">{sustainDuration >= 1000 ? `${(sustainDuration / 1000).toFixed(1)}s` : `${sustainDuration}ms`}</span>
+                    <span className="text-sm font-mono text-[var(--accent-blue)]">{sustainDuration === 0 ? 'Instant (0ms)' : sustainDuration >= 1000 ? `${(sustainDuration / 1000).toFixed(1)}s` : `${sustainDuration}ms`}</span>
                   </div>
                   <Slider
-                    min={10}
+                    min={0}
                     max={3000}
                     step={10}
                     value={sustainDuration}
                     onChange={(e) => setSustainDuration(parseInt(e.target.value))}
                   />
                   <p className="text-xs text-[var(--text-muted)]">
-                    Audio must stay above threshold for this duration to trigger
+                    {sustainDuration === 0 ? 'Instant trigger (no delay) - captures everything' : 'Audio must stay above threshold for this duration to trigger'}
                   </p>
                 </div>
 

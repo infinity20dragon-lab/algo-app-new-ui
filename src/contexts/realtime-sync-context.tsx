@@ -84,6 +84,9 @@ export interface SessionState {
   playbackRampStartVolume: number; // Ramp start volume (0-2)
   playbackRampTargetVolume: number; // Ramp target volume (0-2)
   playbackSessionRampDuration: number; // Ramp duration (ms)
+  playbackRampScheduleEnabled: boolean; // Enable time-based ramping schedule
+  playbackRampStartHour: number; // Start hour for ramping (0-23.5, supports half hours)
+  playbackRampEndHour: number; // End hour for ramping (0-23.5, supports half hours)
   emulationMode: boolean; // Hardware emulation mode
   emulationNetworkDelay: number; // Emulation delay (ms)
   saveRecording: boolean; // Save recordings to Firebase
