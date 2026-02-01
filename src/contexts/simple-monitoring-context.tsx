@@ -303,6 +303,69 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
         onPlaybackLevel: (level) => {
           setPlaybackAudioLevel(level);
         },
+        setSpeakerMulticastIP: async (speakerId: string, ip: string, port: number) => {
+          // Find speaker device
+          const speaker = devices.find(d => d.id === speakerId);
+          if (!speaker || !speaker.ipAddress || !speaker.apiPassword) {
+            throw new Error(`Speaker ${speakerId} not found or missing credentials`);
+          }
+
+          addLog(`Setting ${speaker.name} multicast to ${ip}:${port}`, 'info');
+
+          try {
+            const response = await fetch("/api/algo/speakers/mcast", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                ipAddress: speaker.ipAddress,
+                password: speaker.apiPassword,
+                multicastIP: ip,
+                multicastPort: port,
+              }),
+            });
+
+            if (!response.ok) {
+              throw new Error(`API returned ${response.status}`);
+            }
+
+            addLog(`✓ ${speaker.name} multicast updated`, 'info');
+          } catch (error) {
+            addLog(`❌ Failed to set ${speaker.name} multicast: ${error}`, 'error');
+            throw error;
+          }
+        },
+        setPagingMulticastIP: async (active: boolean) => {
+          const multicastIP = active ? "224.0.2.60:50002" : "224.0.2.60:50022";
+          const mode = active ? "active" : "idle";
+
+          addLog(`Setting paging multicast to ${mode} (${multicastIP})`, 'info');
+
+          if (!pagingDevice || !pagingDevice.ipAddress || !pagingDevice.apiPassword) {
+            throw new Error('Paging device not configured or missing credentials');
+          }
+
+          try {
+            const response = await fetch("/api/algo/settings", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                ipAddress: pagingDevice.ipAddress,
+                password: pagingDevice.apiPassword,
+                setting: "mcast.1.addr",
+                value: multicastIP,
+              }),
+            });
+
+            if (!response.ok) {
+              throw new Error(`API returned ${response.status}`);
+            }
+
+            addLog(`✓ Paging device set to ${mode} mode`, 'info');
+          } catch (error) {
+            addLog(`❌ Failed to set paging multicast: ${error}`, 'error');
+            throw error;
+          }
+        },
       });
 
       // Start recorder

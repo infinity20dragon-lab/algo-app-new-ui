@@ -74,6 +74,10 @@ interface SimpleRecorderConfig {
   onError?: (error: Error) => void;
   onAudioLevel?: (level: number) => void;
   onPlaybackLevel?: (level: number) => void;
+
+  // Hardware Control Callbacks
+  setSpeakerMulticastIP?: (speakerId: string, ip: string, port: number) => Promise<void>;
+  setPagingMulticastIP?: (active: boolean) => Promise<void>;
 }
 
 // Internal config type with required properties
@@ -809,17 +813,13 @@ export class SimpleRecorder {
       if (linkedSpeakers.length > 0) {
         this.log(`Setting ${linkedSpeakers.length} speaker(s) to active IP...`);
 
-        // Show individual speaker operations
+        // Set multicast IP for each speaker
         for (const speaker of linkedSpeakers) {
           this.log(`  → ${speaker.name} (${speaker.ipAddress}): Setting to 224.0.2.60:50002`);
 
-          // In real mode, this would be:
-          // await setMulticastIP(speaker, '224.0.2.60:50002');
-          // await pollSpeakerReady(speaker);
-
-          // Emulation mode: simulate network delay
-          if (this.config.emulationMode) {
-            await new Promise(resolve => setTimeout(resolve, 50)); // Small delay per speaker
+          // Call API to set speaker multicast IP
+          if (this.config.setSpeakerMulticastIP) {
+            await this.config.setSpeakerMulticastIP(speaker.id, '224.0.2.60', 50002);
           }
 
           this.log(`  ✓ ${speaker.name}: Ready`);
@@ -828,15 +828,17 @@ export class SimpleRecorder {
         this.log('⚠️  No linked speakers to activate');
       }
 
-      // Paging device info
+      // Set paging device multicast IP to active mode
       if (this.config.pagingDevice) {
         this.log(`📢 Paging device: ${this.config.pagingDevice.name} (${this.config.pagingDevice.ipAddress})`);
+        this.log(`   Setting paging to ACTIVE mode (224.0.2.60:50002)`);
+
+        if (this.config.setPagingMulticastIP) {
+          await this.config.setPagingMulticastIP(true);
+        }
       } else {
         this.log('⚠️  No paging device configured');
       }
-
-      // Simulation delay for overall activation
-      await new Promise(resolve => setTimeout(resolve, 500));
 
       this.hardwareReady = true;
       this.log('✅ Speakers ACTIVE - Ready for playback');
@@ -1032,17 +1034,13 @@ export class SimpleRecorder {
       if (linkedSpeakers.length > 0) {
         this.log(`Setting ${linkedSpeakers.length} speaker(s) to idle IP...`);
 
-        // Show individual speaker operations
+        // Set multicast IP for each speaker
         for (const speaker of linkedSpeakers) {
           this.log(`  → ${speaker.name} (${speaker.ipAddress}): Setting to 224.0.2.60:50022`);
 
-          // In real mode, this would be:
-          // await setMulticastIP(speaker, '224.0.2.60:50022');
-          // await pollSpeakerReady(speaker);
-
-          // Emulation mode: simulate network delay
-          if (this.config.emulationMode) {
-            await new Promise(resolve => setTimeout(resolve, 50)); // Small delay per speaker
+          // Call API to set speaker multicast IP
+          if (this.config.setSpeakerMulticastIP) {
+            await this.config.setSpeakerMulticastIP(speaker.id, '224.0.2.60', 50022);
           }
 
           this.log(`  ✓ ${speaker.name}: Idle`);
@@ -1051,8 +1049,14 @@ export class SimpleRecorder {
         this.log('⚠️  No linked speakers to deactivate');
       }
 
-      // Temporary simulation until real implementation
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // Set paging device multicast IP to idle mode
+      if (this.config.pagingDevice) {
+        this.log(`   Setting paging to IDLE mode (224.0.2.60:50022)`);
+
+        if (this.config.setPagingMulticastIP) {
+          await this.config.setPagingMulticastIP(false);
+        }
+      }
 
       this.hardwareReady = false;
       this.log('✅ Speakers IDLE - In standby mode');
