@@ -343,38 +343,56 @@ export class SimpleRecorder {
 
   // Initialize hardware to idle state with configured volume
   async initializeHardware(volumePercent: number): Promise<void> {
-    this.log('🎛️ ═══ HARDWARE INITIALIZATION START ═══');
-    this.log(`Initializing speakers to IDLE mode (224.0.2.60:50022) with volume ${volumePercent}%`);
+    this.log('🎛️ ═══════════════════════════════════════');
+    this.log('🎛️ HARDWARE INITIALIZATION START');
+    this.log('🎛️ ═══════════════════════════════════════');
 
     const linkedSpeakers = this.config.linkedSpeakers || [];
 
     if (linkedSpeakers.length === 0) {
       this.log('⚠️  No linked speakers configured - skipping initialization');
+      this.log('🎛️ ═══════════════════════════════════════');
       return;
     }
 
+    this.log(`📢 Paging Device: ${this.config.pagingDevice?.name || 'N/A'}`);
+    this.log(`🔊 Linked Speakers: ${linkedSpeakers.length}`);
+    this.log(`🎚️ Target Volume: ${volumePercent}%`);
+    this.log(`🌐 Target IP: 224.0.2.60:50022 (IDLE)`);
+    this.log('');
+
     try {
       // Set each speaker to idle mode + volume
-      for (const speaker of linkedSpeakers) {
-        this.log(`  → ${speaker.name} (${speaker.ipAddress})`);
+      for (let i = 0; i < linkedSpeakers.length; i++) {
+        const speaker = linkedSpeakers[i];
+        this.log(`[${i + 1}/${linkedSpeakers.length}] ${speaker.name} (${speaker.ipAddress})`);
 
         // Set to idle multicast IP (50022)
+        this.log(`   → Setting multicast to 224.0.2.60:50022`);
         if (this.config.setSpeakerMulticastIP) {
           await this.config.setSpeakerMulticastIP(speaker.id, '224.0.2.60', 50022);
         }
 
         // Set volume
+        this.log(`   → Setting volume to ${volumePercent}%`);
         if (this.config.setSpeakerVolume) {
           await this.config.setSpeakerVolume(speaker.id, volumePercent);
         }
 
-        this.log(`  ✓ ${speaker.name}: Idle @ ${volumePercent}%`);
+        this.log(`   ✓ ${speaker.name}: READY (Idle @ ${volumePercent}%)`);
+        this.log('');
       }
 
-      this.log('✅ Hardware initialization complete');
-      this.log('🎛️ ═══ HARDWARE INITIALIZATION END ═══');
+      this.log('✅ All speakers initialized successfully');
+      this.log(`   • ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''} set to IDLE mode`);
+      this.log(`   • Volume: ${volumePercent}%`);
+      this.log(`   • Multicast: 224.0.2.60:50022`);
+      this.log('🎛️ ═══════════════════════════════════════');
+      this.log('🎛️ HARDWARE INITIALIZATION COMPLETE');
+      this.log('🎛️ ═══════════════════════════════════════');
     } catch (error) {
       this.log(`❌ Hardware initialization failed: ${error}`, 'error');
+      this.log('🎛️ ═══════════════════════════════════════');
       throw error;
     }
   }
@@ -816,9 +834,11 @@ export class SimpleRecorder {
       return;
     }
 
-    this.log('🎛️ ═══ HARDWARE ACTIVATION START ═══');
-    this.log('🌐 Setting speaker multicast IP to 224.0.2.60:50002 (ACTIVE)');
-    this.log('⚠️  NEVER touching paging device (no zone changes, no IP changes)');
+    this.log('🎛️ ═══════════════════════════════════════');
+    this.log('🎛️ HARDWARE ACTIVATION START');
+    this.log('🎛️ ═══════════════════════════════════════');
+    this.log('🌐 Target: 224.0.2.60:50002 (ACTIVE - Playback Mode)');
+    this.log('⚠️  Note: Paging device stays unchanged');
 
     // 🧪 EMULATION MODE: Skip actual network calls
     if (this.config.emulationMode) {
@@ -854,37 +874,43 @@ export class SimpleRecorder {
     }
 
     // REAL MODE: Actual hardware control (SPEAKERS ONLY, NEVER PAGING DEVICE)
-    this.log('⏳ Setting speaker IPs and polling readiness...');
+    const linkedSpeakers = this.config.linkedSpeakers || [];
+    this.log(`🔊 Activating ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''}...`);
+    this.log('');
 
     try {
       // Set linked speakers to active multicast IP (224.0.2.60:50002)
-      const linkedSpeakers = this.config.linkedSpeakers || [];
       if (linkedSpeakers.length > 0) {
-        this.log(`Setting ${linkedSpeakers.length} speaker(s) to active IP...`);
-
         // Set multicast IP for each speaker
-        for (const speaker of linkedSpeakers) {
-          this.log(`  → ${speaker.name} (${speaker.ipAddress}): Setting to 224.0.2.60:50002`);
+        for (let i = 0; i < linkedSpeakers.length; i++) {
+          const speaker = linkedSpeakers[i];
+          this.log(`[${i + 1}/${linkedSpeakers.length}] ${speaker.name} (${speaker.ipAddress})`);
+          this.log(`   → Setting multicast to 224.0.2.60:50002 (ACTIVE)`);
 
           // Call API to set speaker multicast IP
           if (this.config.setSpeakerMulticastIP) {
             await this.config.setSpeakerMulticastIP(speaker.id, '224.0.2.60', 50002);
           }
 
-          this.log(`  ✓ ${speaker.name}: Ready`);
+          this.log(`   ✓ ${speaker.name}: ACTIVE - Ready for playback`);
+          this.log('');
         }
       } else {
         this.log('⚠️  No linked speakers to activate');
+        this.log('');
       }
 
       // Set paging device multicast IP to active mode (only if configured)
       if (this.config.pagingDevice && this.config.pagingDevice.ipAddress && this.config.pagingDevice.apiPassword) {
-        this.log(`📢 Paging device: ${this.config.pagingDevice.name} (${this.config.pagingDevice.ipAddress})`);
-        this.log(`   Setting paging to ACTIVE mode (224.0.2.60:50002)`);
+        this.log(`📢 Paging Device: ${this.config.pagingDevice.name} (${this.config.pagingDevice.ipAddress})`);
+        this.log(`   → Setting paging to ACTIVE mode (224.0.2.60:50002)`);
 
         if (this.config.setPagingMulticastIP) {
           await this.config.setPagingMulticastIP(true);
         }
+
+        this.log(`   ✓ Paging device ACTIVE`);
+        this.log('');
       } else if (this.config.pagingDevice) {
         this.log('⚠️  Paging device configured but missing IP/password - skipping');
       } else {
@@ -892,8 +918,12 @@ export class SimpleRecorder {
       }
 
       this.hardwareReady = true;
-      this.log('✅ Speakers ACTIVE - Ready for playback');
-      this.log('🎛️ ═══ HARDWARE ACTIVATION COMPLETE ═══');
+      this.log('✅ All hardware activated successfully');
+      this.log(`   • ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''} set to ACTIVE mode`);
+      this.log(`   • Multicast: 224.0.2.60:50002`);
+      this.log('🎛️ ═══════════════════════════════════════');
+      this.log('🎛️ HARDWARE ACTIVATION COMPLETE');
+      this.log('🎛️ ═══════════════════════════════════════');
     } catch (error) {
       this.log(`❌ Speaker activation failed: ${error}`, 'error');
       throw error;
@@ -1049,9 +1079,11 @@ export class SimpleRecorder {
       return;
     }
 
-    this.log('🎛️ ═══ HARDWARE DEACTIVATION START ═══');
-    this.log('🌐 Setting speaker multicast IP to 224.0.2.60:50022 (IDLE)');
-    this.log('⚠️  NEVER touching paging device (no zone changes, no IP changes)');
+    this.log('🎛️ ═══════════════════════════════════════');
+    this.log('🎛️ HARDWARE DEACTIVATION START');
+    this.log('🎛️ ═══════════════════════════════════════');
+    this.log('🌐 Target: 224.0.2.60:50022 (IDLE - Standby Mode)');
+    this.log('⚠️  Note: Paging device stays unchanged');
 
     // 🧪 EMULATION MODE: Skip actual network calls
     if (this.config.emulationMode) {
@@ -1087,43 +1119,54 @@ export class SimpleRecorder {
     }
 
     // REAL MODE: Actual hardware control (SPEAKERS ONLY, NEVER PAGING DEVICE)
-    this.log('⏳ Setting speaker IPs to idle...');
+    const linkedSpeakers = this.config.linkedSpeakers || [];
+    this.log(`🔊 Deactivating ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''}...`);
+    this.log('');
 
     try {
       // Set linked speakers to idle multicast IP (224.0.2.60:50022)
-      const linkedSpeakers = this.config.linkedSpeakers || [];
       if (linkedSpeakers.length > 0) {
-        this.log(`Setting ${linkedSpeakers.length} speaker(s) to idle IP...`);
-
         // Set multicast IP for each speaker
-        for (const speaker of linkedSpeakers) {
-          this.log(`  → ${speaker.name} (${speaker.ipAddress}): Setting to 224.0.2.60:50022`);
+        for (let i = 0; i < linkedSpeakers.length; i++) {
+          const speaker = linkedSpeakers[i];
+          this.log(`[${i + 1}/${linkedSpeakers.length}] ${speaker.name} (${speaker.ipAddress})`);
+          this.log(`   → Setting multicast to 224.0.2.60:50022 (IDLE)`);
 
           // Call API to set speaker multicast IP
           if (this.config.setSpeakerMulticastIP) {
             await this.config.setSpeakerMulticastIP(speaker.id, '224.0.2.60', 50022);
           }
 
-          this.log(`  ✓ ${speaker.name}: Idle`);
+          this.log(`   ✓ ${speaker.name}: IDLE - Standby mode`);
+          this.log('');
         }
       } else {
         this.log('⚠️  No linked speakers to deactivate');
+        this.log('');
       }
 
       // Set paging device multicast IP to idle mode (only if configured)
       if (this.config.pagingDevice && this.config.pagingDevice.ipAddress && this.config.pagingDevice.apiPassword) {
-        this.log(`   Setting paging to IDLE mode (224.0.2.60:50022)`);
+        this.log(`📢 Paging Device: ${this.config.pagingDevice.name} (${this.config.pagingDevice.ipAddress})`);
+        this.log(`   → Setting paging to IDLE mode (224.0.2.60:50022)`);
 
         if (this.config.setPagingMulticastIP) {
           await this.config.setPagingMulticastIP(false);
         }
+
+        this.log(`   ✓ Paging device IDLE`);
+        this.log('');
       } else if (this.config.pagingDevice) {
         this.log('⚠️  Paging device configured but missing IP/password - skipping');
       }
 
       this.hardwareReady = false;
-      this.log('✅ Speakers IDLE - In standby mode');
-      this.log('🎛️ ═══ HARDWARE DEACTIVATION COMPLETE ═══');
+      this.log('✅ All hardware deactivated successfully');
+      this.log(`   • ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''} set to IDLE mode`);
+      this.log(`   • Multicast: 224.0.2.60:50022`);
+      this.log('🎛️ ═══════════════════════════════════════');
+      this.log('🎛️ HARDWARE DEACTIVATION COMPLETE');
+      this.log('🎛️ ═══════════════════════════════════════');
     } catch (error) {
       this.log(`⚠️ Speaker deactivation error (non-fatal): ${error}`, 'warning');
       // Continue anyway - don't block shutdown

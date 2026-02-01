@@ -318,10 +318,30 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
 
         addLog(`🧪 Emulation Mode: Created 12 virtual speakers + 1 paging device`, 'info');
       } else {
-        // Use real devices
-        linkedSpeakers = devices.filter(d => selectedDevices.includes(d.id));
-        pagingDevice = devices.find(d => d.type === "8301") || null;
-        addLog(`Configured with ${linkedSpeakers.length} speakers and ${pagingDevice ? '1' : '0'} paging device`, 'info');
+        // Use real devices - find paging device from selected devices
+        const selectedPagingDevices = devices.filter(d =>
+          selectedDevices.includes(d.id) && d.type === "8301"
+        );
+
+        if (selectedPagingDevices.length > 0) {
+          // Use first selected paging device
+          pagingDevice = selectedPagingDevices[0];
+
+          // Get linked speakers from paging device
+          const linkedSpeakerIds = pagingDevice.linkedSpeakerIds || [];
+          linkedSpeakers = devices.filter(d => linkedSpeakerIds.includes(d.id));
+
+          addLog(`📢 Paging Device: ${pagingDevice.name}`, 'info');
+          addLog(`🔊 Linked Speakers: ${linkedSpeakers.length}`, 'info');
+          linkedSpeakers.forEach((s, i) => {
+            addLog(`   ${i + 1}. ${s.name} (${s.ipAddress})`, 'info');
+          });
+        } else {
+          // No paging device selected
+          pagingDevice = null;
+          linkedSpeakers = [];
+          addLog(`⚠️  No paging device selected`, 'warning');
+        }
       }
 
       // Create SimpleRecorder
