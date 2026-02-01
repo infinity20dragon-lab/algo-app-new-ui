@@ -471,9 +471,16 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
             return;
           }
 
-          // Convert percent to dB (Algo uses dB format)
-          // Assuming -50dB to 0dB range, where 0dB = 100%
-          const volumeDb = Math.round((volumePercent / 100) * 50 - 50);
+          // Use speaker's maxVolume setting from /live-v2 page (NOT default volume from output page)
+          const speakerMaxVolume = speaker.maxVolume ?? 100;
+
+          // Convert to level (0-10) and then to dB
+          // Formula: dB = (level - 10) * 3
+          // Level 7 (70%) = -9dB, Level 10 (100%) = 0dB
+          let volumeDbString: string;
+          const volumeScale = Math.round((speakerMaxVolume / 100) * 10);
+          const volumeDb = (volumeScale - 10) * 3;
+          volumeDbString = volumeDb === 0 ? "0dB" : `${volumeDb}dB`;
 
           try {
             const response = await fetch("/api/algo/settings", {
@@ -484,7 +491,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
                 password: speaker.apiPassword,
                 authMethod: speaker.authMethod || 'basic',
                 settings: {
-                  "audio.output.1.level": volumeDb.toString(),
+                  "audio.page.vol": volumeDbString,
                 },
               }),
             });
@@ -493,6 +500,8 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
               const errorData = await response.json().catch(() => ({ error: 'Unknown' }));
               throw new Error(`${response.status}: ${errorData.error}`);
             }
+
+            addLog(`✓ ${speaker.name} page volume set to ${volumeDbString} (level ${volumeScale})`, 'info');
           } catch (error) {
             // Don't throw - just log and continue with other speakers
             addLog(`⚠️  ${speaker.name} volume failed: ${error}`, 'warning');
