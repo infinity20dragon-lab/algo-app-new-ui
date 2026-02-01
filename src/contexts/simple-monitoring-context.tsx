@@ -203,6 +203,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
 
     // Load device selection
     if (sessionState.selectedDevices !== undefined) setSelectedDevices(sessionState.selectedDevices);
+    if (sessionState.selectedInputDevice !== undefined) setSelectedInputDevice(sessionState.selectedInputDevice);
 
     // Load SimpleRecorder settings
     if (sessionState.batchDuration !== undefined) setBatchDuration(sessionState.batchDuration);
@@ -247,6 +248,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   useEffect(() => {
     syncSessionState({
       selectedDevices,
+      selectedInputDevice,
       batchDuration,
       silenceTimeout,
       playbackDelay,
@@ -276,6 +278,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     });
   }, [
     selectedDevices,
+    selectedInputDevice,
     batchDuration, silenceTimeout, playbackDelay, audioThreshold, sustainDuration, disableDelay,
     targetVolume, rampEnabled, rampDuration, dayNightMode, dayStartHour, dayEndHour, nightRampDuration,
     playbackRampDuration, playbackStartVolume, playbackMaxVolume, playbackVolume,
@@ -579,12 +582,30 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   // Helper to get PST time
   const getPSTTime = () => {
     const now = new Date();
-    const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-    const timestamp = pstTime.toLocaleTimeString('en-US', { hour12: false });
-    const year = pstTime.getFullYear();
-    const month = String(pstTime.getMonth() + 1).padStart(2, '0');
-    const day = String(pstTime.getDate()).padStart(2, '0');
+
+    // Get PST time parts using Intl.DateTimeFormat
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+
+    const parts = formatter.formatToParts(now);
+    const year = parts.find(p => p.type === 'year')?.value || '';
+    const month = parts.find(p => p.type === 'month')?.value || '';
+    const day = parts.find(p => p.type === 'day')?.value || '';
+    const hour = parts.find(p => p.type === 'hour')?.value || '';
+    const minute = parts.find(p => p.type === 'minute')?.value || '';
+    const second = parts.find(p => p.type === 'second')?.value || '';
+
+    const timestamp = `${hour}:${minute}:${second}`;
     const dateKey = `${year}-${month}-${day}`;
+
     return { timestamp, dateKey };
   };
 
