@@ -26,10 +26,16 @@ export default function ActivityPage() {
   // Get PST date for initial load and default date picker value
   const getPSTDate = () => {
     const now = new Date();
-    const pstTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-    const year = pstTime.getFullYear();
-    const month = String(pstTime.getMonth() + 1).padStart(2, '0');
-    const day = String(pstTime.getDate()).padStart(2, '0');
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const parts = formatter.formatToParts(now);
+    const year = parts.find(p => p.type === 'year')?.value || '';
+    const month = parts.find(p => p.type === 'month')?.value || '';
+    const day = parts.find(p => p.type === 'day')?.value || '';
     return `${year}-${month}-${day}`;
   };
 
@@ -98,7 +104,8 @@ export default function ActivityPage() {
   const exportLogs = () => {
     const header = "Timestamp,Type,Audio Level,Threshold,Speakers,Volume,Message,Recording URL\n";
     const rows = logs.map(log => {
-      const timestamp = new Date(log.timestamp).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+      // log.timestamp is already a PST time string (HH:MM:SS), use it directly
+      const timestamp = log.timestamp;
       return `"${timestamp}","${log.type}","${log.audioLevel ?? ''}","${log.audioThreshold ?? ''}","${log.speakersEnabled ?? ''}","${log.volume ?? ''}","${log.message}","${log.recordingUrl ?? ''}"`;
     }).join("\n");
 
@@ -296,12 +303,7 @@ export default function ActivityPage() {
                         className="border-b border-[var(--border-color)] hover:bg-[var(--bg-tertiary)]/50 transition-colors"
                       >
                         <td className="px-4 py-3 text-[var(--text-muted)] whitespace-nowrap font-mono text-xs">
-                          {new Date(log.timestamp).toLocaleTimeString('en-US', {
-                            timeZone: 'America/Los_Angeles',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                            second: '2-digit',
-                          })}
+                          {log.timestamp /* Already PST formatted HH:MM:SS */}
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant={getTypeColor(log.type)} className="text-xs">

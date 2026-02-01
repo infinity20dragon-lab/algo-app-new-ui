@@ -1265,23 +1265,29 @@ export class SimpleRecorder {
   }
 
   private generateFilename(timestamp: Date): string {
-    // Convert to PST timezone
-    const pstTime = new Date(timestamp.toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    // Convert to PST timezone using Intl.DateTimeFormat
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true,
+    });
 
-    const year = pstTime.getFullYear();
-    const month = String(pstTime.getMonth() + 1).padStart(2, '0');
-    const day = String(pstTime.getDate()).padStart(2, '0');
-
-    let hours = pstTime.getHours();
-    const minutes = String(pstTime.getMinutes()).padStart(2, '0');
-    const seconds = String(pstTime.getSeconds()).padStart(2, '0');
-
-    const ampm = hours >= 12 ? 'PM' : 'AM';
-    hours = hours % 12 || 12; // Convert to 12-hour format
-    const hoursStr = String(hours).padStart(2, '0');
+    const parts = formatter.formatToParts(timestamp);
+    const year = parts.find(p => p.type === 'year')?.value || '';
+    const month = parts.find(p => p.type === 'month')?.value || '';
+    const day = parts.find(p => p.type === 'day')?.value || '';
+    const hour = parts.find(p => p.type === 'hour')?.value || '';
+    const minute = parts.find(p => p.type === 'minute')?.value || '';
+    const second = parts.find(p => p.type === 'second')?.value || '';
+    const dayPeriod = parts.find(p => p.type === 'dayPeriod')?.value || '';
 
     // Format: recording-YYYY-MM-DD_HH-MM-SS-AM/PM.webm
-    return `recording-${year}-${month}-${day}_${hoursStr}-${minutes}-${seconds}-${ampm}.webm`;
+    return `recording-${year}-${month}-${day}_${hour}-${minute}-${second}-${dayPeriod}.webm`;
   }
 
   private log(message: string, type: 'info' | 'error' | 'warning' = 'info'): void {
