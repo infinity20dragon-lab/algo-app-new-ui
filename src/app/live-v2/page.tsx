@@ -1148,9 +1148,12 @@ function LiveV2Content() {
               </CardContent>
             </Card>
 
-            {/* Quick Stats */}
+            {/* Session Target Devices */}
             <Card>
-              <CardContent className="p-4">
+              <CardHeader className="py-3">
+                <CardTitle className="text-sm">Active Session</CardTitle>
+              </CardHeader>
+              <CardContent className="p-4 pt-0">
                 <div className="space-y-3 text-sm">
                   <div className="flex items-center justify-between">
                     <span className="text-[var(--text-muted)]">Status</span>
@@ -1158,13 +1161,56 @@ function LiveV2Content() {
                       {isCapturing ? "Active" : "Inactive"}
                     </Badge>
                   </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-[var(--text-muted)]">Devices</span>
-                    <span className="font-semibold text-[var(--text-primary)]">{safeSelectedDevices.length} selected</span>
-                  </div>
-                  <div className="flex items-center justify-between">
+
+                  {/* Show paging device and linked speakers */}
+                  {safeSelectedDevices.length > 0 && (() => {
+                    const pagingDevice = contextDevices.find(d => d.id === safeSelectedDevices[0] && d.type === "8301");
+                    const linkedSpeakers = pagingDevice?.linkedSpeakerIds
+                      ? contextDevices.filter(d => pagingDevice.linkedSpeakerIds?.includes(d.id))
+                      : [];
+
+                    if (pagingDevice) {
+                      return (
+                        <>
+                          <div className="pt-2 border-t border-[var(--border-color)]">
+                            <div className="text-xs text-[var(--text-muted)] mb-2">Paging Device</div>
+                            <div className="flex items-center gap-2 p-2 rounded-lg bg-[var(--accent-blue)]/10 border border-[var(--accent-blue)]/30">
+                              <div className="w-2 h-2 rounded-full bg-[var(--accent-blue)]" />
+                              <span className="text-xs font-medium text-[var(--text-primary)] truncate">
+                                {pagingDevice.name}
+                              </span>
+                            </div>
+                          </div>
+
+                          {linkedSpeakers.length > 0 && (
+                            <div className="pt-2 border-t border-[var(--border-color)]">
+                              <div className="text-xs text-[var(--text-muted)] mb-2">
+                                Linked Speakers ({linkedSpeakers.length})
+                              </div>
+                              <div className="space-y-1 max-h-[200px] overflow-y-auto">
+                                {linkedSpeakers.map((speaker) => (
+                                  <div
+                                    key={speaker.id}
+                                    className="flex items-center gap-2 p-2 rounded-lg bg-[var(--accent-green)]/10 border border-[var(--accent-green)]/30"
+                                  >
+                                    <div className="w-1.5 h-1.5 rounded-full bg-[var(--accent-green)]" />
+                                    <span className="text-xs text-[var(--text-primary)] truncate">
+                                      {speaker.name}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      );
+                    }
+                    return null;
+                  })()}
+
+                  <div className="flex items-center justify-between pt-2 border-t border-[var(--border-color)]">
                     <span className="text-[var(--text-muted)]">Architecture</span>
-                    <Badge variant="secondary">Producer/Consumer</Badge>
+                    <Badge variant="secondary">Micro-Batch</Badge>
                   </div>
                 </div>
               </CardContent>

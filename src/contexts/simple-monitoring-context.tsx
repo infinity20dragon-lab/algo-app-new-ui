@@ -467,8 +467,6 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
           // Assuming -50dB to 0dB range, where 0dB = 100%
           const volumeDb = Math.round((volumePercent / 100) * 50 - 50);
 
-          addLog(`Setting ${speaker.name} volume to ${volumePercent}% (${volumeDb}dB)`, 'info');
-
           try {
             const response = await fetch("/api/algo/settings", {
               method: "POST",
@@ -476,19 +474,20 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
               body: JSON.stringify({
                 ipAddress: speaker.ipAddress,
                 password: speaker.apiPassword,
-                setting: "audio.output.1.level",
-                value: volumeDb.toString(),
+                authMethod: speaker.authMethod || 'basic',
+                settings: {
+                  "audio.output.1.level": volumeDb.toString(),
+                },
               }),
             });
 
             if (!response.ok) {
-              throw new Error(`API returned ${response.status}`);
+              const errorData = await response.json().catch(() => ({ error: 'Unknown' }));
+              throw new Error(`${response.status}: ${errorData.error}`);
             }
-
-            addLog(`✓ ${speaker.name} volume set`, 'info');
           } catch (error) {
-            addLog(`❌ Failed to set ${speaker.name} volume: ${error}`, 'error');
-            throw error;
+            // Don't throw - just log and continue with other speakers
+            addLog(`⚠️  ${speaker.name} volume failed: ${error}`, 'warning');
           }
         },
       });
