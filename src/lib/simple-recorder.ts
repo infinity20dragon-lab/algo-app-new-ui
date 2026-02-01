@@ -78,6 +78,7 @@ interface SimpleRecorderConfig {
   // Hardware Control Callbacks
   setSpeakerMulticastIP?: (speakerId: string, ip: string, port: number) => Promise<void>;
   setPagingMulticastIP?: (active: boolean) => Promise<void>;
+  setSpeakerVolume?: (speakerId: string, volumePercent: number) => Promise<void>;
 }
 
 // Internal config type with required properties
@@ -337,6 +338,44 @@ export class SimpleRecorder {
     if (this.playbackGainNode) {
       this.playbackGainNode.gain.value = volume;
       this.log(`🔊 Playback volume updated: ${(volume * 100).toFixed(0)}%`);
+    }
+  }
+
+  // Initialize hardware to idle state with configured volume
+  async initializeHardware(volumePercent: number): Promise<void> {
+    this.log('🎛️ ═══ HARDWARE INITIALIZATION START ═══');
+    this.log(`Initializing speakers to IDLE mode (224.0.2.60:50022) with volume ${volumePercent}%`);
+
+    const linkedSpeakers = this.config.linkedSpeakers || [];
+
+    if (linkedSpeakers.length === 0) {
+      this.log('⚠️  No linked speakers configured - skipping initialization');
+      return;
+    }
+
+    try {
+      // Set each speaker to idle mode + volume
+      for (const speaker of linkedSpeakers) {
+        this.log(`  → ${speaker.name} (${speaker.ipAddress})`);
+
+        // Set to idle multicast IP (50022)
+        if (this.config.setSpeakerMulticastIP) {
+          await this.config.setSpeakerMulticastIP(speaker.id, '224.0.2.60', 50022);
+        }
+
+        // Set volume
+        if (this.config.setSpeakerVolume) {
+          await this.config.setSpeakerVolume(speaker.id, volumePercent);
+        }
+
+        this.log(`  ✓ ${speaker.name}: Idle @ ${volumePercent}%`);
+      }
+
+      this.log('✅ Hardware initialization complete');
+      this.log('🎛️ ═══ HARDWARE INITIALIZATION END ═══');
+    } catch (error) {
+      this.log(`❌ Hardware initialization failed: ${error}`, 'error');
+      throw error;
     }
   }
 
@@ -1177,7 +1216,7 @@ export class SimpleRecorder {
         allChunks.push(...batch.chunks);
       }
 
-      combinedBlob = new Blob(allChunks, { type: this.mimeType });
+      combinedBlob = new Blob(allChunks, { type: this.getBestMimeType() });
       this.log(`📦 Multi-batch session: ${session.batches.length} batches combined`);
       this.log(`   Total chunks: ${allChunks.length}, Total size: ${(combinedBlob.size / 1024).toFixed(2)} KB`);
     }

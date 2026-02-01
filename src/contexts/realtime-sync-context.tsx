@@ -77,6 +77,17 @@ export interface SessionState {
   playbackMaxVolume: number;
   playbackVolume: number;
 
+  // New SimpleRecorder settings (live-v2 page)
+  batchDuration: number; // Batch recording duration (ms)
+  silenceTimeout: number; // Silence timeout before stopping (ms)
+  playbackRampEnabled: boolean; // Enable per-session volume ramping
+  playbackRampStartVolume: number; // Ramp start volume (0-2)
+  playbackRampTargetVolume: number; // Ramp target volume (0-2)
+  playbackSessionRampDuration: number; // Ramp duration (ms)
+  emulationMode: boolean; // Hardware emulation mode
+  emulationNetworkDelay: number; // Emulation delay (ms)
+  saveRecording: boolean; // Save recordings to Firebase
+
   // Real-time audio state (for display only)
   audioLevel: number;
   playbackAudioLevel: number;

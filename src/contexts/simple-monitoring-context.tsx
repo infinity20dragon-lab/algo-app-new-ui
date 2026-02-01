@@ -10,6 +10,7 @@
 import React, { createContext, useContext, useState, useRef, useCallback, useEffect } from "react";
 import { SimpleRecorder } from "@/lib/simple-recorder";
 import { useAuth } from "./auth-context";
+import { useRealtimeSync } from "./realtime-sync-context";
 import { ref as dbRef, push, set } from "firebase/database";
 import { realtimeDb, storage } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
@@ -81,6 +82,7 @@ interface SimpleMonitoringContextType {
   startMonitoring: () => Promise<void>;
   stopMonitoring: () => Promise<void>;
   setInputDevice: (deviceId: string) => void;
+  setBatchDuration: (ms: number) => void;
   setSilenceTimeout: (ms: number) => void;
   setPlaybackDelay: (ms: number) => void;
   setAudioThreshold: (value: number) => void;
@@ -127,6 +129,7 @@ const SimpleMonitoringContext = createContext<SimpleMonitoringContextType | null
 
 export function SimpleMonitoringProvider({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
+  const { syncSessionState, sessionState } = useRealtimeSync();
 
   // State
   const [isMonitoring, setIsMonitoring] = useState(false);
@@ -137,7 +140,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   const [speakersEnabled, setSpeakersEnabled] = useState(false);
 
   // Audio Settings
-  const [batchDuration] = useState(5000); // Fixed at 5s
+  const [batchDuration, setBatchDuration] = useState(5000);
   const [silenceTimeout, setSilenceTimeout] = useState(8000);
   const [playbackDelay, setPlaybackDelay] = useState(4000);
   const [audioThreshold, setAudioThreshold] = useState(5);
@@ -193,6 +196,88 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
       recorderRef.current.setPlaybackVolume(playbackVolume);
     }
   }, [playbackVolume]);
+
+  // Load settings from sessionState on mount
+  useEffect(() => {
+    if (!sessionState) return;
+
+    // Load SimpleRecorder settings
+    if (sessionState.batchDuration !== undefined) setBatchDuration(sessionState.batchDuration);
+    if (sessionState.silenceTimeout !== undefined) setSilenceTimeout(sessionState.silenceTimeout);
+    if (sessionState.playbackDelay !== undefined) setPlaybackDelay(sessionState.playbackDelay);
+    if (sessionState.audioThreshold !== undefined) setAudioThreshold(sessionState.audioThreshold);
+    if (sessionState.sustainDuration !== undefined) setSustainDuration(sessionState.sustainDuration);
+    if (sessionState.disableDelay !== undefined) setDisableDelay(sessionState.disableDelay);
+
+    // Load volume settings
+    if (sessionState.targetVolume !== undefined) setTargetVolume(sessionState.targetVolume);
+    if (sessionState.rampEnabled !== undefined) setRampEnabled(sessionState.rampEnabled);
+    if (sessionState.rampDuration !== undefined) setRampDuration(sessionState.rampDuration);
+    if (sessionState.dayNightMode !== undefined) setDayNightMode(sessionState.dayNightMode);
+    if (sessionState.dayStartHour !== undefined) setDayStartHour(sessionState.dayStartHour);
+    if (sessionState.dayEndHour !== undefined) setDayEndHour(sessionState.dayEndHour);
+    if (sessionState.nightRampDuration !== undefined) setNightRampDuration(sessionState.nightRampDuration);
+
+    // Load playback volume settings
+    if (sessionState.playbackRampDuration !== undefined) setPlaybackRampDuration(sessionState.playbackRampDuration);
+    if (sessionState.playbackStartVolume !== undefined) setPlaybackStartVolume(sessionState.playbackStartVolume);
+    if (sessionState.playbackMaxVolume !== undefined) setPlaybackMaxVolume(sessionState.playbackMaxVolume);
+    if (sessionState.playbackVolume !== undefined) setPlaybackVolume(sessionState.playbackVolume);
+
+    // Load session volume ramping settings
+    if (sessionState.playbackRampEnabled !== undefined) setPlaybackRampEnabled(sessionState.playbackRampEnabled);
+    if (sessionState.playbackRampStartVolume !== undefined) setPlaybackRampStartVolume(sessionState.playbackRampStartVolume);
+    if (sessionState.playbackRampTargetVolume !== undefined) setPlaybackRampTargetVolume(sessionState.playbackRampTargetVolume);
+    if (sessionState.playbackSessionRampDuration !== undefined) setPlaybackSessionRampDuration(sessionState.playbackSessionRampDuration);
+
+    // Load recording/playback settings
+    if (sessionState.saveRecording !== undefined) setSaveRecording(sessionState.saveRecording);
+    if (sessionState.loggingEnabled !== undefined) setLoggingEnabled(sessionState.loggingEnabled);
+    if (sessionState.playbackEnabled !== undefined) setPlaybackEnabled(sessionState.playbackEnabled);
+
+    // Load emulation settings
+    if (sessionState.emulationMode !== undefined) setEmulationMode(sessionState.emulationMode);
+    if (sessionState.emulationNetworkDelay !== undefined) setEmulationNetworkDelay(sessionState.emulationNetworkDelay);
+  }, [sessionState]);
+
+  // Sync settings to RTDB when they change
+  useEffect(() => {
+    syncSessionState({
+      batchDuration,
+      silenceTimeout,
+      playbackDelay,
+      audioThreshold,
+      sustainDuration,
+      disableDelay,
+      targetVolume,
+      rampEnabled,
+      rampDuration,
+      dayNightMode,
+      dayStartHour,
+      dayEndHour,
+      nightRampDuration,
+      playbackRampDuration,
+      playbackStartVolume,
+      playbackMaxVolume,
+      playbackVolume,
+      playbackRampEnabled,
+      playbackRampStartVolume,
+      playbackRampTargetVolume,
+      playbackSessionRampDuration,
+      saveRecording,
+      loggingEnabled,
+      playbackEnabled,
+      emulationMode,
+      emulationNetworkDelay,
+    });
+  }, [
+    batchDuration, silenceTimeout, playbackDelay, audioThreshold, sustainDuration, disableDelay,
+    targetVolume, rampEnabled, rampDuration, dayNightMode, dayStartHour, dayEndHour, nightRampDuration,
+    playbackRampDuration, playbackStartVolume, playbackMaxVolume, playbackVolume,
+    playbackRampEnabled, playbackRampStartVolume, playbackRampTargetVolume, playbackSessionRampDuration,
+    saveRecording, loggingEnabled, playbackEnabled, emulationMode, emulationNetworkDelay,
+    syncSessionState,
+  ]);
 
   // Start monitoring
   const startMonitoring = useCallback(async () => {
@@ -369,10 +454,50 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
             throw error;
           }
         },
+        setSpeakerVolume: async (speakerId: string, volumePercent: number) => {
+          // Find speaker device
+          const speaker = devices.find(d => d.id === speakerId);
+          if (!speaker || !speaker.ipAddress || !speaker.apiPassword) {
+            addLog(`⚠️  Speaker ${speakerId} not found or missing credentials - skipping volume set`, 'warning');
+            return;
+          }
+
+          // Convert percent to dB (Algo uses dB format)
+          // Assuming -50dB to 0dB range, where 0dB = 100%
+          const volumeDb = Math.round((volumePercent / 100) * 50 - 50);
+
+          addLog(`Setting ${speaker.name} volume to ${volumePercent}% (${volumeDb}dB)`, 'info');
+
+          try {
+            const response = await fetch("/api/algo/settings", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                ipAddress: speaker.ipAddress,
+                password: speaker.apiPassword,
+                setting: "audio.output.1.level",
+                value: volumeDb.toString(),
+              }),
+            });
+
+            if (!response.ok) {
+              throw new Error(`API returned ${response.status}`);
+            }
+
+            addLog(`✓ ${speaker.name} volume set`, 'info');
+          } catch (error) {
+            addLog(`❌ Failed to set ${speaker.name} volume: ${error}`, 'error');
+            throw error;
+          }
+        },
       });
 
       // Start recorder
       await recorderRef.current.start(stream);
+
+      // Initialize hardware (set to idle + volume)
+      addLog('Initializing hardware...', 'info');
+      await recorderRef.current.initializeHardware(targetVolume);
 
       setIsMonitoring(true);
       addLog('✅ Monitoring started', 'info');
@@ -538,6 +663,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     startMonitoring,
     stopMonitoring,
     setInputDevice,
+    setBatchDuration,
     setSilenceTimeout,
     setPlaybackDelay,
     setAudioThreshold,
