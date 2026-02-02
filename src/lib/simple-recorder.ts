@@ -177,6 +177,10 @@ export class SimpleRecorder {
   // Batch duration monitoring (manual flush at clean Opus boundaries)
   private batchDurationMonitorInterval: number | null = null;
 
+  // Hardware idle timer (deactivate speakers after grace period)
+  private hardwareIdleTimer: number | null = null;
+  private readonly hardwareIdleDelay: number = 12000; // 12 seconds grace period
+
   // Audio threshold and sustain detection
   private audioAboveThresholdStart: number | null = null; // When audio first went above threshold
   private isAudioSustained: boolean = false; // Has audio been sustained long enough?
@@ -390,6 +394,12 @@ export class SimpleRecorder {
       clearInterval(this.batchDurationMonitorInterval);
       this.batchDurationMonitorInterval = null;
       this.log('✓ Batch duration monitor stopped');
+    }
+
+    if (this.hardwareIdleTimer) {
+      clearTimeout(this.hardwareIdleTimer);
+      this.hardwareIdleTimer = null;
+      this.log('✓ Hardware idle timer cleared');
     }
 
     // FORCE STOP batching (no sealing, no waiting)
@@ -803,6 +813,9 @@ export class SimpleRecorder {
   private startBatching(): void {
     if (this.isBatching) return;
 
+    // Cancel any pending hardware idle check (new audio detected)
+    this.cancelHardwareIdleCheck();
+
     this.isBatching = true;
     this.log('📦 ═══════════════════════════════════════');
     this.log('📦 BATCHING MODE STARTED');
@@ -918,6 +931,9 @@ export class SimpleRecorder {
 
     this.log(`✓ Batching stopped - ${this.batchQueue.length} batches in queue`);
     this.log('⏳ Waiting for save worker to upload session...');
+
+    // 🔥 Schedule hardware idle check (deactivate after grace period if no new audio)
+    this.scheduleHardwareIdleCheck();
   }
 
   private startNewBatch(): void {
@@ -1084,8 +1100,20 @@ export class SimpleRecorder {
     let totalSamplesPlayed = 0;
     let emptyBufferCount = 0; // Track how many times buffer was empty
 
+    let callbackCount = 0;
+
     this.pcmPlaybackNode.onaudioprocess = (event) => {
-      if (!this.pcmRingBuffer || !this.audioContext || !this.pcmPlaybackEnabled) return;
+      callbackCount++;
+
+      // Debug: Log first 10 callbacks to see what's blocking
+      if (callbackCount <= 10) {
+        this.log(`🎵 PCM CALLBACK #${callbackCount}: enabled=${this.pcmPlaybackEnabled}, hardwareState=${HardwareState[this.hardwareState]}, hasAudio=${this.hasReceivedRealAudio}`);
+      }
+
+      if (!this.pcmRingBuffer || !this.audioContext || !this.pcmPlaybackEnabled) {
+        if (callbackCount <= 10) this.log(`   └─ BLOCKED: Basic checks failed`);
+        return;
+      }
 
       const output = event.outputBuffer.getChannelData(0);
 
@@ -1113,6 +1141,7 @@ export class SimpleRecorder {
 
       // 🔥 WAIT FOR HARDWARE before outputting audio (but keep filling ring buffer)
       if (this.hardwareState !== HardwareState.ACTIVE) {
+        if (callbackCount <= 10) this.log(`   └─ BLOCKED: Hardware not ACTIVE (state=${HardwareState[this.hardwareState]})`);
         output.fill(0); // Output silence until hardware ready
         return;
       }
@@ -1151,6 +1180,7 @@ export class SimpleRecorder {
           }
         } else {
           // Output silence until delay is complete
+          if (callbackCount <= 10) this.log(`   └─ BLOCKED: Delay not satisfied (${availableSamples}/${requiredSamples} samples, hasAudio=${this.hasReceivedRealAudio})`);
           output.fill(0);
           return;
         }
@@ -1200,6 +1230,12 @@ export class SimpleRecorder {
         if (emptyBufferCount > 59) {
           this.log(`🛑 Buffer drained - auto-stopping PCM playback`);
           this.stopPCMPlayback();
+
+          // 🔥 Schedule hardware idle check (buffer drained, may be ready to deactivate)
+          if (!this.isBatching) {
+            this.scheduleHardwareIdleCheck();
+          }
+
           return;
         }
         // Removed: countdown logging (too spammy)
@@ -1686,8 +1722,9 @@ export class SimpleRecorder {
       // Reset scheduled time for next session
       this.nextScheduledStartTime = 0;
 
-      // Deactivate hardware
-      await this.deactivateHardware();
+      // 🔥 Trigger immediate hardware idle check (should deactivate if conditions met)
+      // This provides immediate deactivation when queue empties naturally
+      await this.checkHardwareIdle();
     } else {
       // Recording still active - queue just caught up, more audio coming
       this.log('✓ Recording still active - waiting for more batches');
@@ -1818,6 +1855,85 @@ export class SimpleRecorder {
       // Continue anyway - don't block shutdown
       this.hardwareState = HardwareState.IDLE;
       this.hardwareTransitionAbort = null;
+    }
+  }
+
+  // ============================================================================
+  // Hardware Idle Detection (Prevents speakers staying active indefinitely)
+  // ============================================================================
+
+  /**
+   * Schedule a hardware idle check after a grace period
+   * This ensures hardware deactivates even when sessions overlap
+   */
+  private scheduleHardwareIdleCheck(): void {
+    // Clear any existing timer
+    if (this.hardwareIdleTimer !== null) {
+      clearTimeout(this.hardwareIdleTimer);
+      this.hardwareIdleTimer = null;
+    }
+
+    this.log(`⏲️ Hardware idle check scheduled (${this.hardwareIdleDelay / 1000}s grace period)`);
+
+    this.hardwareIdleTimer = window.setTimeout(() => {
+      this.checkHardwareIdle();
+    }, this.hardwareIdleDelay);
+  }
+
+  /**
+   * Check if hardware should be deactivated (all conditions met)
+   */
+  private async checkHardwareIdle(): Promise<void> {
+    this.hardwareIdleTimer = null;
+
+    this.log('🔍 ═══════════════════════════════════════');
+    this.log('🔍 HARDWARE IDLE CHECK');
+    this.log('🔍 ═══════════════════════════════════════');
+
+    // Condition 1: Recording stopped
+    const notBatching = !this.isBatching;
+
+    // Condition 2: Playback stopped OR buffer is low
+    const playbackStopped = !this.pcmPlaybackEnabled || !this.pcmPlaybackStarted;
+    const bufferAvailable = this.pcmRingBuffer?.getAvailable() ?? 0;
+    const bufferDuration = bufferAvailable / (this.audioContext?.sampleRate || 48000);
+    const bufferLow = bufferDuration < 2.0; // Less than 2 seconds
+    const playbackDone = playbackStopped || bufferLow;
+
+    // Condition 3: Playback queue is empty
+    const queueEmpty = this.batchQueue.length === 0;
+
+    this.log(`   ├─ Recording stopped: ${notBatching ? '✓' : '✗'}`);
+    this.log(`   ├─ Playback stopped: ${playbackStopped ? '✓' : '✗'}`);
+    this.log(`   ├─ Buffer low (<2s): ${bufferLow ? '✓' : '✗'} (${bufferDuration.toFixed(1)}s available)`);
+    this.log(`   ├─ Queue empty: ${queueEmpty ? '✓' : '✗'} (${this.batchQueue.length} batches)`);
+    this.log(`   └─ Hardware state: ${HardwareState[this.hardwareState]}`);
+
+    // Only deactivate if ALL conditions are met
+    if (notBatching && playbackDone && queueEmpty) {
+      this.log('✅ All idle conditions met - deactivating hardware');
+      await this.deactivateHardware();
+    } else if (notBatching && queueEmpty) {
+      // Recording and queue stopped, just waiting for playback to finish
+      this.log('⏳ Waiting for playback to finish - checking again in 3s');
+      this.hardwareIdleTimer = window.setTimeout(() => {
+        this.checkHardwareIdle();
+      }, 3000);
+    } else {
+      this.log('⏳ Idle conditions not met - will check after next session ends');
+    }
+
+    this.log('🔍 ═══════════════════════════════════════');
+  }
+
+  /**
+   * Cancel any pending hardware idle checks (new audio detected)
+   */
+  private cancelHardwareIdleCheck(): void {
+    if (this.hardwareIdleTimer !== null) {
+      clearTimeout(this.hardwareIdleTimer);
+      this.hardwareIdleTimer = null;
+      this.log('⏲️ Hardware idle check cancelled (new audio detected)');
     }
   }
 

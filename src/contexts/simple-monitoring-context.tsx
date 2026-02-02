@@ -454,6 +454,13 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
             return;
           }
 
+          // 🧪 EMULATION MODE: Skip API calls (SimpleRecorder handles virtual speakers internally)
+          if (emulationMode) {
+            const mode = zoneIP.includes(':50002') ? 'ACTIVE' : 'IDLE';
+            addLog(`🧪 EMULATION: Skipping API call for ${speakers.length} speakers' mcast.zone1 → ${zoneIP} (${mode})`, 'info');
+            return;
+          }
+
           const mode = zoneIP.includes(':50002') ? 'ACTIVE' : 'IDLE';
           addLog(`Setting ${speakers.length} speakers' mcast.zone1 to ${zoneIP} (${mode}) - in parallel`, 'info');
 
@@ -496,6 +503,12 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
           }
         },
         setSpeakerVolume: async (speakerId: string, volumePercent: number) => {
+          // 🧪 EMULATION MODE: Skip API calls
+          if (emulationMode) {
+            addLog(`🧪 EMULATION: Skipping volume set for speaker ${speakerId}`, 'info');
+            return;
+          }
+
           // Find speaker device
           const speaker = devices.find(d => d.id === speakerId);
           if (!speaker || !speaker.ipAddress || !speaker.apiPassword) {
