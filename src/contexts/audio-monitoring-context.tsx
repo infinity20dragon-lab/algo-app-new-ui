@@ -10,6 +10,7 @@ import { useAuth } from "@/contexts/auth-context";
 import { getIdleVolumeString, getAlwaysKeepPagingOn } from "@/lib/settings";
 import { CallCoordinator, CallState } from "@/lib/call-coordinator";
 import { BatchCoordinator, type BatchCoordinatorConfig } from "@/lib/batch-coordinator";
+import { addRecording } from "@/lib/firebase/firestore";
 
 // Debug mode - set to false for production to reduce console noise
 const DEBUG_MODE = process.env.NODE_ENV === 'development';
@@ -2929,6 +2930,25 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
       // Get download URL
       const downloadUrl = await getDownloadURL(fileRef);
       debugLog(`[CallCoordinator] ${recordingType.toUpperCase()} recording upload successful:`, downloadUrl);
+
+      // Save metadata to Firestore for fast querying (admin recordings page)
+      try {
+        await addRecording({
+          userId: user.uid,
+          userEmail: user.email || 'unknown',
+          filename,
+          storageUrl: downloadUrl,
+          storagePath: filePath,
+          size: blob.size,
+          mimeType,
+          timestamp: detectionTime,
+          dateKey: dailyFolder,
+        });
+        debugLog('[CallCoordinator] Metadata saved to Firestore');
+      } catch (metaError) {
+        console.error('[CallCoordinator] Failed to save metadata to Firestore:', metaError);
+        // Don't throw - upload succeeded, metadata is optional
+      }
 
       return downloadUrl;
     } catch (error) {

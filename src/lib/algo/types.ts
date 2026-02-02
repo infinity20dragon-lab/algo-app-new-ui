@@ -198,3 +198,19 @@ export interface PoEDevice {
   createdAt: Date;
   updatedAt: Date;
 }
+
+// Recording Metadata (stored in Firestore for fast access)
+export interface Recording {
+  id: string;
+  userId: string; // User ID who made the recording
+  userEmail: string; // User email (for display)
+  filename: string; // Original filename (e.g., recording-2026-02-02_10-30-45-AM.webm)
+  storageUrl: string; // Firebase Storage download URL
+  storagePath: string; // Storage path (e.g., recordings/{userId}/{filename})
+  size: number; // File size in bytes
+  duration?: number; // Duration in seconds (if available)
+  mimeType: string; // e.g., audio/webm;codecs=opus
+  timestamp: Date; // When the recording was created (PST)
+  dateKey: string; // Date key for grouping (e.g., "2026-02-02")
+  createdAt: Date; // Firestore timestamp
+}

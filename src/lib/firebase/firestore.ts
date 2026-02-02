@@ -14,7 +14,7 @@ import {
   type DocumentData,
 } from "firebase/firestore";
 import { db } from "./config";
-import type { AlgoDevice, Zone, AudioFile, DistributionLog, ZoneRouting, PoESwitch, PoEDevice } from "@/lib/algo/types";
+import type { AlgoDevice, Zone, AudioFile, DistributionLog, ZoneRouting, PoESwitch, PoEDevice, Recording } from "@/lib/algo/types";
 
 // ============ Devices ============
 
@@ -318,6 +318,115 @@ export async function updatePoEDevice(id: string, data: Partial<PoEDevice>): Pro
 export async function deletePoEDevice(id: string): Promise<void> {
   const docRef = doc(db, "poeDevices", id);
   await deleteDoc(docRef);
+}
+
+// ============ Recordings ============
+
+const recordingsCollection = collection(db, "recordings");
+
+export async function getRecordings(userId?: string): Promise<Recording[]> {
+  let q = query(recordingsCollection, orderBy("createdAt", "desc"));
+
+  // Filter by user if provided
+  if (userId) {
+    q = query(recordingsCollection, where("userId", "==", userId), orderBy("createdAt", "desc"));
+  }
+
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...convertTimestamps(doc.data()),
+  })) as Recording[];
+}
+
+export async function getRecording(id: string): Promise<Recording | null> {
+  const docRef = doc(db, "recordings", id);
+  const snapshot = await getDoc(docRef);
+  if (!snapshot.exists()) return null;
+  return { id: snapshot.id, ...convertTimestamps(snapshot.data()) } as Recording;
+}
+
+export async function addRecording(recording: Omit<Recording, "id" | "createdAt"> & { sessionId?: string }): Promise<string> {
+  const now = Timestamp.now();
+
+  // Use sessionId as document ID if provided (deterministic, allows retries)
+  if (recording.sessionId) {
+    const docRef = doc(db, "recordings", recording.sessionId);
+    await setDoc(docRef, {
+      ...recording,
+      createdAt: now,
+    }, { merge: true }); // merge: true prevents overwriting if already exists
+    return docRef.id;
+  }
+
+  // Fallback to auto-generated ID
+  const docRef = await addDoc(recordingsCollection, {
+    ...recording,
+    createdAt: now,
+  });
+  return docRef.id;
+}
+
+export async function deleteRecording(id: string): Promise<void> {
+  const docRef = doc(db, "recordings", id);
+  await deleteDoc(docRef);
+}
+
+// Get recordings grouped by date key
+export async function getRecordingsByDateKey(userId: string, dateKey: string): Promise<Recording[]> {
+  const q = query(
+    recordingsCollection,
+    where("userId", "==", userId),
+    where("dateKey", "==", dateKey),
+    orderBy("createdAt", "desc")
+  );
+
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...convertTimestamps(doc.data()),
+  })) as Recording[];
+}
+
+// Get all recordings for a specific date range
+export async function getRecordingsByDateRange(
+  userId: string,
+  startDate: Date,
+  endDate: Date
+): Promise<Recording[]> {
+  const q = query(
+    recordingsCollection,
+    where("userId", "==", userId),
+    where("timestamp", ">=", Timestamp.fromDate(startDate)),
+    where("timestamp", "<=", Timestamp.fromDate(endDate)),
+    orderBy("timestamp", "desc")
+  );
+
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map((doc) => ({
+    id: doc.id,
+    ...convertTimestamps(doc.data()),
+  })) as Recording[];
+}
+
+// Get all unique date keys for a user (for folder organization)
+export async function getRecordingDateKeys(userId: string): Promise<string[]> {
+  const q = query(
+    recordingsCollection,
+    where("userId", "==", userId),
+    orderBy("dateKey", "desc")
+  );
+
+  const snapshot = await getDocs(q);
+  const dateKeys = new Set<string>();
+  snapshot.docs.forEach((doc) => {
+    const data = doc.data();
+    if (data.dateKey) {
+      dateKeys.add(data.dateKey);
+    }
+  });
+
+  return Array.from(dateKeys);
 }
 
 // ============ Helpers ============

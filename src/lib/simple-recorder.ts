@@ -14,6 +14,8 @@
  * - Session metadata created at FIRST AUDIO DETECTION (not playback time)
  */
 
+import { RingBuffer } from './ring-buffer';
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -73,7 +75,7 @@ interface SimpleRecorderConfig {
 
   // Saving
   saveRecording?: boolean;
-  uploadCallback?: (blob: Blob, filename: string) => Promise<string>;
+  uploadCallback?: (blob: Blob, filename: string, sessionId: string) => Promise<string>;
 
   // Callbacks
   onLog?: (message: string, type: 'info' | 'error' | 'warning') => void;
@@ -91,8 +93,22 @@ type InternalConfig = Required<Pick<SimpleRecorderConfig, 'batchDuration' | 'sil
   Omit<SimpleRecorderConfig, 'batchDuration' | 'silenceTimeout' | 'playbackDelay' | 'saveRecording' | 'emulationMode' | 'emulationNetworkDelay'>;
 
 // ============================================================================
+// Hardware State Management
+// ============================================================================
+
+enum HardwareState {
+  IDLE = 'IDLE',
+  ACTIVATING = 'ACTIVATING',
+  ACTIVE = 'ACTIVE',
+  DEACTIVATING = 'DEACTIVATING'
+}
+
+// ============================================================================
 // SimpleRecorder Class
 // ============================================================================
+
+// Audio Time-To-Live (TTL) - Maximum age for buffered audio
+const MAX_AUDIO_AGE_MS = 60000; // 60 seconds - audio older than this is invalid
 
 export class SimpleRecorder {
   // Configuration
@@ -106,11 +122,22 @@ export class SimpleRecorder {
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private audioLevelInterval: number | null = null;
 
+  // PCM Capture (for live playback - bypasses encoding)
+  private pcmWorkletNode: AudioWorkletNode | null = null;
+  private pcmRingBuffer: RingBuffer | null = null; // TRUE ring buffer (circular array of samples)
+  private pcmPlaybackNode: ScriptProcessorNode | null = null; // Continuous audio callback
+  private pcmPlaybackEnabled: boolean = false;
+  private pcmPlaybackStarted: boolean = false; // Track if delay period has passed
+  private pcmSessionRamped: boolean = false; // Track if this session has been ramped (only ramp once per session)
+  private hasReceivedRealAudio: boolean = false; // Track if worklet has received non-zero audio samples
+  private ringBufferFirstSampleTime: number = 0; // Timestamp of first sample in buffer (for TTL)
+
   // Audio Output (playback monitoring)
   private playbackAnalyserNode: AnalyserNode | null = null;
   private playbackGainNode: GainNode | null = null;
   private playbackLevelInterval: number | null = null;
   private desiredPlaybackVolume: number = 1.0; // Track desired volume even when GainNode doesn't exist
+  private nextScheduledStartTime: number = 0; // Sample-accurate scheduling for seamless playback
 
   // Recording Loop State
   private isMonitoring: boolean = false;
@@ -134,7 +161,8 @@ export class SimpleRecorder {
 
   // Playback Worker State
   private isPlaybackActive: boolean = false;
-  private hardwareReady: boolean = false;
+  private hardwareState: HardwareState = HardwareState.IDLE;
+  private hardwareTransitionAbort: (() => void) | null = null; // To cancel deactivation if needed
   private currentlyPlaying: AudioBatch | null = null;
   private currentPlaybackSessionId: string | null = null; // Track which session playback is on
 
@@ -145,6 +173,9 @@ export class SimpleRecorder {
 
   // Silence detection
   private silenceCheckInterval: number | null = null;
+
+  // Batch duration monitoring (manual flush at clean Opus boundaries)
+  private batchDurationMonitorInterval: number | null = null;
 
   // Audio threshold and sustain detection
   private audioAboveThresholdStart: number | null = null; // When audio first went above threshold
@@ -160,7 +191,7 @@ export class SimpleRecorder {
       silenceTimeout: 8000,
       playbackDelay: 4000,
       audioThreshold: 0, // 0 = capture everything (no threshold)
-      sustainDuration: 0, // 0ms = no delay (instant trigger)
+      sustainDuration: 0, // User controls this via settings
       saveRecording: true,
       emulationMode: false,
       emulationNetworkDelay: 0,
@@ -184,12 +215,96 @@ export class SimpleRecorder {
     // Initialize AudioContext for playback AND audio level monitoring
     this.audioContext = new AudioContext();
     this.log(`🎧 AudioContext: ${this.audioContext.sampleRate}Hz sample rate`);
+    this.log(`🎧 AudioContext state: ${this.audioContext.state}`);
+
+    // Resume AudioContext if suspended (browser autoplay policy)
+    if (this.audioContext.state === 'suspended') {
+      this.log('⚠️  AudioContext suspended - attempting resume...');
+      this.audioContext.resume().then(() => {
+        this.log(`✓ AudioContext resumed - state: ${this.audioContext!.state}`);
+      }).catch((error) => {
+        this.log(`❌ Failed to resume AudioContext: ${error}`, 'error');
+      });
+    }
+
+    // 🎯 Load AudioWorklet for PCM capture (bypass encoding)
+    try {
+      await this.audioContext.audioWorklet.addModule('/audio/pcm-capture.worklet.js');
+      this.log('✓ PCM AudioWorklet loaded');
+    } catch (error) {
+      this.log(`⚠️ Failed to load PCM worklet: ${error}`, 'warning');
+    }
 
     // Set up INPUT audio level monitoring (for recording)
     this.sourceNode = this.audioContext.createMediaStreamSource(stream);
     this.analyserNode = this.audioContext.createAnalyser();
     this.analyserNode.fftSize = 256;
     this.sourceNode.connect(this.analyserNode);
+
+    // 🔥 Set up PCM capture (TAP ONLY - no playback yet)
+    try {
+      this.pcmWorkletNode = new AudioWorkletNode(this.audioContext, 'pcm-capture');
+
+      // Create TRUE ring buffer (60 seconds for worst-case hardware delays + network issues)
+      // 60s @ 48kHz mono Float32 = 11.52 MB (acceptable for emergency paging)
+      const bufferDuration = 60; // seconds (absolute maximum for valid audio)
+      const bufferSize = Math.floor(this.audioContext.sampleRate * bufferDuration);
+      this.pcmRingBuffer = new RingBuffer(bufferSize);
+      this.log(`✓ PCM ring buffer created: ${bufferDuration}s (${bufferSize} samples = ${(bufferSize * 4 / 1024 / 1024).toFixed(2)} MB)`);
+
+      // 🔥 CRITICAL: Connect analyser → worklet (not source → worklet!)
+      // Audio must flow THROUGH the graph for worklet to receive samples
+      this.analyserNode.connect(this.pcmWorkletNode);
+
+      // Handle PCM samples - push to TRUE ring buffer
+      let messageCount = 0;
+      let lastNonZeroPeak = 0;
+      let lastNonZeroTime = 0;
+
+      this.pcmWorkletNode.port.onmessage = (event) => {
+        messageCount++;
+
+        if (this.pcmRingBuffer) {
+          const samples = event.data.samples as Float32Array;
+          const peak = Math.max(...Array.from(samples).map(Math.abs));
+
+          // Track non-zero peaks
+          if (peak > 0.0001) {
+            lastNonZeroPeak = peak;
+            lastNonZeroTime = Date.now();
+
+            // Flag that we've received real audio (not just silence/zeros)
+            if (!this.hasReceivedRealAudio) {
+              this.hasReceivedRealAudio = true;
+              this.log(`🎤 First real audio detected in worklet! (peak: ${peak.toFixed(4)})`);
+            }
+          }
+
+          // Log first message only (reduced spam)
+          if (messageCount === 1) {
+            this.log(`🎤 PCM Worklet: First message received (${samples?.length} samples, peak: ${peak.toFixed(4)})`);
+          }
+          // Removed: every 100th message logging (too spammy)
+
+          // Track timestamp of first sample arriving in buffer (for TTL)
+          if (this.ringBufferFirstSampleTime === 0 && this.pcmRingBuffer.getAvailable() === 0) {
+            this.ringBufferFirstSampleTime = Date.now();
+            this.log(`⏱️ Ring buffer TTL tracking started (max age: ${MAX_AUDIO_AGE_MS / 1000}s)`);
+          }
+
+          // Push samples to ring buffer (logging removed to reduce spam)
+          this.pcmRingBuffer.push(samples);
+        } else {
+          if (messageCount === 1) {
+            this.log(`⚠️ PCM Worklet: Ring buffer is null!`);
+          }
+        }
+      };
+
+      this.log('✓ PCM capture pipeline initialized');
+    } catch (error) {
+      this.log(`⚠️ PCM capture failed: ${error}`, 'warning');
+    }
 
     // Log input device info
     const audioTracks = stream.getAudioTracks();
@@ -208,7 +323,12 @@ export class SimpleRecorder {
     // Set up GainNode for volume control
     this.playbackGainNode = this.audioContext.createGain();
     this.playbackGainNode.gain.value = this.desiredPlaybackVolume; // Use saved volume from slider
-    this.log(`🔊 Playback GainNode initialized at ${(this.desiredPlaybackVolume * 100).toFixed(0)}%`);
+
+    // 🔥 CRITICAL: Connect playback chain - GainNode → Analyser → Destination
+    // PCM sources will connect → GainNode, so we need this chain ready
+    this.playbackGainNode.connect(this.playbackAnalyserNode);
+    this.playbackAnalyserNode.connect(this.audioContext.destination);
+    this.log(`🔊 Playback chain connected: GainNode (${(this.desiredPlaybackVolume * 100).toFixed(0)}%) → Analyser → Speakers`);
 
     // 🔥 Capture 200ms silent pre-roll for init segment (LIKE BATCH COORDINATOR)
     // IMPORTANT: Start monitoring when quiet (no "eh" sounds)!
@@ -266,6 +386,12 @@ export class SimpleRecorder {
       this.log('✓ Silence detection stopped');
     }
 
+    if (this.batchDurationMonitorInterval) {
+      clearInterval(this.batchDurationMonitorInterval);
+      this.batchDurationMonitorInterval = null;
+      this.log('✓ Batch duration monitor stopped');
+    }
+
     // FORCE STOP batching (no sealing, no waiting)
     if (this.isBatching) {
       this.isBatching = false;
@@ -278,6 +404,9 @@ export class SimpleRecorder {
       this.mediaRecorder.stop();
       this.mediaRecorder = null;
     }
+
+    // FORCE STOP PCM playback
+    this.stopPCMPlayback();
 
     // FORCE CLEAR all queues (NO WAITING)
     if (this.batchQueue.length > 0) {
@@ -308,6 +437,11 @@ export class SimpleRecorder {
     if (this.analyserNode) {
       this.analyserNode.disconnect();
       this.analyserNode = null;
+    }
+
+    if (this.pcmWorkletNode) {
+      this.pcmWorkletNode.disconnect();
+      this.pcmWorkletNode = null;
     }
 
     if (this.playbackGainNode) {
@@ -343,9 +477,24 @@ export class SimpleRecorder {
   onAudioDetected(level: number): void {
     this.lastAudioTime = Date.now();
 
-    // If not batching, start batching
+    // If not batching, start batching (for storage)
     if (!this.isBatching && this.isMonitoring) {
+      this.log(`🎯 Starting batching (audio detected at level ${level})`);
       this.startBatching();
+
+      // 🔥 START PCM PLAYBACK IMMEDIATELY (don't wait for hardware!)
+      // Ring buffer starts filling NOW, playback outputs silence until hardware ready
+      if (!this.pcmPlaybackEnabled) {
+        this.log('🎬 First audio detected - starting PCM playback session');
+        this.startPCMPlayback(); // Start immediately!
+
+        // Activate hardware asynchronously (in parallel)
+        this.ensureHardwareActive().then(() => {
+          this.log('✓ Hardware activation complete');
+        }).catch((error) => {
+          this.log(`❌ Hardware activation failed: ${error}`, 'error');
+        });
+      }
     }
   }
 
@@ -571,20 +720,8 @@ export class SimpleRecorder {
         this.isAudioSustained = false;
       }
 
-      // Log significant audio level changes
-      if (Math.abs(level - this.lastLoggedAudioLevel) > 10) {
-        let status = '(quiet)';
-        if (isAboveThreshold) {
-          if (this.isAudioSustained) {
-            status = '(VOICE DETECTED)';
-          } else if (sustainDuration > 0) {
-            const elapsed = this.audioAboveThresholdStart ? now - this.audioAboveThresholdStart : 0;
-            status = `(sustaining... ${elapsed}ms/${sustainDuration}ms)`;
-          }
-        }
-        this.log(`🎤 Audio Level: ${level}% ${status}`);
-        this.lastLoggedAudioLevel = level;
-      }
+      // Audio level logging removed to reduce spam
+      // (UI still gets updates via onAudioLevel callback)
 
       // Notify audio level callback for UI
       if (this.config.onAudioLevel) {
@@ -613,7 +750,7 @@ export class SimpleRecorder {
         `Queue=${this.batchQueue.length} batches`,
         `Playing=${this.currentlyPlaying ? 'YES' : 'NO'}`,
         `SaveQueue=${this.saveQueue.length}/${this.MAX_SAVE_SESSIONS}`,
-        `Hardware=${this.hardwareReady ? 'ACTIVE' : 'IDLE'}`,
+        `Hardware=${this.hardwareState}`,
       ];
 
       if (this.currentBatch) {
@@ -715,11 +852,16 @@ export class SimpleRecorder {
       }
     };
 
-    this.mediaRecorder.start(100); // 100ms chunks
-    this.log(`🎤 MediaRecorder ACTIVE (${mimeType}, 128kbps, 100ms chunks)`);
+    // 🔥 NO TIMESLICE: Let Opus create natural frame boundaries
+    // We'll manually flush when batches are ready (prevents mid-syllable cuts)
+    this.mediaRecorder.start();
+    this.log(`🎤 MediaRecorder ACTIVE (${mimeType}, 128kbps, continuous recording - manual flush)`);
 
     // Start first batch
     this.startNewBatch();
+
+    // Start batch duration monitor (checks every 100ms, flushes at 5s)
+    this.startBatchDurationMonitor();
   }
 
   private stopBatching(): void {
@@ -730,34 +872,52 @@ export class SimpleRecorder {
     this.log('📦 BATCHING MODE STOPPED (8s Silence Timeout)');
     this.log('📦 ═══════════════════════════════════════');
 
-    // Seal current batch
-    if (this.currentBatch) {
-      this.log('📦 Sealing final batch...');
-      this.sealCurrentBatch();
-    }
+    // Stop batch duration monitor
+    this.stopBatchDurationMonitor();
 
-    // Stop MediaRecorder
+    // Stop MediaRecorder (automatically flushes remaining data → triggers final ondataavailable)
     if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-      this.log('⏹️ Stopping MediaRecorder...');
+      this.log('⏹️ Stopping MediaRecorder (final flush will seal last batch)...');
       this.mediaRecorder.stop();
       this.mediaRecorder = null;
     }
+
+    // ✅ DON'T stop PCM playback here - let it drain the buffer naturally
+    // PCM will stop when:
+    // 1. User manually stops monitoring (stop() method)
+    // 2. Ring buffer is empty (future enhancement)
+    // this.log('✓ Recording stopped - PCM playback will continue draining buffer');
 
     // 🔥 CLOSE SESSION (Recording Authority decides session is done)
     if (this.currentSessionId) {
       this.log(`🔒 SESSION CLOSED: ${this.currentSessionId}`);
       this.log(`   └─ Reason: 8s silence timeout reached`);
-      // Don't clear currentSessionId yet - playback needs it
-      // Will be cleared when next session starts
+
+      // Reset PCM session ramp flag (ready for next session)
+      this.pcmSessionRamped = false;
+      this.log(`🎚️ Session ramp flag reset (ready for next session)`);
+
+      // 💾 FINALIZE SESSION FOR SAVING (after short delay to ensure all batches are processed)
+      // Wait a bit for the last batch to be added to the session by the playback worker
+      setTimeout(() => {
+        const sessionMeta = this.sessionMetaStore.get(this.currentSessionId!);
+        if (sessionMeta && sessionMeta.batches.length > 0) {
+          sessionMeta.playbackEndTime = Date.now();
+          this.log(`💾 Finalizing session: ${this.currentSessionId} (${sessionMeta.batches.length} batches)`);
+          this.enqueueSaveSession(sessionMeta);
+        } else {
+          this.log(`⚠️ Session ${this.currentSessionId} has no batches - not saving`);
+        }
+      }, 500); // Wait 500ms for last batch to be processed
+
+      // Don't clear currentSessionId yet - will be cleared when next session starts
     }
 
     // NOTE: We keep initSegment for reuse across sessions (like BatchCoordinator)
     // Only cleared when monitoring stops completely (in stop() method)
 
     this.log(`✓ Batching stopped - ${this.batchQueue.length} batches in queue`);
-    this.log('⏳ Waiting for playback worker to drain queue...');
-
-    // Session will be marked complete by playback worker when queue drains
+    this.log('⏳ Waiting for save worker to upload session...');
   }
 
   private startNewBatch(): void {
@@ -788,39 +948,87 @@ export class SimpleRecorder {
     }
   }
 
+  private startBatchDurationMonitor(): void {
+    // Clear any existing monitor
+    this.stopBatchDurationMonitor();
+
+    // Check batch duration every 100ms
+    this.batchDurationMonitorInterval = window.setInterval(() => {
+      if (!this.currentBatch || !this.isBatching) return;
+
+      const elapsed = Date.now() - this.batchStartTime;
+
+      // 🎯 CRITICAL: Only flush during SILENCE, never mid-word
+      // This prevents cutting syllables ("ni...ne", "e...ight")
+      const MIN_DURATION = 4500; // Don't flush before 4.5s
+      const TARGET_DURATION = this.config.batchDuration; // 5000ms
+      const MAX_DURATION = 6500; // Force flush if continuous speech
+
+      if (elapsed < MIN_DURATION) return; // Too early
+
+      // Ideal case: flush at ~5s during silence (word boundary)
+      if (elapsed >= TARGET_DURATION && !this.isAudioSustained) {
+        this.log(`⏱️ Batch duration reached (${elapsed}ms) + silence detected - flushing at word boundary`);
+
+        if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+          this.mediaRecorder.requestData();
+        }
+      }
+      // Safety valve: force flush if continuous speech exceeds 6.5s
+      else if (elapsed >= MAX_DURATION) {
+        this.log(`⚠️ Max duration exceeded (${elapsed}ms) - force flushing (continuous speech)`);
+
+        if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+          this.mediaRecorder.requestData();
+        }
+      }
+      // Waiting for silence...
+      else if (elapsed >= TARGET_DURATION && this.isAudioSustained) {
+        // Voice still active, waiting for silence (logging removed to reduce spam)
+      }
+    }, 100);
+  }
+
+  private stopBatchDurationMonitor(): void {
+    if (this.batchDurationMonitorInterval !== null) {
+      clearInterval(this.batchDurationMonitorInterval);
+      this.batchDurationMonitorInterval = null;
+    }
+  }
+
   private onChunkRecorded(chunk: Blob): void {
     if (!this.currentBatch) return;
 
+    // With manual flushing, each chunk is ~5 seconds of clean Opus audio
     this.currentChunks.push(chunk);
     this.currentBatch.duration = Date.now() - this.batchStartTime;
 
-    // Check if batch duration reached
-    if (this.currentBatch.duration >= this.config.batchDuration) {
-      this.sealCurrentBatch();
+    // Seal batch when we receive flushed data
+    this.sealCurrentBatch();
 
-      // Continue with next batch (DON'T restart MediaRecorder)
-      if (this.isBatching) {
-        this.startNewBatch();
-      }
+    // Continue with next batch (DON'T restart MediaRecorder)
+    if (this.isBatching) {
+      this.startNewBatch();
     }
   }
 
   private sealCurrentBatch(): void {
     if (!this.currentBatch) return;
 
+    // ⚠️ NEVER seal empty batches (causes silence gaps!)
+    if (this.currentChunks.length === 0) {
+      this.log(`⚠️ Skipping empty batch (no chunks recorded)`);
+      this.currentBatch = null;
+      return;
+    }
+
     const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
     const batchNumber = this.batchQueue.length + 1;
 
-    // 🔥 ALWAYS prepend init segment for ALL batches (LIKE BATCH COORDINATOR)
-    // This ensures every batch can play standalone with decodeAudioData
-    if (this.initSegment) {
-      this.currentBatch.blob = new Blob([this.initSegment, ...this.currentChunks], { type: mimeType });
-      this.log(`📦 Batch ${batchNumber}: Prepended silent pre-roll (${(this.initSegment.size / 1024).toFixed(2)} KB)`);
-    } else {
-      // Fallback (should never happen after captureSilentPreRoll)
-      this.currentBatch.blob = new Blob(this.currentChunks, { type: mimeType });
-      this.log(`⚠️ Batch ${batchNumber}: No init segment available!`, 'warning');
-    }
+    // 🔥 Store PURE AUDIO ONLY (no init segment in stored blob!)
+    // Init segment will be prepended temporarily during decode, not stored
+    this.currentBatch.blob = new Blob(this.currentChunks, { type: mimeType });
+    this.log(`📦 Batch ${batchNumber}: Raw audio (${(this.currentBatch.blob.size / 1024).toFixed(2)} KB) - pure continuity`);
 
     // Store raw chunks for saving (without init segment duplication)
     this.currentBatch.chunks = [...this.currentChunks];
@@ -830,7 +1038,7 @@ export class SimpleRecorder {
     this.log(`📦 Batch SEALED: ${this.currentBatch.id}`);
     this.log(`   ├─ Batch #${batchNumber}`);
     this.log(`   ├─ Duration: ${this.currentBatch.duration}ms`);
-    this.log(`   ├─ Size: ${sizeKB} KB (silent pre-roll + audio)`);
+    this.log(`   ├─ Size: ${sizeKB} KB (raw audio only)`);
     this.log(`   ├─ Chunks: ${this.currentChunks.length}`);
     this.log(`   └─ Queue position: ${batchNumber}`);
 
@@ -850,6 +1058,229 @@ export class SimpleRecorder {
   }
 
   // ============================================================================
+  // PCM Playback (Live Streaming - No Encoding)
+  // ============================================================================
+
+  /**
+   * Start PCM playback (replaces batch-based playback)
+   * - Pulls samples from ring buffer
+   * - Schedules continuously
+   * - No decoding, no gaps, no artifacts
+   */
+  private startPCMPlayback(): void {
+    if (this.pcmPlaybackEnabled) return;
+    if (!this.audioContext || !this.pcmRingBuffer) return;
+
+    this.log('🎧 ═══════════════════════════════════════');
+    this.log('🎧 STARTING PCM LIVE PLAYBACK');
+    this.log('🎧 ═══════════════════════════════════════');
+    this.log('🎧 Mode: ScriptProcessorNode (continuous callback)');
+    this.log('🎧 Buffer size: 4096 samples (~85ms at 48kHz)');
+
+    // Create ScriptProcessor for continuous playback (like test page)
+    // Buffer size: 4096 samples = ~85ms at 48kHz (low latency)
+    this.pcmPlaybackNode = this.audioContext.createScriptProcessor(4096, 0, 1);
+
+    let totalSamplesPlayed = 0;
+    let emptyBufferCount = 0; // Track how many times buffer was empty
+
+    this.pcmPlaybackNode.onaudioprocess = (event) => {
+      if (!this.pcmRingBuffer || !this.audioContext || !this.pcmPlaybackEnabled) return;
+
+      const output = event.outputBuffer.getChannelData(0);
+
+      // 🔥 TTL CHECK: Ensure audio isn't too old (prevents time-travel audio)
+      if (this.ringBufferFirstSampleTime > 0) {
+        const audioAge = Date.now() - this.ringBufferFirstSampleTime;
+
+        if (audioAge > MAX_AUDIO_AGE_MS) {
+          // Audio is too old - flush buffer and wait for fresh audio
+          const availableSamples = this.pcmRingBuffer.getAvailable();
+          this.log(`⚠️ AUDIO TOO OLD: ${(audioAge / 1000).toFixed(1)}s > ${MAX_AUDIO_AGE_MS / 1000}s max`);
+          this.log(`   └─ Flushing ${availableSamples} stale samples (${(availableSamples / this.audioContext.sampleRate).toFixed(1)}s)`);
+
+          // Flush stale audio
+          this.pcmRingBuffer.clear();
+          this.ringBufferFirstSampleTime = 0; // Reset for fresh audio
+          this.pcmPlaybackStarted = false; // Reset playback state
+          this.hasReceivedRealAudio = false; // Reset audio detection
+
+          // Output silence and wait for fresh audio
+          output.fill(0);
+          return;
+        }
+      }
+
+      // 🔥 WAIT FOR HARDWARE before outputting audio (but keep filling ring buffer)
+      if (this.hardwareState !== HardwareState.ACTIVE) {
+        output.fill(0); // Output silence until hardware ready
+        return;
+      }
+
+      // Check if we've accumulated enough samples to start playback (delay period)
+      if (!this.pcmPlaybackStarted) {
+        const requiredSamples = this.config.playbackDelay * (this.audioContext!.sampleRate / 1000);
+        const availableSamples = this.pcmRingBuffer.getAvailable();
+
+        // 🔥 CRITICAL: Wait for BOTH:
+        // 1. Enough samples accumulated (delay period)
+        // 2. Worklet has received actual audio (not just zeros)
+        if (availableSamples >= requiredSamples && this.hasReceivedRealAudio) {
+          this.pcmPlaybackStarted = true;
+          this.log(`🔊 Playback delay complete (${availableSamples} samples = ${(availableSamples / this.audioContext!.sampleRate).toFixed(2)}s available, real audio received)`);
+
+          // 🎚️ APPLY SESSION VOLUME RAMP (first audio of session)
+          if (!this.pcmSessionRamped && this.config.playbackRampEnabled && this.isWithinRampWindow() && this.playbackGainNode) {
+            const startVol = this.config.playbackRampStartVolume ?? 0;
+            const targetVol = this.config.playbackRampTargetVolume ?? 1.0;
+            const rampDuration = (this.config.playbackRampDuration ?? 2000) / 1000; // Convert to seconds
+
+            // Set to start volume immediately
+            this.playbackGainNode.gain.setValueAtTime(startVol, this.audioContext.currentTime);
+
+            // Ramp to target volume over duration
+            this.playbackGainNode.gain.linearRampToValueAtTime(
+              targetVol,
+              this.audioContext.currentTime + rampDuration
+            );
+
+            this.pcmSessionRamped = true;
+            this.log(`🎚️ PCM SESSION RAMP: ${(startVol * 100).toFixed(0)}% → ${(targetVol * 100).toFixed(0)}% over ${rampDuration.toFixed(1)}s`);
+          } else if (!this.pcmSessionRamped && this.config.playbackRampEnabled && !this.isWithinRampWindow()) {
+            this.log(`🕐 Outside ramp window - using static volume`);
+          }
+        } else {
+          // Output silence until delay is complete
+          output.fill(0);
+          return;
+        }
+      }
+
+      // 🔥 Pull samples from TRUE ring buffer (exactly what we need)
+      const samples = this.pcmRingBuffer.pull(output.length); // Pull 4096 samples
+
+      // Apply gain and copy to output
+      const PCM_GAIN = 1.0; // No gain (adjust if needed: 0.5 = quieter, 2.0 = louder)
+      let peakLevel = 0;
+
+      for (let i = 0; i < samples.length; i++) {
+        const sample = samples[i] * PCM_GAIN;
+        output[i] = Math.max(-1, Math.min(1, sample)); // Clamp to prevent clipping
+        peakLevel = Math.max(peakLevel, Math.abs(sample));
+      }
+
+      // Fill any remaining with silence (shouldn't happen with TRUE ring buffer)
+      for (let i = samples.length; i < output.length; i++) {
+        output[i] = 0;
+      }
+
+      totalSamplesPlayed += output.length;
+
+      // Log first frame only (reduced spam)
+      if (totalSamplesPlayed === output.length) {
+        this.log(`🎵 First audio frame played!`);
+      }
+      // Removed: detailed logging and periodic pull logs (too spammy)
+
+      // Check if buffer is truly empty
+      const bufferAvailable = this.pcmRingBuffer.getAvailable();
+      const bufferEmpty = bufferAvailable === 0;
+
+      // 🔥 CRITICAL: Only auto-stop if:
+      // 1. Recording has stopped (!this.isBatching)
+      // 2. Buffer is either completely empty OR very low (< 0.5s of audio)
+      // 3. Has been empty for sufficient time (5 seconds to be safe)
+      const bufferDuration = bufferAvailable / (this.audioContext?.sampleRate || 48000);
+      const bufferVeryLow = bufferDuration < 0.5; // Less than 0.5 seconds
+
+      if (!this.isBatching && (bufferEmpty || bufferVeryLow)) {
+        emptyBufferCount++;
+
+        // Wait 5 seconds before auto-stopping (5000ms / 85ms = ~59 callbacks)
+        if (emptyBufferCount > 59) {
+          this.log(`🛑 Buffer drained - auto-stopping PCM playback`);
+          this.stopPCMPlayback();
+          return;
+        }
+        // Removed: countdown logging (too spammy)
+      } else {
+        // Reset counter if recording is still active OR buffer has significant audio
+        emptyBufferCount = 0;
+      }
+
+      // Reset TTL tracking when buffer becomes empty (all audio drained)
+      if (bufferEmpty && this.ringBufferFirstSampleTime > 0) {
+        this.ringBufferFirstSampleTime = 0; // Ready for next audio session
+
+        // Reset session ramp flag (ready for next session)
+        if (this.pcmSessionRamped) {
+          this.pcmSessionRamped = false;
+
+          // Reset gain to start volume (ready for next session ramp)
+          if (this.config.playbackRampEnabled && this.isWithinRampWindow() && this.playbackGainNode && this.audioContext) {
+            const startVol = this.config.playbackRampStartVolume ?? 0;
+            this.playbackGainNode.gain.setValueAtTime(startVol, this.audioContext.currentTime);
+            this.log(`🎚️ Session ended - volume reset to ${(startVol * 100).toFixed(0)}% (ready for next session)`);
+          }
+        }
+      }
+
+      // Periodic logging removed to prevent console accumulation
+      // if (totalSamplesPlayed > 0 && totalSamplesPlayed % (output.length * 20) === 0) {
+      //   this.log(`🎵 Playing: ${(totalSamplesPlayed / this.audioContext!.sampleRate).toFixed(1)}s played, peak: ${peakLevel.toFixed(4)}, buffer: ${this.pcmRingBuffer.getAvailable()} samples`);
+      // }
+    };
+
+    // Connect ScriptProcessor → GainNode → Analyser → Destination
+    this.pcmPlaybackNode.connect(this.playbackGainNode!);
+    this.pcmPlaybackEnabled = true;
+
+    this.log(`✓ PCM playback started - continuous audio stream`);
+    this.log('🎧 ═══════════════════════════════════════');
+  }
+
+  /**
+   * Stop PCM playback
+   */
+  private stopPCMPlayback(): void {
+    if (!this.pcmPlaybackEnabled) return;
+
+    this.log('🛑 Stopping PCM playback');
+
+    this.pcmPlaybackEnabled = false;
+    this.pcmPlaybackStarted = false;
+    this.pcmSessionRamped = false; // Reset session ramp flag
+    this.hasReceivedRealAudio = false; // Reset audio detection
+    this.ringBufferFirstSampleTime = 0; // Reset TTL tracking
+
+    if (this.pcmPlaybackNode) {
+      this.pcmPlaybackNode.disconnect();
+      this.pcmPlaybackNode = null;
+    }
+
+    if (this.pcmRingBuffer) {
+      this.pcmRingBuffer.clear();
+    }
+
+    // 🔥 STOP PCM CAPTURE (worklet + analyser) to prevent endless background noise
+    // Only stop if recording has also stopped (if still batching, need to continue capturing)
+    if (!this.isBatching) {
+      this.log('🛑 Stopping PCM capture (worklet + analyser)');
+
+      if (this.pcmWorkletNode) {
+        this.pcmWorkletNode.disconnect();
+        this.pcmWorkletNode.port.onmessage = null;
+        this.pcmWorkletNode = null;
+      }
+
+      // Note: We keep analyserNode connected for audio detection to work for next session
+      // Only disconnect if we're truly stopping monitoring
+    }
+
+    this.log('✓ PCM playback stopped');
+  }
+
+  // ============================================================================
   // Playback Worker (Consumer - Always Listening)
   // ============================================================================
 
@@ -860,33 +1291,38 @@ export class SimpleRecorder {
       // Wait for next batch
       const batch = await this.waitForNextBatch();
 
-      if (!batch) continue; // Monitoring stopped
-
-      // 🔥 DETECT SESSION CHANGE (Playback follows sessionID)
-      if (this.currentPlaybackSessionId && batch.sessionId !== this.currentPlaybackSessionId) {
-        this.log(`🔄 SESSION CHANGE DETECTED`);
-        this.log(`   ├─ Previous: ${this.currentPlaybackSessionId}`);
-        this.log(`   └─ New: ${batch.sessionId}`);
-
-        // Finalize previous session
-        await this.finalizePlaybackSession(this.currentPlaybackSessionId);
+      if (!batch) {
+        continue; // Monitoring stopped
       }
 
-      // Set current playback session
+      // 🔥 DETECT SESSION CHANGE (Playback follows sessionID)
+      // ⚠️ DO NOT finalize previous session here - queue empty doesn't mean recording stopped!
+      // User might still be speaking - just haven't hit 5s batch boundary yet
+      if (this.currentPlaybackSessionId && batch.sessionId !== this.currentPlaybackSessionId) {
+        this.log(`🔄 SESSION CHANGE DETECTED (continuing playback)`);
+        this.log(`   ├─ Previous: ${this.currentPlaybackSessionId}`);
+        this.log(`   └─ New: ${batch.sessionId}`);
+        // Session changes are just metadata - don't interrupt audio continuity!
+      }
+
+      // Set current playback session (for tracking only - PCM playback started at first audio detection)
       let isFirstBatchOfSession = false;
       if (!this.currentPlaybackSessionId || batch.sessionId !== this.currentPlaybackSessionId) {
         this.currentPlaybackSessionId = batch.sessionId;
         isFirstBatchOfSession = true;
-        this.log(`🎬 PLAYBACK SESSION STARTED: ${batch.sessionId}`);
+        this.log(`🎬 PLAYBACK SESSION: ${batch.sessionId}`);
+        // Note: PCM playback already started when audio was first detected
       }
 
-      // Ensure hardware active (CAN BLOCK FOREVER - this is OK)
-      await this.ensureHardwareActive();
+      // 🎧 PCM PLAYBACK MODE - batches are for storage only
+      // Audio flows continuously from PCM ring buffer
+      // No decoding, no scheduling, no gaps
+      // (Logging removed to prevent console accumulation)
 
-      // Play batch (with ramping if first batch of session)
-      await this.playBatch(batch, isFirstBatchOfSession);
+      // ❌ OLD BATCH PLAYBACK DISABLED
+      // this.playBatch(batch, isFirstBatchOfSession, isLastBatchOfSession);
 
-      // Remove from queue ONLY after successful playback
+      // Remove from queue immediately after scheduling (not after playback complete!)
       const index = this.batchQueue.indexOf(batch);
       if (index !== -1) {
         this.batchQueue.splice(index, 1);
@@ -898,10 +1334,10 @@ export class SimpleRecorder {
         sessionMeta.batches.push(batch);
       }
 
-      // Check if queue is empty (session complete)
-      if (this.batchQueue.length === 0) {
-        await this.onQueueEmpty();
-      }
+      // ✅ NO session finalization here!
+      // Session lifetime is controlled by SILENCE TIMEOUT (recording side)
+      // NOT by queue emptiness (playback side)
+      // The user might still be talking - queue empty just means we're caught up!
     }
 
     this.log('🔊 Playback worker stopped');
@@ -924,10 +1360,27 @@ export class SimpleRecorder {
   }
 
   private async ensureHardwareActive(): Promise<void> {
-    if (this.hardwareReady) {
+    // 🔥 STATE MACHINE: Handle all possible states
+    if (this.hardwareState === HardwareState.ACTIVE) {
       const speakerCount = (this.config.linkedSpeakers || []).length;
       this.log(`✓ Speakers already active (${speakerCount} speaker${speakerCount !== 1 ? 's' : ''} @ 224.0.2.60:50002)`);
       return;
+    }
+
+    if (this.hardwareState === HardwareState.ACTIVATING) {
+      this.log('✓ Hardware activation already in progress - waiting...');
+      return;
+    }
+
+    if (this.hardwareState === HardwareState.DEACTIVATING) {
+      this.log('🔄 Hardware deactivation in progress - CANCELING and reactivating');
+      // Cancel deactivation
+      if (this.hardwareTransitionAbort) {
+        this.hardwareTransitionAbort();
+        this.hardwareTransitionAbort = null;
+      }
+      // Wait a bit for deactivation to abort
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
     // Check if any hardware is configured
@@ -936,9 +1389,11 @@ export class SimpleRecorder {
 
     if (!hasLinkedSpeakers && !hasPagingDevice) {
       this.log('⚠️  No hardware configured - skipping activation');
-      this.hardwareReady = true; // Mark as ready anyway for playback
+      this.hardwareState = HardwareState.ACTIVE; // Mark as ready anyway for playback
       return;
     }
+
+    this.hardwareState = HardwareState.ACTIVATING;
 
     this.log('🎛️ ═══════════════════════════════════════');
     this.log('🎛️ HARDWARE ACTIVATION START');
@@ -973,7 +1428,7 @@ export class SimpleRecorder {
         await new Promise(resolve => setTimeout(resolve, this.config.emulationNetworkDelay));
       }
 
-      this.hardwareReady = true;
+      this.hardwareState = HardwareState.ACTIVE;
       this.log('✅ EMULATION: Speaker activation complete');
       this.log('🎛️ ═══ HARDWARE ACTIVATION COMPLETE ═══');
       return;
@@ -998,7 +1453,7 @@ export class SimpleRecorder {
         this.log('');
       }
 
-      this.hardwareReady = true;
+      this.hardwareState = HardwareState.ACTIVE;
       this.log('✅ All speakers activated successfully');
       this.log(`   • ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''} zone set to ACTIVE`);
       this.log(`   • mcast.zone1: 224.0.2.60:50002 (receiving from paging)`);
@@ -1012,7 +1467,7 @@ export class SimpleRecorder {
     }
   }
 
-  private async playBatch(batch: AudioBatch, isFirstBatchOfSession: boolean = false): Promise<void> {
+  private async playBatch(batch: AudioBatch, isFirstBatchOfSession: boolean = false, isLastBatchOfSession: boolean = false): Promise<void> {
     this.currentlyPlaying = batch;
     const sizeKB = (batch.blob.size / 1024).toFixed(2);
 
@@ -1021,30 +1476,47 @@ export class SimpleRecorder {
     this.log(`   ├─ Duration: ${batch.duration}ms`);
     this.log(`   ├─ Size: ${sizeKB} KB`);
     this.log(`   ├─ Session: ${batch.sessionId}`);
-    this.log(`   └─ First of session: ${isFirstBatchOfSession ? 'YES' : 'NO'}`);
+    this.log(`   ├─ First of session: ${isFirstBatchOfSession ? 'YES' : 'NO'}`);
+    this.log(`   └─ Last of session: ${isLastBatchOfSession ? 'YES' : 'NO'}`);
 
     if (!this.audioContext || !this.playbackAnalyserNode) {
       throw new Error('AudioContext not initialized');
     }
 
     let source: AudioBufferSourceNode | null = null;
+    let batchGainNode: GainNode | null = null;
 
     try {
       const playStartTime = Date.now();
 
-      // 🎵 Step 1: Decode blob to AudioBuffer (LIKE BATCH COORDINATOR)
+      // 🎵 Step 1: Decode blob to AudioBuffer
+      // Create temporary decode blob with init segment (required for decodeAudioData)
+      // Init segment is NOT stored in batch, only used here for decoding
       this.log(`🎧 Decoding WebM blob to AudioBuffer...`);
-      const arrayBuffer = await batch.blob.arrayBuffer();
+
+      if (!this.initSegment) {
+        throw new Error('Init segment not available for decoding');
+      }
+
+      // Create temporary blob: [initSegment, batchAudio] for decoding ONLY
+      const decodeBlob = new Blob([this.initSegment, batch.blob], { type: 'audio/webm;codecs=opus' });
+      const arrayBuffer = await decodeBlob.arrayBuffer();
       const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
 
       this.log(`✓ Decoded: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.numberOfChannels}ch`);
-      this.log(`🎧 Audio pipeline: WebM → decodeAudioData → AudioBuffer → AnalyserNode → Speakers`);
+      this.log(`🎧 Audio pipeline: [Init + Audio] → decodeAudioData → AudioBuffer → Speakers (no trimming!)`);
 
-      // 🎵 Step 2: Create AudioBufferSourceNode and connect with volume control
-      // Audio chain: Source → GainNode (volume) → AnalyserNode (VU meter) → Speakers
+      // 🎵 Step 2: Create AudioBufferSourceNode with BATCH-SPECIFIC GainNode
+      // Audio chain: Source → Batch Gain (micro fades) → Master Gain (volume) → Analyser → Speakers
       source = this.audioContext.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(this.playbackGainNode!);
+
+      // Create dedicated GainNode for this batch (for micro fade-in/out to eliminate pops)
+      batchGainNode = this.audioContext.createGain();
+
+      // Connect: Source → Batch Gain → Master Gain → Analyser → Destination
+      source.connect(batchGainNode);
+      batchGainNode.connect(this.playbackGainNode!);
       this.playbackGainNode!.connect(this.playbackAnalyserNode);
       this.playbackAnalyserNode.connect(this.audioContext.destination);
 
@@ -1079,35 +1551,92 @@ export class SimpleRecorder {
 
       this.log(`▶️  Starting playback...`);
 
-      // 🎵 Step 3: Play and wait for completion
-      await new Promise<void>((resolve, reject) => {
-        source!.onended = () => resolve();
+      // 🎵 Step 3: SEAMLESS SCHEDULED PLAYBACK (No gaps!)
+      // Instead of reactive onended, we SCHEDULE batches sample-accurately
 
-        // Start playback
-        try {
-          source!.start(0);
-        } catch (err) {
-          reject(err);
-        }
-      });
+      // Determine start time:
+      // - First batch: use current time + safety margin
+      // - Subsequent batches: use EXACT scheduled time (no overlap unless truly late)
+      const now = this.audioContext.currentTime;
+      let startTime: number;
+      let actualStartTime: number; // When source.start() is called
+      let needsOverlap = false;
 
-      const playDuration = Date.now() - playStartTime;
-      this.log(`✅ PLAYBACK COMPLETE (${playDuration}ms)`);
-      this.log(`🔊 ═══ PLAYBACK END ═══`);
-    } catch (error) {
-      this.log(`❌ PLAYBACK FAILED: ${error}`, 'error');
-      // Don't throw - let playback worker continue with next batch
-    } finally {
-      // Cleanup: disconnect source
-      if (source) {
-        try {
-          source.disconnect();
-        } catch (e) {
-          // Ignore disconnect errors
+      if (this.nextScheduledStartTime === 0 || isFirstBatchOfSession) {
+        // First batch of session: start ASAP with safety margin
+        const safeNow = now + 0.02; // 20ms cushion
+        startTime = safeNow;
+        actualStartTime = safeNow;
+      } else {
+        // Subsequent batches: check if we're truly late
+        startTime = this.nextScheduledStartTime;
+        const gap = startTime - now;
+
+        // Only overlap if we're running late (< 10ms ahead)
+        if (gap < 0.01) {
+          const OVERLAP_MS = 0.002; // 2ms overlap
+          actualStartTime = startTime - OVERLAP_MS;
+          needsOverlap = true;
+          this.log(`⚠️  Late by ${(-gap * 1000).toFixed(1)}ms - applying ${(OVERLAP_MS * 1000).toFixed(0)}ms overlap`);
+        } else {
+          // On time - no overlap needed
+          actualStartTime = startTime;
+          this.log(`✓ On time - gap: ${(gap * 1000).toFixed(1)}ms`);
         }
       }
-      this.currentlyPlaying = null;
+
+      // Calculate batch duration and end time
+      // 🎯 CRITICAL: Always use decoded audioBuffer.duration, NEVER recorded batch.duration
+      // Opus is variable-rate, decoded time is ground truth
+      const batchDuration = audioBuffer.duration;
+      const endTime = startTime + batchDuration;
+
+      // 🎚️ GAIN CONTROL
+      if (needsOverlap) {
+        // Apply crossfade only when needed (late start)
+        batchGainNode.gain.setValueAtTime(0, actualStartTime);
+        batchGainNode.gain.linearRampToValueAtTime(1, startTime);
+        batchGainNode.gain.setValueAtTime(1, endTime);
+        this.log(`🎚️  Crossfade: 0→1 over ${((startTime - actualStartTime) * 1000).toFixed(0)}ms`);
+      } else {
+        // Constant gain - no fade artifacts
+        batchGainNode.gain.setValueAtTime(1, actualStartTime);
+        batchGainNode.gain.setValueAtTime(1, endTime);
+        this.log(`🎚️  Constant gain: 1.0 (no crossfade)`);
+      }
+
+      // Schedule source to start at actual time (with overlap for non-first batches)
+      source.start(actualStartTime);
+
+      // Auto-cleanup when batch finishes (non-blocking)
+      // Capture references for callback (TypeScript safety)
+      const sourceRef = source;
+      const gainRef = batchGainNode;
+      source.onended = () => {
+        sourceRef.disconnect();
+        gainRef.disconnect();
+        this.log(`🧹 Batch cleanup complete: ${batch.id}`);
+      };
+
+      // Update next scheduled time for seamless chaining (playback cursor)
+      this.nextScheduledStartTime = endTime;
+
+      this.log(`⏱️  Scheduled: start=${startTime.toFixed(3)}s, end=${endTime.toFixed(3)}s, duration=${batchDuration.toFixed(3)}s`);
+      this.log(`✅ Batch scheduled ahead - next batch can be queued immediately (predictive scheduling)`);
+    } catch (error) {
+      this.log(`❌ PLAYBACK FAILED: ${error}`, 'error');
+      // Cleanup on error only
+      try {
+        if (source) source.disconnect();
+        if (batchGainNode) batchGainNode.disconnect();
+      } catch (e) {
+        // Ignore disconnect errors
+      }
+      // Don't throw - let playback worker continue with next batch
     }
+
+    // Note: Normal cleanup happens in source.onended (non-blocking)
+    // currentlyPlaying is intentionally NOT set to null here (predictive scheduling)
   }
 
   private async finalizePlaybackSession(sessionId: string): Promise<void> {
@@ -1144,19 +1673,41 @@ export class SimpleRecorder {
   private async onQueueEmpty(): Promise<void> {
     this.log('📭 Batch queue empty');
 
-    // Finalize current playback session if exists
-    if (this.currentPlaybackSessionId) {
-      await this.finalizePlaybackSession(this.currentPlaybackSessionId);
-      this.currentPlaybackSessionId = null;
-    }
+    // ⚠️ CRITICAL: Only finalize if recording has actually stopped!
+    // Queue can be temporarily empty while user is still speaking
+    // (playback caught up to recording, next batch not ready yet)
+    if (!this.isBatching) {
+      // Recording has stopped (silence timeout) - safe to finalize
+      if (this.currentPlaybackSessionId) {
+        await this.finalizePlaybackSession(this.currentPlaybackSessionId);
+        this.currentPlaybackSessionId = null;
+      }
 
-    // Deactivate hardware
-    await this.deactivateHardware();
+      // Reset scheduled time for next session
+      this.nextScheduledStartTime = 0;
+
+      // Deactivate hardware
+      await this.deactivateHardware();
+    } else {
+      // Recording still active - queue just caught up, more audio coming
+      this.log('✓ Recording still active - waiting for more batches');
+    }
   }
 
   private async deactivateHardware(): Promise<void> {
-    if (!this.hardwareReady) {
+    // 🔥 STATE MACHINE: Handle all possible states
+    if (this.hardwareState === HardwareState.IDLE) {
       this.log('✓ Speakers already idle (IP: 224.0.2.60:50022)');
+      return;
+    }
+
+    if (this.hardwareState === HardwareState.DEACTIVATING) {
+      this.log('✓ Hardware deactivation already in progress');
+      return;
+    }
+
+    if (this.hardwareState === HardwareState.ACTIVATING) {
+      this.log('⚠️ Cannot deactivate - activation in progress');
       return;
     }
 
@@ -1166,9 +1717,18 @@ export class SimpleRecorder {
 
     if (!hasLinkedSpeakers && !hasPagingDevice) {
       this.log('⚠️  No hardware configured - skipping deactivation');
-      this.hardwareReady = false;
+      this.hardwareState = HardwareState.IDLE;
       return;
     }
+
+    this.hardwareState = HardwareState.DEACTIVATING;
+
+    // Set up abort mechanism
+    let aborted = false;
+    this.hardwareTransitionAbort = () => {
+      aborted = true;
+      this.log('🚫 Hardware deactivation ABORTED - new session detected');
+    };
 
     this.log('🎛️ ═══════════════════════════════════════');
     this.log('🎛️ HARDWARE DEACTIVATION START');
@@ -1203,7 +1763,15 @@ export class SimpleRecorder {
         await new Promise(resolve => setTimeout(resolve, this.config.emulationNetworkDelay));
       }
 
-      this.hardwareReady = false;
+      // Check if aborted during delay
+      if (aborted) {
+        this.log('🚫 Deactivation aborted during emulation delay');
+        this.hardwareTransitionAbort = null;
+        return;
+      }
+
+      this.hardwareState = HardwareState.IDLE;
+      this.hardwareTransitionAbort = null;
       this.log('✅ EMULATION: Speaker deactivation complete');
       this.log('🎛️ ═══ HARDWARE DEACTIVATION COMPLETE ═══');
       return;
@@ -1221,6 +1789,14 @@ export class SimpleRecorder {
         if (this.config.setSpeakerZoneIP) {
           await this.config.setSpeakerZoneIP(linkedSpeakers, '224.0.2.60:50022');
         }
+
+        // Check if aborted during network call
+        if (aborted) {
+          this.log('🚫 Deactivation aborted during network call');
+          this.hardwareTransitionAbort = null;
+          return;
+        }
+
         this.log(`✓ All speakers' zone IP set to 224.0.2.60:50022`);
         this.log('');
       } else {
@@ -1228,7 +1804,8 @@ export class SimpleRecorder {
         this.log('');
       }
 
-      this.hardwareReady = false;
+      this.hardwareState = HardwareState.IDLE;
+      this.hardwareTransitionAbort = null;
       this.log('✅ All speakers deactivated successfully');
       this.log(`   • ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''} zone set to IDLE`);
       this.log(`   • mcast.zone1: 224.0.2.60:50022 (idle)`);
@@ -1239,7 +1816,8 @@ export class SimpleRecorder {
     } catch (error) {
       this.log(`⚠️ Speaker deactivation error (non-fatal): ${error}`, 'warning');
       // Continue anyway - don't block shutdown
-      this.hardwareReady = false;
+      this.hardwareState = HardwareState.IDLE;
+      this.hardwareTransitionAbort = null;
     }
   }
 
@@ -1342,9 +1920,9 @@ export class SimpleRecorder {
 
     this.log(`📤 Uploading: ${filename}`);
 
-    // Upload
+    // Upload (include sessionId for deterministic Firestore document ID)
     if (this.config.uploadCallback) {
-      await this.config.uploadCallback(combinedBlob, filename);
+      await this.config.uploadCallback(combinedBlob, filename, session.sessionId);
     }
 
     this.log(`✅ SAVE COMPLETE`);

@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
+import { useSimpleMonitoring } from "@/contexts/simple-monitoring-context";
 import { useSessionSync } from "@/hooks/useSessionSync";
 import { useRealtimeSync } from "@/contexts/realtime-sync-context";
 import { getDevices, getZones, getPoEDevices } from "@/lib/firebase/firestore";
@@ -46,6 +47,10 @@ export default function LiveBroadcastPage() {
 
   // Get session state to check for multi-input monitoring conflicts
   const { sessionState, viewingAsUserEmail, viewingAsUserId, syncSessionState } = useRealtimeSync();
+
+  // Check if new monitoring system (/live-v2 page) is active
+  const newMonitoring = useSimpleMonitoring();
+  const otherPageIsMonitoring = newMonitoring.isMonitoring;
 
   // Get monitoring state from global context
   const {
@@ -372,14 +377,25 @@ export default function LiveBroadcastPage() {
                           alert('Cannot start audio input monitoring: Multi-Input Routing is currently active. Please stop multi-input monitoring first.');
                           return;
                         }
+                        // Check if other monitoring page is active
+                        if (otherPageIsMonitoring) {
+                          alert('Cannot start monitoring: Live V2 page is currently monitoring. Please stop it first.');
+                          return;
+                        }
                         console.log('[Live] User clicked Start Monitoring');
                         startMonitoring(displayedSelectedInputDevice || undefined);
                       }}
-                      disabled={sessionState?.multiInputMonitoring}
-                      title={sessionState?.multiInputMonitoring ? 'Multi-Input Routing is active' : ''}
+                      disabled={sessionState?.multiInputMonitoring || otherPageIsMonitoring}
+                      title={
+                        sessionState?.multiInputMonitoring
+                          ? 'Multi-Input Routing is active'
+                          : otherPageIsMonitoring
+                          ? 'Monitoring is already active on /live-v2 page'
+                          : ''
+                      }
                     >
                       <Mic className="mr-2 h-4 w-4" />
-                      Start Monitoring
+                      {otherPageIsMonitoring ? "Monitoring Active on /live-v2" : "Start Monitoring"}
                     </Button>
                   ) : (
                     <Button

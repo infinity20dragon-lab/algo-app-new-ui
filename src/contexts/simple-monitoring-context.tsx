@@ -14,6 +14,7 @@ import { useRealtimeSync } from "./realtime-sync-context";
 import { ref as dbRef, push, set } from "firebase/database";
 import { realtimeDb, storage } from "@/lib/firebase/config";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
+import { addRecording } from "@/lib/firebase/firestore";
 
 // TODO: Import proper types
 type Device = any;
@@ -388,7 +389,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
         playbackRampScheduleEnabled,
         playbackRampStartHour,
         playbackRampEndHour,
-        uploadCallback: async (blob, filename) => {
+        uploadCallback: async (blob, filename, sessionId) => {
           try {
             addLog(`Uploading ${filename} (${(blob.size / 1024).toFixed(2)} KB)...`, 'info');
 
@@ -405,17 +406,26 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
             addLog(`✓ Upload complete: ${filename}`, 'info');
             addLog(`🔗 Download: ${downloadURL}`, 'info');
 
-            // Also save URL to Firebase RTDB for easy retrieval
+            // Save metadata to Firestore for fast querying
             if (user) {
               const { dateKey } = getPSTTime();
-              const recordingRef = dbRef(realtimeDb, `recordings/${user.uid}/${dateKey}`);
-              const newRecordingRef = push(recordingRef);
-              set(newRecordingRef, {
+
+              // Save to Firestore (for admin recordings page)
+              // Use sessionId as document ID to prevent duplicates on retry
+              await addRecording({
+                sessionId, // Use session ID as Firestore document ID
+                userId: user.uid,
+                userEmail: user.email || 'unknown',
                 filename,
-                downloadURL,
-                timestamp: new Date().toISOString(),
+                storageUrl: downloadURL,
+                storagePath: `recordings/${user.uid}/${filename}`,
                 size: blob.size,
+                mimeType: 'audio/webm;codecs=opus',
+                timestamp: new Date(),
+                dateKey,
               });
+
+              addLog('✓ Metadata saved to Firestore', 'info');
             }
 
             return downloadURL;

@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import { useAudioCapture } from "@/hooks/useAudioCapture";
 import { useSimpleMonitoring } from "@/contexts/simple-monitoring-context";
+import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
 import { getDevices, getZones, getPoEDevices } from "@/lib/firebase/firestore";
 import { useAuth } from "@/contexts/auth-context";
 import type { Zone } from "@/lib/algo/types";
@@ -38,6 +39,10 @@ import type { Zone } from "@/lib/algo/types";
 function LiveV2Content() {
   const { user } = useAuth();
   const isDev = process.env.NODE_ENV === 'development';
+
+  // Check if old monitoring system (/live page) is active
+  const oldMonitoring = useAudioMonitoring();
+  const otherPageIsMonitoring = oldMonitoring.isCapturing;
 
   // Get monitoring state from CLEAN simple monitoring context
   const {
@@ -308,9 +313,11 @@ function LiveV2Content() {
                         console.log('[Live V2] User clicked Start Monitoring');
                         startMonitoring();
                       }}
+                      disabled={otherPageIsMonitoring}
+                      title={otherPageIsMonitoring ? "Monitoring is already active on /live page" : ""}
                     >
                       <Mic className="mr-2 h-4 w-4" />
-                      Start Monitoring
+                      {otherPageIsMonitoring ? "Monitoring Active on /live" : "Start Monitoring"}
                     </Button>
                   ) : (
                     <Button

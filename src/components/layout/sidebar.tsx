@@ -16,10 +16,12 @@ import {
   Network,
   Lightbulb,
   Gamepad2,
+  FileAudio,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useState, useMemo } from "react";
 import { useAudioMonitoring } from "@/contexts/audio-monitoring-context";
+import { useSimpleMonitoring } from "@/contexts/simple-monitoring-context";
 import { useAuth } from "@/contexts/auth-context";
 
 interface NavItem {
@@ -36,11 +38,13 @@ const baseNavItems: NavItem[] = [
   { title: "Call Routing", href: "/distribute", icon: Activity, section: "Overview" },
   { title: "Audio Input", href: "/live", icon: Mic, section: "Audio" },
   { title: "Live V2 (Clean)", href: "/live-v2", icon: Radio, section: "Audio" },
+  { title: "PCM Streaming (Test)", href: "/live-pcm", icon: Radio, section: "Audio" },
   { title: "Multi-Input Routing", href: "/input-routing", icon: Network, section: "Audio" },
   { title: "Output & Speakers", href: "/devices", icon: Speaker, section: "Audio" },
   { title: "PoE Devices", href: "/poe-devices", icon: Lightbulb, section: "Audio" },
   { title: "Activity Log", href: "/activity", icon: Activity, section: "System" },
   { title: "Settings", href: "/settings", icon: Settings, section: "System" },
+  { title: "Recordings", href: "/recordings", icon: FileAudio, section: "Admin", adminOnly: true },
   { title: "Control Center", href: "/admin/control", icon: Gamepad2, section: "Admin", adminOnly: true },
 ];
 
@@ -51,7 +55,16 @@ interface SidebarProps {
 export function Sidebar({ onLogout }: SidebarProps) {
   const pathname = usePathname();
   const [isMobileOpen, setIsMobileOpen] = useState(false);
-  const { isCapturing, audioDetected, speakersEnabled } = useAudioMonitoring();
+
+  // Check BOTH monitoring contexts (old /live and new /live-v2)
+  const oldContext = useAudioMonitoring();
+  const newContext = useSimpleMonitoring();
+
+  // Merge state from both contexts - whichever is active
+  const isCapturing = oldContext.isCapturing || newContext.isMonitoring;
+  const audioDetected = oldContext.audioDetected || newContext.audioDetected;
+  const speakersEnabled = oldContext.speakersEnabled || newContext.speakersEnabled;
+
   const { user } = useAuth();
 
   const isAdmin = (user as any)?.role === "admin";
