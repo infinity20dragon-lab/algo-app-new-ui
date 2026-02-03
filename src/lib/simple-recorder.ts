@@ -96,19 +96,31 @@ type InternalConfig = Required<Pick<SimpleRecorderConfig, 'batchDuration' | 'sil
 // Hardware State Management
 // ============================================================================
 
+/**
+ * Speaker Lifecycle State Machine
+ *
+ * OFF  → ACTIVATING → WAKING  → STABLE  → PLAYING  → DRAINING → OFF
+ *
+ * IDLE/OFF:       Speakers off, no white noise. Default state.
+ * ACTIVATING:     API call in flight to set zone IP.
+ * WAKING:         Zone set, speakers powered on. White noise expected. Playback MUTED.
+ * STABLE:         Warmup timer elapsed, noise settled. Safe to unmute. Waiting for buffer.
+ * PLAYING:        Buffer threshold met. PCM flowing. Speakers hearing audio.
+ * DRAINING:       No new audio. Buffer draining. Idle timer running before shutdown.
+ */
 enum HardwareState {
   IDLE = 'IDLE',
   ACTIVATING = 'ACTIVATING',
-  ACTIVE = 'ACTIVE',
+  WAKING = 'WAKING',       // Speakers powered on, warmup period (white noise)
+  STABLE = 'STABLE',       // Warmup done, safe to unmute, waiting for buffer
+  PLAYING = 'PLAYING',     // Audio flowing to speakers
+  DRAINING = 'DRAINING',   // Buffer draining, idle timer running
   DEACTIVATING = 'DEACTIVATING'
 }
 
 // ============================================================================
 // SimpleRecorder Class
 // ============================================================================
-
-// Audio Time-To-Live (TTL) - Maximum age for buffered audio
-const MAX_AUDIO_AGE_MS = 60000; // 60 seconds - audio older than this is invalid
 
 export class SimpleRecorder {
   // Configuration
@@ -130,15 +142,12 @@ export class SimpleRecorder {
   private pcmPlaybackStarted: boolean = false; // Track if delay period has passed
   private pcmSessionRamped: boolean = false; // Track if this session has been ramped (only ramp once per session)
   private hasReceivedRealAudio: boolean = false; // Track if worklet has received non-zero audio samples
-  private ringBufferFirstSampleTime: number = 0; // Timestamp of first sample in buffer (for TTL)
 
   // Audio Output (playback monitoring)
   private playbackAnalyserNode: AnalyserNode | null = null;
   private playbackGainNode: GainNode | null = null;
   private playbackLevelInterval: number | null = null;
   private desiredPlaybackVolume: number = 1.0; // Track desired volume even when GainNode doesn't exist
-  private nextScheduledStartTime: number = 0; // Sample-accurate scheduling for seamless playback
-
   // Recording Loop State
   private isMonitoring: boolean = false;
   private isBatching: boolean = false; // Are we currently creating batches?
@@ -155,16 +164,10 @@ export class SimpleRecorder {
   private currentSessionMeta: SessionMetadata | null = null;
   private sessionMetaStore: Map<string, SessionMetadata> = new Map();
 
-  // Batch Queue (FIFO, append-only)
-  private batchQueue: AudioBatch[] = [];
-  private batchQueueResolvers: Array<() => void> = [];
-
-  // Playback Worker State
-  private isPlaybackActive: boolean = false;
+  // Hardware State
   private hardwareState: HardwareState = HardwareState.IDLE;
   private hardwareTransitionAbort: (() => void) | null = null; // To cancel deactivation if needed
-  private currentlyPlaying: AudioBatch | null = null;
-  private currentPlaybackSessionId: string | null = null; // Track which session playback is on
+  private sessionDrainTarget: number = 0; // Samples remaining to play before session is fully drained (silence keeps buffer filled, so we track session end explicitly)
 
   // Save Queue (max 100 sessions)
   private saveQueue: SaveQueueItem[] = [];
@@ -290,12 +293,6 @@ export class SimpleRecorder {
           }
           // Removed: every 100th message logging (too spammy)
 
-          // Track timestamp of first sample arriving in buffer (for TTL)
-          if (this.ringBufferFirstSampleTime === 0 && this.pcmRingBuffer.getAvailable() === 0) {
-            this.ringBufferFirstSampleTime = Date.now();
-            this.log(`⏱️ Ring buffer TTL tracking started (max age: ${MAX_AUDIO_AGE_MS / 1000}s)`);
-          }
-
           // Push samples to ring buffer (logging removed to reduce spam)
           this.pcmRingBuffer.push(samples);
         } else {
@@ -334,6 +331,10 @@ export class SimpleRecorder {
     this.playbackAnalyserNode.connect(this.audioContext.destination);
     this.log(`🔊 Playback chain connected: GainNode (${(this.desiredPlaybackVolume * 100).toFixed(0)}%) → Analyser → Speakers`);
 
+    // 🔥 Start ScriptProcessor ONCE at init. It outputs silence until hardware is
+    // ready and ring buffer fills past the delay threshold. Never auto-stops.
+    this.startPCMPlayback();
+
     // 🔥 Capture 200ms silent pre-roll for init segment (LIKE BATCH COORDINATOR)
     // IMPORTANT: Start monitoring when quiet (no "eh" sounds)!
     // This 200ms of SILENCE becomes the init segment for ALL batches
@@ -348,9 +349,6 @@ export class SimpleRecorder {
 
     // Start monitoring loop (always on)
     this.startMonitoringLoop();
-
-    // Start playback worker (always listening)
-    this.startPlaybackWorker();
 
     // Start save worker (if enabled)
     if (this.config.saveRecording) {
@@ -418,12 +416,7 @@ export class SimpleRecorder {
     // FORCE STOP PCM playback
     this.stopPCMPlayback();
 
-    // FORCE CLEAR all queues (NO WAITING)
-    if (this.batchQueue.length > 0) {
-      this.log(`🗑️  FORCE clearing batch queue (${this.batchQueue.length} batches dropped)`);
-      this.batchQueue = [];
-    }
-
+    // FORCE CLEAR save queue (NO WAITING)
     if (this.saveQueue.length > 0) {
       this.log(`🗑️  FORCE clearing save queue (${this.saveQueue.length} sessions dropped)`);
       this.saveQueue = [];
@@ -432,7 +425,6 @@ export class SimpleRecorder {
     // Clear current batch
     this.currentBatch = null;
     this.currentChunks = [];
-    this.currentlyPlaying = null;
 
     // FORCE deactivate hardware (set to idle Zone 2 / .50022)
     this.log('🛑 FORCE deactivating hardware...');
@@ -487,24 +479,19 @@ export class SimpleRecorder {
   onAudioDetected(level: number): void {
     this.lastAudioTime = Date.now();
 
-    // If not batching, start batching (for storage)
+    // If not batching, start batching (for storage) + trigger hardware activation.
+    // PCM playback ScriptProcessor is already running (started in start()) — it
+    // outputs silence until hardware reaches STABLE and ring buffer fills.
     if (!this.isBatching && this.isMonitoring) {
       this.log(`🎯 Starting batching (audio detected at level ${level})`);
       this.startBatching();
 
-      // 🔥 START PCM PLAYBACK IMMEDIATELY (don't wait for hardware!)
-      // Ring buffer starts filling NOW, playback outputs silence until hardware ready
-      if (!this.pcmPlaybackEnabled) {
-        this.log('🎬 First audio detected - starting PCM playback session');
-        this.startPCMPlayback(); // Start immediately!
-
-        // Activate hardware asynchronously (in parallel)
-        this.ensureHardwareActive().then(() => {
-          this.log('✓ Hardware activation complete');
-        }).catch((error) => {
-          this.log(`❌ Hardware activation failed: ${error}`, 'error');
-        });
-      }
+      // Activate hardware asynchronously
+      this.ensureHardwareActive().then(() => {
+        this.log('✓ Hardware activation complete');
+      }).catch((error) => {
+        this.log(`❌ Hardware activation failed: ${error}`, 'error');
+      });
     }
   }
 
@@ -757,8 +744,6 @@ export class SimpleRecorder {
         `📊 STATUS:`,
         `Monitoring=${this.isMonitoring}`,
         `Batching=${this.isBatching}`,
-        `Queue=${this.batchQueue.length} batches`,
-        `Playing=${this.currentlyPlaying ? 'YES' : 'NO'}`,
         `SaveQueue=${this.saveQueue.length}/${this.MAX_SAVE_SESSIONS}`,
         `Hardware=${this.hardwareState}`,
       ];
@@ -816,6 +801,18 @@ export class SimpleRecorder {
     // Cancel any pending hardware idle check (new audio detected)
     this.cancelHardwareIdleCheck();
 
+    // Reset session drain state (new session overrides any pending drain from previous)
+    this.sessionDrainTarget = 0;
+    this.pcmSessionRamped = false;
+    this.pcmPlaybackStarted = false;  // Re-arm delay for new session
+
+    // Clear accumulated silence from idle period — worklet keeps pushing while hardware
+    // gate blocks pulls, so buffer fills with useless silence. Discard it all.
+    if (this.hardwareState === HardwareState.IDLE && this.pcmRingBuffer) {
+      this.pcmRingBuffer.clear();
+      this.log('🧹 Ring buffer cleared (accumulated silence from idle period)');
+    }
+
     this.isBatching = true;
     this.log('📦 ═══════════════════════════════════════');
     this.log('📦 BATCHING MODE STARTED');
@@ -865,6 +862,12 @@ export class SimpleRecorder {
       }
     };
 
+    // Session finalization: onstop fires AFTER the final ondataavailable,
+    // so the last batch is already sealed when this runs.
+    this.mediaRecorder.onstop = () => {
+      this.finalizeAndSaveSession();
+    };
+
     // 🔥 NO TIMESLICE: Let Opus create natural frame boundaries
     // We'll manually flush when batches are ready (prevents mid-syllable cuts)
     this.mediaRecorder.start();
@@ -881,6 +884,12 @@ export class SimpleRecorder {
     if (!this.isBatching) return;
 
     this.isBatching = false;
+
+    // Snapshot buffer for session drain: silence timeout = session boundary, NOT buffer empty.
+    // The worklet keeps pushing silence, so buffer never empties. We count down from here.
+    this.sessionDrainTarget = this.pcmRingBuffer?.getAvailable() ?? 0;
+    this.log(`📊 Session drain target set: ${this.sessionDrainTarget} samples (${(this.sessionDrainTarget / (this.audioContext?.sampleRate || 48000)).toFixed(1)}s of audio to play)`);
+
     this.log('📦 ═══════════════════════════════════════');
     this.log('📦 BATCHING MODE STOPPED (8s Silence Timeout)');
     this.log('📦 ═══════════════════════════════════════');
@@ -910,30 +919,34 @@ export class SimpleRecorder {
       this.pcmSessionRamped = false;
       this.log(`🎚️ Session ramp flag reset (ready for next session)`);
 
-      // 💾 FINALIZE SESSION FOR SAVING (after short delay to ensure all batches are processed)
-      // Wait a bit for the last batch to be added to the session by the playback worker
-      setTimeout(() => {
-        const sessionMeta = this.sessionMetaStore.get(this.currentSessionId!);
-        if (sessionMeta && sessionMeta.batches.length > 0) {
-          sessionMeta.playbackEndTime = Date.now();
-          this.log(`💾 Finalizing session: ${this.currentSessionId} (${sessionMeta.batches.length} batches)`);
-          this.enqueueSaveSession(sessionMeta);
-        } else {
-          this.log(`⚠️ Session ${this.currentSessionId} has no batches - not saving`);
-        }
-      }, 500); // Wait 500ms for last batch to be processed
-
-      // Don't clear currentSessionId yet - will be cleared when next session starts
+      // Session finalization happens via MediaRecorder.onstop
     }
 
     // NOTE: We keep initSegment for reuse across sessions (like BatchCoordinator)
     // Only cleared when monitoring stops completely (in stop() method)
 
-    this.log(`✓ Batching stopped - ${this.batchQueue.length} batches in queue`);
-    this.log('⏳ Waiting for save worker to upload session...');
+    this.log('✓ Batching stopped');
 
     // 🔥 Schedule hardware idle check (deactivate after grace period if no new audio)
     this.scheduleHardwareIdleCheck();
+  }
+
+  private finalizeAndSaveSession(): void {
+    if (!this.currentSessionId) return;
+    const sessionMeta = this.sessionMetaStore.get(this.currentSessionId);
+    if (!sessionMeta || sessionMeta.batches.length === 0) {
+      this.log(`⚠️ Session ${this.currentSessionId} has no batches - not saving`);
+      return;
+    }
+    sessionMeta.playbackEndTime = Date.now();
+    this.log(`💾 Session sealed: ${this.currentSessionId} (${sessionMeta.batches.length} batches)`);
+    // Copy to Saving Bucket (Blobs are immutable, shallow array copy is safe)
+    if (this.config.saveRecording) {
+      this.enqueueSaveSession({
+        ...sessionMeta,
+        batches: [...sessionMeta.batches]  // frozen snapshot
+      });
+    }
   }
 
   private startNewBatch(): void {
@@ -1039,7 +1052,7 @@ export class SimpleRecorder {
     }
 
     const mimeType = this.mediaRecorder?.mimeType || 'audio/webm;codecs=opus';
-    const batchNumber = this.batchQueue.length + 1;
+    const batchNumber = (this.currentSessionMeta?.batches.length ?? 0) + 1;
 
     // 🔥 Store PURE AUDIO ONLY (no init segment in stored blob!)
     // Init segment will be prepended temporarily during decode, not stored
@@ -1056,17 +1069,12 @@ export class SimpleRecorder {
     this.log(`   ├─ Duration: ${this.currentBatch.duration}ms`);
     this.log(`   ├─ Size: ${sizeKB} KB (raw audio only)`);
     this.log(`   ├─ Chunks: ${this.currentChunks.length}`);
-    this.log(`   └─ Queue position: ${batchNumber}`);
+    this.log(`   └─ Batch #${batchNumber} of session`);
 
-    // CRITICAL: Append to batch queue (FIFO, append-only)
-    this.batchQueue.push(this.currentBatch);
-    this.log(`🎯 Queue updated: ${this.batchQueue.length} batches waiting`);
-
-    // Notify playback worker (if waiting)
-    const resolver = this.batchQueueResolvers.shift();
-    if (resolver) {
-      resolver();
-      this.log('🔔 Notified playback worker - new batch ready');
+    // Append directly to session (Recording Bucket is authoritative)
+    if (this.currentSessionMeta) {
+      this.currentSessionMeta.batches.push(this.currentBatch);
+      this.log(`📦 Session updated: ${this.currentSessionMeta.batches.length} batches`);
     }
 
     this.currentBatch = null;
@@ -1097,9 +1105,6 @@ export class SimpleRecorder {
     // Buffer size: 4096 samples = ~85ms at 48kHz (low latency)
     this.pcmPlaybackNode = this.audioContext.createScriptProcessor(4096, 0, 1);
 
-    let totalSamplesPlayed = 0;
-    let emptyBufferCount = 0; // Track how many times buffer was empty
-
     let callbackCount = 0;
 
     this.pcmPlaybackNode.onaudioprocess = (event) => {
@@ -1117,31 +1122,10 @@ export class SimpleRecorder {
 
       const output = event.outputBuffer.getChannelData(0);
 
-      // 🔥 TTL CHECK: Ensure audio isn't too old (prevents time-travel audio)
-      if (this.ringBufferFirstSampleTime > 0) {
-        const audioAge = Date.now() - this.ringBufferFirstSampleTime;
-
-        if (audioAge > MAX_AUDIO_AGE_MS) {
-          // Audio is too old - flush buffer and wait for fresh audio
-          const availableSamples = this.pcmRingBuffer.getAvailable();
-          this.log(`⚠️ AUDIO TOO OLD: ${(audioAge / 1000).toFixed(1)}s > ${MAX_AUDIO_AGE_MS / 1000}s max`);
-          this.log(`   └─ Flushing ${availableSamples} stale samples (${(availableSamples / this.audioContext.sampleRate).toFixed(1)}s)`);
-
-          // Flush stale audio
-          this.pcmRingBuffer.clear();
-          this.ringBufferFirstSampleTime = 0; // Reset for fresh audio
-          this.pcmPlaybackStarted = false; // Reset playback state
-          this.hasReceivedRealAudio = false; // Reset audio detection
-
-          // Output silence and wait for fresh audio
-          output.fill(0);
-          return;
-        }
-      }
-
-      // 🔥 WAIT FOR HARDWARE before outputting audio (but keep filling ring buffer)
-      if (this.hardwareState !== HardwareState.ACTIVE) {
-        if (callbackCount <= 10) this.log(`   └─ BLOCKED: Hardware not ACTIVE (state=${HardwareState[this.hardwareState]})`);
+      // 🔥 WAIT FOR HARDWARE: Gate on STABLE/PLAYING/DRAINING (warmup complete).
+      // DRAINING must pass through so it can recover to PLAYING if new audio arrives.
+      if (this.hardwareState !== HardwareState.STABLE && this.hardwareState !== HardwareState.PLAYING && this.hardwareState !== HardwareState.DRAINING) {
+        if (callbackCount <= 10) this.log(`   └─ BLOCKED: Hardware not ready (state=${HardwareState[this.hardwareState]})`);
         output.fill(0); // Output silence until hardware ready
         return;
       }
@@ -1178,6 +1162,12 @@ export class SimpleRecorder {
           } else if (!this.pcmSessionRamped && this.config.playbackRampEnabled && !this.isWithinRampWindow()) {
             this.log(`🕐 Outside ramp window - using static volume`);
           }
+
+          // STABLE → PLAYING: transition fires every time delay re-arms (per session)
+          if (this.hardwareState === HardwareState.STABLE) {
+            this.hardwareState = HardwareState.PLAYING;
+            this.log('🔊 Hardware state: STABLE → PLAYING');
+          }
         } else {
           // Output silence until delay is complete
           if (callbackCount <= 10) this.log(`   └─ BLOCKED: Delay not satisfied (${availableSamples}/${requiredSamples} samples, hasAudio=${this.hasReceivedRealAudio})`);
@@ -1188,6 +1178,11 @@ export class SimpleRecorder {
 
       // 🔥 Pull samples from TRUE ring buffer (exactly what we need)
       const samples = this.pcmRingBuffer.pull(output.length); // Pull 4096 samples
+
+      // Count down session drain target (session end = silence timeout, not buffer empty)
+      if (this.sessionDrainTarget > 0) {
+        this.sessionDrainTarget -= samples.length;
+      }
 
       // Apply gain and copy to output
       const PCM_GAIN = 1.0; // No gain (adjust if needed: 0.5 = quieter, 2.0 = louder)
@@ -1204,67 +1199,33 @@ export class SimpleRecorder {
         output[i] = 0;
       }
 
-      totalSamplesPlayed += output.length;
-
-      // Log first frame only (reduced spam)
-      if (totalSamplesPlayed === output.length) {
-        this.log(`🎵 First audio frame played!`);
-      }
-      // Removed: detailed logging and periodic pull logs (too spammy)
-
-      // Check if buffer is truly empty
-      const bufferAvailable = this.pcmRingBuffer.getAvailable();
-      const bufferEmpty = bufferAvailable === 0;
-
-      // 🔥 CRITICAL: Only auto-stop if:
-      // 1. Recording has stopped (!this.isBatching)
-      // 2. Buffer is either completely empty OR very low (< 0.5s of audio)
-      // 3. Has been empty for sufficient time (5 seconds to be safe)
-      const bufferDuration = bufferAvailable / (this.audioContext?.sampleRate || 48000);
-      const bufferVeryLow = bufferDuration < 0.5; // Less than 0.5 seconds
-
-      if (!this.isBatching && (bufferEmpty || bufferVeryLow)) {
-        emptyBufferCount++;
-
-        // Wait 5 seconds before auto-stopping (5000ms / 85ms = ~59 callbacks)
-        if (emptyBufferCount > 59) {
-          this.log(`🛑 Buffer drained - auto-stopping PCM playback`);
-          this.stopPCMPlayback();
-
-          // 🔥 Schedule hardware idle check (buffer drained, may be ready to deactivate)
-          if (!this.isBatching) {
-            this.scheduleHardwareIdleCheck();
-          }
-
-          return;
+      // 🔥 STATE TRANSITIONS: PLAYING ↔ DRAINING based on session drain, not buffer emptiness.
+      // Silence keeps the buffer filled forever — session end (silence timeout) is the boundary.
+      // Hardware deactivation is handled by scheduleHardwareIdleCheck → checkHardwareIdle.
+      if (!this.isBatching && this.sessionDrainTarget <= 0) {
+        if (this.hardwareState === HardwareState.PLAYING) {
+          this.hardwareState = HardwareState.DRAINING;
+          this.log('🔊 Hardware state: PLAYING → DRAINING (session audio fully played)');
+          this.scheduleHardwareIdleCheck();
         }
-        // Removed: countdown logging (too spammy)
       } else {
-        // Reset counter if recording is still active OR buffer has significant audio
-        emptyBufferCount = 0;
-      }
-
-      // Reset TTL tracking when buffer becomes empty (all audio drained)
-      if (bufferEmpty && this.ringBufferFirstSampleTime > 0) {
-        this.ringBufferFirstSampleTime = 0; // Ready for next audio session
-
-        // Reset session ramp flag (ready for next session)
-        if (this.pcmSessionRamped) {
-          this.pcmSessionRamped = false;
-
-          // Reset gain to start volume (ready for next session ramp)
-          if (this.config.playbackRampEnabled && this.isWithinRampWindow() && this.playbackGainNode && this.audioContext) {
-            const startVol = this.config.playbackRampStartVolume ?? 0;
-            this.playbackGainNode.gain.setValueAtTime(startVol, this.audioContext.currentTime);
-            this.log(`🎚️ Session ended - volume reset to ${(startVol * 100).toFixed(0)}% (ready for next session)`);
-          }
+        if (this.hardwareState === HardwareState.DRAINING) {
+          this.hardwareState = HardwareState.PLAYING;
+          this.log('🔊 Hardware state: DRAINING → PLAYING (new audio arrived)');
+          this.cancelHardwareIdleCheck();
         }
       }
 
-      // Periodic logging removed to prevent console accumulation
-      // if (totalSamplesPlayed > 0 && totalSamplesPlayed % (output.length * 20) === 0) {
-      //   this.log(`🎵 Playing: ${(totalSamplesPlayed / this.audioContext!.sampleRate).toFixed(1)}s played, peak: ${peakLevel.toFixed(4)}, buffer: ${this.pcmRingBuffer.getAvailable()} samples`);
-      // }
+      // Reset session volume ramp when session audio is fully drained (one-shot, gated on pcmSessionRamped)
+      if (!this.isBatching && this.sessionDrainTarget <= 0 && this.pcmSessionRamped) {
+        this.pcmSessionRamped = false;
+        if (this.config.playbackRampEnabled && this.isWithinRampWindow() && this.playbackGainNode && this.audioContext) {
+          const startVol = this.config.playbackRampStartVolume ?? 0;
+          this.playbackGainNode.gain.setValueAtTime(startVol, this.audioContext.currentTime);
+          this.log(`🎚️ Session ended - volume reset to ${(startVol * 100).toFixed(0)}% (ready for next session)`);
+        }
+      }
+
     };
 
     // Connect ScriptProcessor → GainNode → Analyser → Destination
@@ -1287,7 +1248,6 @@ export class SimpleRecorder {
     this.pcmPlaybackStarted = false;
     this.pcmSessionRamped = false; // Reset session ramp flag
     this.hasReceivedRealAudio = false; // Reset audio detection
-    this.ringBufferFirstSampleTime = 0; // Reset TTL tracking
 
     if (this.pcmPlaybackNode) {
       this.pcmPlaybackNode.disconnect();
@@ -1320,86 +1280,17 @@ export class SimpleRecorder {
   // Playback Worker (Consumer - Always Listening)
   // ============================================================================
 
-  private async startPlaybackWorker(): Promise<void> {
-    this.log('🔊 Playback worker started (always listening)');
-
-    while (this.isMonitoring) {
-      // Wait for next batch
-      const batch = await this.waitForNextBatch();
-
-      if (!batch) {
-        continue; // Monitoring stopped
-      }
-
-      // 🔥 DETECT SESSION CHANGE (Playback follows sessionID)
-      // ⚠️ DO NOT finalize previous session here - queue empty doesn't mean recording stopped!
-      // User might still be speaking - just haven't hit 5s batch boundary yet
-      if (this.currentPlaybackSessionId && batch.sessionId !== this.currentPlaybackSessionId) {
-        this.log(`🔄 SESSION CHANGE DETECTED (continuing playback)`);
-        this.log(`   ├─ Previous: ${this.currentPlaybackSessionId}`);
-        this.log(`   └─ New: ${batch.sessionId}`);
-        // Session changes are just metadata - don't interrupt audio continuity!
-      }
-
-      // Set current playback session (for tracking only - PCM playback started at first audio detection)
-      let isFirstBatchOfSession = false;
-      if (!this.currentPlaybackSessionId || batch.sessionId !== this.currentPlaybackSessionId) {
-        this.currentPlaybackSessionId = batch.sessionId;
-        isFirstBatchOfSession = true;
-        this.log(`🎬 PLAYBACK SESSION: ${batch.sessionId}`);
-        // Note: PCM playback already started when audio was first detected
-      }
-
-      // 🎧 PCM PLAYBACK MODE - batches are for storage only
-      // Audio flows continuously from PCM ring buffer
-      // No decoding, no scheduling, no gaps
-      // (Logging removed to prevent console accumulation)
-
-      // ❌ OLD BATCH PLAYBACK DISABLED
-      // this.playBatch(batch, isFirstBatchOfSession, isLastBatchOfSession);
-
-      // Remove from queue immediately after scheduling (not after playback complete!)
-      const index = this.batchQueue.indexOf(batch);
-      if (index !== -1) {
-        this.batchQueue.splice(index, 1);
-      }
-
-      // Add to current session
-      const sessionMeta = this.sessionMetaStore.get(batch.sessionId);
-      if (sessionMeta) {
-        sessionMeta.batches.push(batch);
-      }
-
-      // ✅ NO session finalization here!
-      // Session lifetime is controlled by SILENCE TIMEOUT (recording side)
-      // NOT by queue emptiness (playback side)
-      // The user might still be talking - queue empty just means we're caught up!
-    }
-
-    this.log('🔊 Playback worker stopped');
-  }
-
-  private async waitForNextBatch(): Promise<AudioBatch | null> {
-    while (this.isMonitoring) {
-      if (this.batchQueue.length > 0) {
-        return this.batchQueue[0]; // Peek, don't remove
-      }
-
-      // Wait for new batch
-      await new Promise<void>((resolve) => {
-        this.batchQueueResolvers.push(resolve);
-        setTimeout(() => resolve(), 50); // Timeout to check isMonitoring
-      });
-    }
-
-    return null;
-  }
-
   private async ensureHardwareActive(): Promise<void> {
     // 🔥 STATE MACHINE: Handle all possible states
-    if (this.hardwareState === HardwareState.ACTIVE) {
+    if (this.hardwareState === HardwareState.STABLE || this.hardwareState === HardwareState.PLAYING || this.hardwareState === HardwareState.DRAINING) {
       const speakerCount = (this.config.linkedSpeakers || []).length;
-      this.log(`✓ Speakers already active (${speakerCount} speaker${speakerCount !== 1 ? 's' : ''} @ 224.0.2.60:50002)`);
+      this.log(`✓ Speakers already active (${speakerCount} speaker${speakerCount !== 1 ? 's' : ''} @ 224.0.2.60:50002, state=${HardwareState[this.hardwareState]})`);
+      // If DRAINING, cancel idle check — new audio is coming
+      if (this.hardwareState === HardwareState.DRAINING) {
+        this.hardwareState = HardwareState.PLAYING;
+        this.cancelHardwareIdleCheck();
+        this.log('🔊 Hardware state: DRAINING → PLAYING (new session starting)');
+      }
       return;
     }
 
@@ -1425,7 +1316,7 @@ export class SimpleRecorder {
 
     if (!hasLinkedSpeakers && !hasPagingDevice) {
       this.log('⚠️  No hardware configured - skipping activation');
-      this.hardwareState = HardwareState.ACTIVE; // Mark as ready anyway for playback
+      this.hardwareState = HardwareState.STABLE; // No hardware = no warmup needed
       return;
     }
 
@@ -1464,8 +1355,13 @@ export class SimpleRecorder {
         await new Promise(resolve => setTimeout(resolve, this.config.emulationNetworkDelay));
       }
 
-      this.hardwareState = HardwareState.ACTIVE;
-      this.log('✅ EMULATION: Speaker activation complete');
+      // WAKING: Speakers powered on, white noise expected. Wait for warmup.
+      this.hardwareState = HardwareState.WAKING;
+      this.log('🔊 EMULATION: Speakers waking up - waiting for warmup...');
+      await new Promise(resolve => setTimeout(resolve, this.config.playbackDelay));
+
+      this.hardwareState = HardwareState.STABLE;
+      this.log(`✅ EMULATION: Speaker warmup complete (${this.config.playbackDelay}ms) - safe to unmute`);
       this.log('🎛️ ═══ HARDWARE ACTIVATION COMPLETE ═══');
       return;
     }
@@ -1489,245 +1385,24 @@ export class SimpleRecorder {
         this.log('');
       }
 
-      this.hardwareState = HardwareState.ACTIVE;
-      this.log('✅ All speakers activated successfully');
+      // WAKING: Zone IP set, speakers powered on. White noise expected.
+      this.hardwareState = HardwareState.WAKING;
+      this.log('🔊 Speakers waking up - waiting for warmup...');
       this.log(`   • ${linkedSpeakers.length} speaker${linkedSpeakers.length !== 1 ? 's' : ''} zone set to ACTIVE`);
       this.log(`   • mcast.zone1: 224.0.2.60:50002 (receiving from paging)`);
       this.log(`   • Paging device: ${this.config.pagingDevice?.name || 'N/A'} (NEVER CONTROLLED)`);
+
+      // Wait for speaker warmup (hides white noise)
+      await new Promise(resolve => setTimeout(resolve, this.config.playbackDelay));
+
+      this.hardwareState = HardwareState.STABLE;
+      this.log(`✅ Speaker warmup complete (${this.config.playbackDelay}ms) - safe to unmute`);
       this.log('🎛️ ═══════════════════════════════════════');
       this.log('🎛️ HARDWARE ACTIVATION COMPLETE');
       this.log('🎛️ ═══════════════════════════════════════');
     } catch (error) {
       this.log(`❌ Speaker activation failed: ${error}`, 'error');
       throw error;
-    }
-  }
-
-  private async playBatch(batch: AudioBatch, isFirstBatchOfSession: boolean = false, isLastBatchOfSession: boolean = false): Promise<void> {
-    this.currentlyPlaying = batch;
-    const sizeKB = (batch.blob.size / 1024).toFixed(2);
-
-    this.log(`🔊 ═══ PLAYBACK START ═══`);
-    this.log(`🎵 Batch: ${batch.id}`);
-    this.log(`   ├─ Duration: ${batch.duration}ms`);
-    this.log(`   ├─ Size: ${sizeKB} KB`);
-    this.log(`   ├─ Session: ${batch.sessionId}`);
-    this.log(`   ├─ First of session: ${isFirstBatchOfSession ? 'YES' : 'NO'}`);
-    this.log(`   └─ Last of session: ${isLastBatchOfSession ? 'YES' : 'NO'}`);
-
-    if (!this.audioContext || !this.playbackAnalyserNode) {
-      throw new Error('AudioContext not initialized');
-    }
-
-    let source: AudioBufferSourceNode | null = null;
-    let batchGainNode: GainNode | null = null;
-
-    try {
-      const playStartTime = Date.now();
-
-      // 🎵 Step 1: Decode blob to AudioBuffer
-      // Create temporary decode blob with init segment (required for decodeAudioData)
-      // Init segment is NOT stored in batch, only used here for decoding
-      this.log(`🎧 Decoding WebM blob to AudioBuffer...`);
-
-      if (!this.initSegment) {
-        throw new Error('Init segment not available for decoding');
-      }
-
-      // Create temporary blob: [initSegment, batchAudio] for decoding ONLY
-      const decodeBlob = new Blob([this.initSegment, batch.blob], { type: 'audio/webm;codecs=opus' });
-      const arrayBuffer = await decodeBlob.arrayBuffer();
-      const audioBuffer = await this.audioContext.decodeAudioData(arrayBuffer);
-
-      this.log(`✓ Decoded: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.numberOfChannels}ch`);
-      this.log(`🎧 Audio pipeline: [Init + Audio] → decodeAudioData → AudioBuffer → Speakers (no trimming!)`);
-
-      // 🎵 Step 2: Create AudioBufferSourceNode with BATCH-SPECIFIC GainNode
-      // Audio chain: Source → Batch Gain (micro fades) → Master Gain (volume) → Analyser → Speakers
-      source = this.audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-
-      // Create dedicated GainNode for this batch (for micro fade-in/out to eliminate pops)
-      batchGainNode = this.audioContext.createGain();
-
-      // Connect: Source → Batch Gain → Master Gain → Analyser → Destination
-      source.connect(batchGainNode);
-      batchGainNode.connect(this.playbackGainNode!);
-      this.playbackGainNode!.connect(this.playbackAnalyserNode);
-      this.playbackAnalyserNode.connect(this.audioContext.destination);
-
-      // 🎚️ Apply volume ramping if enabled, first batch of session, AND within time window
-      const shouldRamp = this.config.playbackRampEnabled && isFirstBatchOfSession && this.isWithinRampWindow();
-
-      if (shouldRamp) {
-        const startVol = this.config.playbackRampStartVolume ?? 0;
-        const targetVol = this.config.playbackRampTargetVolume ?? 1.0;
-        const rampDuration = (this.config.playbackRampDuration ?? 2000) / 1000; // Convert to seconds
-
-        // Set to start volume immediately
-        this.playbackGainNode!.gain.setValueAtTime(startVol, this.audioContext.currentTime);
-
-        // Ramp to target volume over duration
-        this.playbackGainNode!.gain.linearRampToValueAtTime(
-          targetVol,
-          this.audioContext.currentTime + rampDuration
-        );
-
-        this.log(`🎚️ RAMPING: ${(startVol * 100).toFixed(0)}% → ${(targetVol * 100).toFixed(0)}% over ${rampDuration.toFixed(1)}s`);
-      } else {
-        // NOT ramping - ensure volume is at the current playback volume setting
-        // (The user controls this via the playback volume slider, which calls setPlaybackVolume)
-        // The gain node keeps its current value, which is updated by setPlaybackVolume() when the slider changes
-
-        if (this.config.playbackRampEnabled && isFirstBatchOfSession && !this.isWithinRampWindow()) {
-          this.log(`🕐 Outside ramp window - using static volume`);
-        }
-        this.log(`🔊 Static Volume: ${(this.playbackGainNode!.gain.value * 100).toFixed(0)}%`);
-      }
-
-      this.log(`▶️  Starting playback...`);
-
-      // 🎵 Step 3: SEAMLESS SCHEDULED PLAYBACK (No gaps!)
-      // Instead of reactive onended, we SCHEDULE batches sample-accurately
-
-      // Determine start time:
-      // - First batch: use current time + safety margin
-      // - Subsequent batches: use EXACT scheduled time (no overlap unless truly late)
-      const now = this.audioContext.currentTime;
-      let startTime: number;
-      let actualStartTime: number; // When source.start() is called
-      let needsOverlap = false;
-
-      if (this.nextScheduledStartTime === 0 || isFirstBatchOfSession) {
-        // First batch of session: start ASAP with safety margin
-        const safeNow = now + 0.02; // 20ms cushion
-        startTime = safeNow;
-        actualStartTime = safeNow;
-      } else {
-        // Subsequent batches: check if we're truly late
-        startTime = this.nextScheduledStartTime;
-        const gap = startTime - now;
-
-        // Only overlap if we're running late (< 10ms ahead)
-        if (gap < 0.01) {
-          const OVERLAP_MS = 0.002; // 2ms overlap
-          actualStartTime = startTime - OVERLAP_MS;
-          needsOverlap = true;
-          this.log(`⚠️  Late by ${(-gap * 1000).toFixed(1)}ms - applying ${(OVERLAP_MS * 1000).toFixed(0)}ms overlap`);
-        } else {
-          // On time - no overlap needed
-          actualStartTime = startTime;
-          this.log(`✓ On time - gap: ${(gap * 1000).toFixed(1)}ms`);
-        }
-      }
-
-      // Calculate batch duration and end time
-      // 🎯 CRITICAL: Always use decoded audioBuffer.duration, NEVER recorded batch.duration
-      // Opus is variable-rate, decoded time is ground truth
-      const batchDuration = audioBuffer.duration;
-      const endTime = startTime + batchDuration;
-
-      // 🎚️ GAIN CONTROL
-      if (needsOverlap) {
-        // Apply crossfade only when needed (late start)
-        batchGainNode.gain.setValueAtTime(0, actualStartTime);
-        batchGainNode.gain.linearRampToValueAtTime(1, startTime);
-        batchGainNode.gain.setValueAtTime(1, endTime);
-        this.log(`🎚️  Crossfade: 0→1 over ${((startTime - actualStartTime) * 1000).toFixed(0)}ms`);
-      } else {
-        // Constant gain - no fade artifacts
-        batchGainNode.gain.setValueAtTime(1, actualStartTime);
-        batchGainNode.gain.setValueAtTime(1, endTime);
-        this.log(`🎚️  Constant gain: 1.0 (no crossfade)`);
-      }
-
-      // Schedule source to start at actual time (with overlap for non-first batches)
-      source.start(actualStartTime);
-
-      // Auto-cleanup when batch finishes (non-blocking)
-      // Capture references for callback (TypeScript safety)
-      const sourceRef = source;
-      const gainRef = batchGainNode;
-      source.onended = () => {
-        sourceRef.disconnect();
-        gainRef.disconnect();
-        this.log(`🧹 Batch cleanup complete: ${batch.id}`);
-      };
-
-      // Update next scheduled time for seamless chaining (playback cursor)
-      this.nextScheduledStartTime = endTime;
-
-      this.log(`⏱️  Scheduled: start=${startTime.toFixed(3)}s, end=${endTime.toFixed(3)}s, duration=${batchDuration.toFixed(3)}s`);
-      this.log(`✅ Batch scheduled ahead - next batch can be queued immediately (predictive scheduling)`);
-    } catch (error) {
-      this.log(`❌ PLAYBACK FAILED: ${error}`, 'error');
-      // Cleanup on error only
-      try {
-        if (source) source.disconnect();
-        if (batchGainNode) batchGainNode.disconnect();
-      } catch (e) {
-        // Ignore disconnect errors
-      }
-      // Don't throw - let playback worker continue with next batch
-    }
-
-    // Note: Normal cleanup happens in source.onended (non-blocking)
-    // currentlyPlaying is intentionally NOT set to null here (predictive scheduling)
-  }
-
-  private async finalizePlaybackSession(sessionId: string): Promise<void> {
-    this.log(`🏁 FINALIZING PLAYBACK SESSION: ${sessionId}`);
-
-    // Reset volume to start volume if ramping is enabled AND within time window
-    if (this.config.playbackRampEnabled && this.isWithinRampWindow() && this.playbackGainNode && this.audioContext) {
-      const startVol = this.config.playbackRampStartVolume ?? 0;
-      this.playbackGainNode.gain.setValueAtTime(startVol, this.audioContext.currentTime);
-      this.log(`🎚️ Volume reset to ${(startVol * 100).toFixed(0)}% (ready for next session)`);
-    }
-
-    const sessionMeta = this.sessionMetaStore.get(sessionId);
-    if (sessionMeta && sessionMeta.batches.length > 0) {
-      sessionMeta.playbackEndTime = Date.now();
-
-      this.log(`✅ Session playback complete: ${sessionId}`);
-      this.log(`   ├─ Batches: ${sessionMeta.batches.length}`);
-      this.log(`   └─ Duration: ${((sessionMeta.playbackEndTime - sessionMeta.batches[0].timestamp) / 1000).toFixed(1)}s`);
-
-      // Enqueue for saving
-      if (this.config.saveRecording) {
-        this.enqueueSaveSession(sessionMeta);
-      }
-
-      // 🎨 CLEAR CONSOLE after successful session
-      setTimeout(() => {
-        console.clear();
-        this.log('🧹 Console cleared - Ready for next session');
-      }, 2000); // Wait 2s so you can see the completion message
-    }
-  }
-
-  private async onQueueEmpty(): Promise<void> {
-    this.log('📭 Batch queue empty');
-
-    // ⚠️ CRITICAL: Only finalize if recording has actually stopped!
-    // Queue can be temporarily empty while user is still speaking
-    // (playback caught up to recording, next batch not ready yet)
-    if (!this.isBatching) {
-      // Recording has stopped (silence timeout) - safe to finalize
-      if (this.currentPlaybackSessionId) {
-        await this.finalizePlaybackSession(this.currentPlaybackSessionId);
-        this.currentPlaybackSessionId = null;
-      }
-
-      // Reset scheduled time for next session
-      this.nextScheduledStartTime = 0;
-
-      // 🔥 Trigger immediate hardware idle check (should deactivate if conditions met)
-      // This provides immediate deactivation when queue empties naturally
-      await this.checkHardwareIdle();
-    } else {
-      // Recording still active - queue just caught up, more audio coming
-      this.log('✓ Recording still active - waiting for more batches');
     }
   }
 
@@ -1893,28 +1568,19 @@ export class SimpleRecorder {
     // Condition 1: Recording stopped
     const notBatching = !this.isBatching;
 
-    // Condition 2: Playback stopped OR buffer is low
-    const playbackStopped = !this.pcmPlaybackEnabled || !this.pcmPlaybackStarted;
-    const bufferAvailable = this.pcmRingBuffer?.getAvailable() ?? 0;
-    const bufferDuration = bufferAvailable / (this.audioContext?.sampleRate || 48000);
-    const bufferLow = bufferDuration < 2.0; // Less than 2 seconds
-    const playbackDone = playbackStopped || bufferLow;
-
-    // Condition 3: Playback queue is empty
-    const queueEmpty = this.batchQueue.length === 0;
+    // Condition 2: Session audio fully played (not buffer empty — silence keeps buffer filled).
+    const playbackDone = this.sessionDrainTarget <= 0;
 
     this.log(`   ├─ Recording stopped: ${notBatching ? '✓' : '✗'}`);
-    this.log(`   ├─ Playback stopped: ${playbackStopped ? '✓' : '✗'}`);
-    this.log(`   ├─ Buffer low (<2s): ${bufferLow ? '✓' : '✗'} (${bufferDuration.toFixed(1)}s available)`);
-    this.log(`   ├─ Queue empty: ${queueEmpty ? '✓' : '✗'} (${this.batchQueue.length} batches)`);
+    this.log(`   ├─ Session drained: ${playbackDone ? '✓' : '✗'} (${Math.max(0, this.sessionDrainTarget)} samples remaining)`);
     this.log(`   └─ Hardware state: ${HardwareState[this.hardwareState]}`);
 
     // Only deactivate if ALL conditions are met
-    if (notBatching && playbackDone && queueEmpty) {
+    if (notBatching && playbackDone) {
       this.log('✅ All idle conditions met - deactivating hardware');
       await this.deactivateHardware();
-    } else if (notBatching && queueEmpty) {
-      // Recording and queue stopped, just waiting for playback to finish
+    } else if (notBatching) {
+      // Recording stopped, waiting for playback to finish
       this.log('⏳ Waiting for playback to finish - checking again in 3s');
       this.hardwareIdleTimer = window.setTimeout(() => {
         this.checkHardwareIdle();
