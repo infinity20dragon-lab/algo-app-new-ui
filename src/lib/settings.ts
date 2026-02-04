@@ -32,27 +32,6 @@ export function getIdleVolumeString(): string {
 }
 
 /**
- * Get the default volume for new distributions
- * @returns The default volume (0-100)
- */
-export function getDefaultVolume(): number {
-  if (typeof window === "undefined") {
-    return 50; // Server-side default
-  }
-
-  const saved = localStorage.getItem("algoapp-default-volume");
-  if (saved) {
-    const parsed = parseInt(saved);
-    // Validate range
-    if (parsed >= 0 && parsed <= 100) {
-      return parsed;
-    }
-  }
-
-  return 50; // Default
-}
-
-/**
  * Get whether to always keep paging device in transmitter mode
  * @returns true if paging device should always be in mode 1, false to toggle based on audio
  */

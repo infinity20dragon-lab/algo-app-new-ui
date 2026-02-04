@@ -1,10 +1,10 @@
 /**
- * SimpleRecorder - Clean Producer/Consumer Architecture
+ * SimpleRecorder - Live audio monitoring and playback
  *
- * Three independent loops:
- * 1. Recording Loop (Producer) - Always on, creates 5s batches
- * 2. Playback Worker (Consumer) - Always listening, drains queue
- * 3. Save Worker - Async, non-blocking
+ * Three independent pipelines:
+ * 1. Recording - MediaRecorder batches, session boundaries via silence timeout
+ * 2. Playback - PCM ring buffer → ScriptProcessorNode, hardware lifecycle
+ * 3. Saving - frozen session snapshots, async upload with retry
  *
  * INVARIANTS (NEVER VIOLATE):
  * - Recording NEVER waits for playback
@@ -58,6 +58,7 @@ interface SimpleRecorderConfig {
   linkedSpeakers: any[]; // Algo speakers to control
   pagingDevice: any; // Paging device
   playbackDelay?: number; // Delay before playback starts (for speaker stabilization)
+  hardwareGracePeriod?: number; // How long to keep speakers active after session ends before deactivating (default: 5000ms)
 
   // Playback Volume Ramping (Web Audio API - non-blocking)
   playbackVolume?: number; // Static playback volume (0.0 - 2.0) when NOT ramping
@@ -182,7 +183,6 @@ export class SimpleRecorder {
 
   // Hardware idle timer (deactivate speakers after grace period)
   private hardwareIdleTimer: number | null = null;
-  private readonly hardwareIdleDelay: number = 12000; // 12 seconds grace period
 
   // Audio threshold and sustain detection
   private audioAboveThresholdStart: number | null = null; // When audio first went above threshold
@@ -694,7 +694,12 @@ export class SimpleRecorder {
       const now = Date.now();
       if (isAboveThreshold) {
         if (!this.audioAboveThresholdStart) {
-          // Audio just went above threshold
+          // Audio just went above threshold — clear accumulated idle silence now,
+          // before any real audio enters the buffer during the sustain window
+          if (this.hardwareState === HardwareState.IDLE && this.pcmRingBuffer) {
+            this.pcmRingBuffer.clear();
+            this.log('🧹 Ring buffer cleared (accumulated silence from idle period)');
+          }
           this.audioAboveThresholdStart = now;
 
           // If sustain duration is 0ms, trigger immediately
@@ -776,7 +781,7 @@ export class SimpleRecorder {
   }
 
   // ============================================================================
-  // Recording Loop (Producer - Always On)
+  // Recording Pipeline
   // ============================================================================
 
   private startMonitoringLoop(): void {
@@ -806,14 +811,8 @@ export class SimpleRecorder {
     this.pcmSessionRamped = false;
     this.pcmPlaybackStarted = false;  // Re-arm delay for new session
 
-    // Clear accumulated silence from idle period — worklet keeps pushing while hardware
-    // gate blocks pulls, so buffer fills with useless silence. Discard it all.
-    if (this.hardwareState === HardwareState.IDLE && this.pcmRingBuffer) {
-      this.pcmRingBuffer.clear();
-      this.log('🧹 Ring buffer cleared (accumulated silence from idle period)');
-    }
-
     this.isBatching = true;
+    console.clear();
     this.log('📦 ═══════════════════════════════════════');
     this.log('📦 BATCHING MODE STARTED');
     this.log('📦 ═══════════════════════════════════════');
@@ -1277,7 +1276,7 @@ export class SimpleRecorder {
   }
 
   // ============================================================================
-  // Playback Worker (Consumer - Always Listening)
+  // Playback Pipeline
   // ============================================================================
 
   private async ensureHardwareActive(): Promise<void> {
@@ -1548,11 +1547,12 @@ export class SimpleRecorder {
       this.hardwareIdleTimer = null;
     }
 
-    this.log(`⏲️ Hardware idle check scheduled (${this.hardwareIdleDelay / 1000}s grace period)`);
+    const gracePeriod = this.config.hardwareGracePeriod ?? 5000;
+    this.log(`⏲️ Hardware idle check scheduled (${gracePeriod / 1000}s grace period)`);
 
     this.hardwareIdleTimer = window.setTimeout(() => {
       this.checkHardwareIdle();
-    }, this.hardwareIdleDelay);
+    }, gracePeriod);
   }
 
   /**

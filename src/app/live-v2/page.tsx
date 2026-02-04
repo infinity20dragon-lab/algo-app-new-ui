@@ -77,16 +77,13 @@ function LiveV2Content() {
     setNightRampDuration,
     setSustainDuration,
     setDisableDelay,
-    loggingEnabled,
-    setLoggingEnabled,
-    recordingEnabled,
-    setRecordingEnabled,
     playbackEnabled,
-    setPlaybackEnabled,
     playbackDelay,
     setPlaybackDelay,
     silenceTimeout,
     setSilenceTimeout,
+    hardwareGracePeriod,
+    setHardwareGracePeriod,
     playbackRampDuration,
     setPlaybackRampDuration,
     playbackStartVolume,
@@ -271,11 +268,7 @@ function LiveV2Content() {
         {/* Header */}
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-[var(--text-primary)]">Audio Input</h1>
-            <div className="text-[var(--text-secondary)] text-sm flex items-center gap-2">
-              <Badge variant="secondary" className="text-xs">Clean Architecture</Badge>
-              <span>Producer/Consumer pattern • 5s batches • Configurable silence timeout</span>
-            </div>
+            <h1 className="text-2xl font-bold text-[var(--text-primary)]">Live Monitoring</h1>
           </div>
           {isCapturing && (
             <div className="flex items-center gap-3">
@@ -941,10 +934,7 @@ function LiveV2Content() {
                 {playbackEnabled && (
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
-                      <Label className="flex items-center gap-2">
-                        Silence Timeout
-                        <Badge variant="default" className="text-xs">Clean Architecture</Badge>
-                      </Label>
+                      <Label>Silence Timeout</Label>
                       <span className="text-sm font-mono text-[var(--accent-blue)]">{(silenceTimeout / 1000).toFixed(1)}s</span>
                     </div>
                     <Slider
@@ -957,92 +947,32 @@ function LiveV2Content() {
                     <p className="text-xs text-[var(--text-muted)]">
                       How long to wait after silence before stopping batching. 0s = new session per pause, higher = more forgiving pauses in same session.
                     </p>
-                    <div className="flex items-start gap-2 p-3 rounded-lg bg-[var(--accent-green)]/10 border border-[var(--accent-green)]/30">
-                      <span className="text-xs">✨</span>
-                      <div className="text-xs text-[var(--text-secondary)] space-y-1">
-                        <p><strong>Clean Architecture Benefits:</strong></p>
-                        <ul className="list-disc list-inside ml-2 space-y-0.5">
-                          <li>No TailGuard complexity</li>
-                          <li>No grace periods</li>
-                          <li>Recording never blocks on playback</li>
-                          <li>Playback never blocks on recording</li>
-                          <li>Natural session batching based on silence</li>
-                        </ul>
-                      </div>
+                  </div>
+                )}
+
+                {/* Hardware Grace Period */}
+                {playbackEnabled && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <Label>Hardware Grace Period</Label>
+                      <span className="text-sm font-mono text-[var(--accent-blue)]">{(hardwareGracePeriod / 1000).toFixed(1)}s</span>
                     </div>
+                    <Slider
+                      min={1000}
+                      max={30000}
+                      step={1000}
+                      value={hardwareGracePeriod}
+                      onChange={(e) => setHardwareGracePeriod(parseInt(e.target.value))}
+                    />
+                    <p className="text-xs text-[var(--text-muted)]">
+                      How long to keep speakers active after a session ends before deactivating. Covers re-activation cost (~{(playbackDelay / 1000).toFixed(1)}s warmup) so back-to-back sentences don't cycle speakers.
+                    </p>
                   </div>
                 )}
               </CardContent>
             </Card>
 
-            {/* Logging & Recording */}
-            <Card>
-              <CardHeader>
-                <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-[var(--accent-purple)]/15">
-                    <Settings2 className="h-5 w-5 text-[var(--accent-purple)]" />
-                  </div>
-                  <CardTitle>Logging & Recording</CardTitle>
-                </div>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="flex items-center justify-between p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
-                  <div>
-                    <Label className="!text-[var(--text-primary)]">Activity Logging</Label>
-                    <p className="text-xs text-[var(--text-muted)]">
-                      Log audio events to the activity viewer
-                    </p>
-                  </div>
-                  <Switch checked={loggingEnabled} onCheckedChange={setLoggingEnabled} />
-                </div>
 
-                <div className="flex items-center justify-between p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
-                  <div>
-                    <Label className="!text-[var(--text-primary)]">Save Recording</Label>
-                    <p className="text-xs text-[var(--text-muted)]">
-                      {recordingEnabled
-                        ? "Save audio clips to Firebase Storage"
-                        : "Temporary only - recordings not saved"}
-                    </p>
-                  </div>
-                  <Switch checked={recordingEnabled} onCheckedChange={setRecordingEnabled} />
-                </div>
-
-                <div className="flex items-center justify-between p-4 rounded-xl bg-[var(--bg-secondary)] border border-[var(--border-color)]">
-                  <div>
-                    <Label className="!text-[var(--text-primary)]">Live Playback</Label>
-                    <p className="text-xs text-[var(--text-muted)]">
-                      {playbackEnabled
-                        ? "Play recorded audio through system in real-time"
-                        : "Disabled - no live playback"}
-                    </p>
-                  </div>
-                  <Switch
-                    checked={playbackEnabled}
-                    onCheckedChange={setPlaybackEnabled}
-                  />
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* Activity Log - View in /activity page or browser console */}
-            <Card>
-              <CardHeader>
-                <CardTitle>Activity Log</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="space-y-2 text-sm text-[var(--text-muted)]">
-                  <p>📊 Activity logs are available in:</p>
-                  <ul className="list-disc list-inside space-y-1 ml-2">
-                    <li>Browser Console (F12)</li>
-                    <li><Link href="/activity" className="text-[var(--accent-blue)] hover:underline">Activity Viewer Page</Link></li>
-                  </ul>
-                  <p className="text-xs mt-3">
-                    Using the same logging infrastructure as /live page for consistency.
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
           </div>
 
           {/* Right Column - Devices & Broadcast */}

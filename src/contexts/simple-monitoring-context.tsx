@@ -1,8 +1,7 @@
 /**
- * Simple Monitoring Context - Clean Architecture
+ * Simple Monitoring Context
  *
- * Uses SimpleRecorder with producer/consumer pattern
- * No TailGuard, no grace periods, no complex state machines
+ * Provides state and config for SimpleRecorder-based live monitoring
  */
 
 "use client";
@@ -38,6 +37,7 @@ interface SimpleMonitoringContextType {
   batchDuration: number;
   silenceTimeout: number;
   playbackDelay: number;
+  hardwareGracePeriod: number;
   audioThreshold: number;
   sustainDuration: number;
   disableDelay: number;
@@ -89,6 +89,7 @@ interface SimpleMonitoringContextType {
   setBatchDuration: (ms: number) => void;
   setSilenceTimeout: (ms: number) => void;
   setPlaybackDelay: (ms: number) => void;
+  setHardwareGracePeriod: (ms: number) => void;
   setAudioThreshold: (value: number) => void;
   setSustainDuration: (ms: number) => void;
   setDisableDelay: (ms: number) => void;
@@ -150,6 +151,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   const [batchDuration, setBatchDuration] = useState(5000);
   const [silenceTimeout, setSilenceTimeout] = useState(8000);
   const [playbackDelay, setPlaybackDelay] = useState(4000);
+  const [hardwareGracePeriod, setHardwareGracePeriod] = useState(5000);
   const [audioThreshold, setAudioThreshold] = useState(0);
   const [sustainDuration, setSustainDuration] = useState(0);
   const [disableDelay, setDisableDelay] = useState(8000);
@@ -199,6 +201,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   // Refs
   const recorderRef = useRef<SimpleRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const linkedSpeakersRef = useRef<any[]>([]);
 
   // Update recorder's playback volume when it changes
   useEffect(() => {
@@ -219,6 +222,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     if (sessionState.batchDuration !== undefined) setBatchDuration(sessionState.batchDuration);
     if (sessionState.silenceTimeout !== undefined) setSilenceTimeout(sessionState.silenceTimeout);
     if (sessionState.playbackDelay !== undefined) setPlaybackDelay(sessionState.playbackDelay);
+    if (sessionState.hardwareGracePeriod !== undefined) setHardwareGracePeriod(sessionState.hardwareGracePeriod);
     if (sessionState.audioThreshold !== undefined) setAudioThreshold(sessionState.audioThreshold);
     if (sessionState.sustainDuration !== undefined) setSustainDuration(sessionState.sustainDuration);
     if (sessionState.disableDelay !== undefined) setDisableDelay(sessionState.disableDelay);
@@ -265,6 +269,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
       batchDuration,
       silenceTimeout,
       playbackDelay,
+      hardwareGracePeriod,
       audioThreshold,
       sustainDuration,
       disableDelay,
@@ -295,7 +300,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
   }, [
     selectedDevices,
     selectedInputDevice,
-    batchDuration, silenceTimeout, playbackDelay, audioThreshold, sustainDuration, disableDelay,
+    batchDuration, silenceTimeout, playbackDelay, hardwareGracePeriod, audioThreshold, sustainDuration, disableDelay,
     targetVolume, rampEnabled, rampDuration, dayNightMode, dayStartHour, dayEndHour, nightRampDuration,
     playbackRampDuration, playbackStartVolume, playbackMaxVolume, playbackVolume,
     playbackRampEnabled, playbackRampStartVolume, playbackRampTargetVolume, playbackSessionRampDuration,
@@ -369,11 +374,15 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
         }
       }
 
+      // Store for emergency controls
+      linkedSpeakersRef.current = linkedSpeakers;
+
       // Create SimpleRecorder
       recorderRef.current = new SimpleRecorder({
         batchDuration,
         silenceTimeout,
         playbackDelay,
+        hardwareGracePeriod,
         audioThreshold,
         sustainDuration,
         linkedSpeakers,
@@ -448,60 +457,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
         onPlaybackLevel: (level) => {
           setPlaybackAudioLevel(level);
         },
-        setSpeakerZoneIP: async (speakers: any[], zoneIP: string) => {
-          if (speakers.length === 0) {
-            addLog(`⚠️  No speakers to control`, 'warning');
-            return;
-          }
-
-          // 🧪 EMULATION MODE: Skip API calls (SimpleRecorder handles virtual speakers internally)
-          if (emulationMode) {
-            const mode = zoneIP.includes(':50002') ? 'ACTIVE' : 'IDLE';
-            addLog(`🧪 EMULATION: Skipping API call for ${speakers.length} speakers' mcast.zone1 → ${zoneIP} (${mode})`, 'info');
-            return;
-          }
-
-          const mode = zoneIP.includes(':50002') ? 'ACTIVE' : 'IDLE';
-          addLog(`Setting ${speakers.length} speakers' mcast.zone1 to ${zoneIP} (${mode}) - in parallel`, 'info');
-
-          try {
-            // Set each speaker's mcast.zone1 in parallel
-            const results = await Promise.allSettled(
-              speakers.map(async (speaker) => {
-                const response = await fetch("/api/algo/settings", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    ipAddress: speaker.ipAddress,
-                    password: speaker.apiPassword || speaker.password,
-                    authMethod: speaker.authMethod || 'basic',
-                    settings: {
-                      "mcast.zone1": zoneIP,
-                    },
-                  }),
-                });
-
-                if (!response.ok) {
-                  throw new Error(`${speaker.name}: API returned ${response.status}`);
-                }
-
-                return { speaker: speaker.name, success: true };
-              })
-            );
-
-            const successCount = results.filter(r => r.status === 'fulfilled').length;
-            const failCount = speakers.length - successCount;
-
-            if (failCount > 0) {
-              addLog(`⚠️  ${successCount}/${speakers.length} speakers updated (${failCount} failed)`, 'warning');
-            } else {
-              addLog(`✓ All ${speakers.length} speakers' zone IP set to ${zoneIP}`, 'info');
-            }
-          } catch (error) {
-            addLog(`❌ Failed to set speaker zone IP: ${error}`, 'error');
-            throw error;
-          }
-        },
+        setSpeakerZoneIP: setSpeakersZoneIP,
         setSpeakerVolume: async (speakerId: string, volumePercent: number) => {
           // 🧪 EMULATION MODE: Skip API calls
           if (emulationMode) {
@@ -569,7 +525,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
       console.error('Failed to start monitoring:', error);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedInputDevice, batchDuration, silenceTimeout, playbackDelay, saveRecording, devices, selectedDevices, audioThreshold, emulationMode, emulationNetworkDelay]);
+  }, [selectedInputDevice, batchDuration, silenceTimeout, playbackDelay, hardwareGracePeriod, saveRecording, devices, selectedDevices, audioThreshold, emulationMode, emulationNetworkDelay]);
 
   // Stop monitoring
   const stopMonitoring = useCallback(async () => {
@@ -586,6 +542,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
         streamRef.current = null;
       }
 
+      linkedSpeakersRef.current = [];
       setIsMonitoring(false);
       addLog('✅ Monitoring stopped', 'info');
 
@@ -612,32 +569,10 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     setSelectedInputDevice(deviceId);
   }, []);
 
-  // Emergency Controls (TODO: Implement these properly)
-  const emergencyKillAll = useCallback(async () => {
-    addLog('🚨 Emergency Kill All requested (not implemented yet)', 'warning');
-  }, []);
-
-  const emergencyEnableAll = useCallback(async () => {
-    addLog('✅ Emergency Enable All requested (not implemented yet)', 'warning');
-  }, []);
-
-  const controlSingleSpeaker = useCallback(async (speakerId: string, enable: boolean) => {
-    addLog(`${enable ? 'Enabling' : 'Disabling'} speaker ${speakerId} (not implemented yet)`, 'warning');
-  }, []);
-
-  const checkSpeakerConnectivity = useCallback(async () => {
-    addLog('Checking speaker connectivity (not implemented yet)', 'warning');
-  }, []);
-
-  const triggerTestCall = useCallback((durationSeconds: number) => {
-    addLog(`Triggering test call for ${durationSeconds}s (not implemented yet)`, 'warning');
-  }, []);
-
   // Helper to get PST time
   const getPSTTime = () => {
     const now = new Date();
 
-    // Get PST time parts using Intl.DateTimeFormat
     const formatter = new Intl.DateTimeFormat('en-US', {
       timeZone: 'America/Los_Angeles',
       year: 'numeric',
@@ -671,19 +606,149 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     // Add to local state (for console/debugging)
     setLogs(prev => [...prev.slice(-99), logEntry]); // Keep last 100
 
-    // Write to Firebase Realtime Database (for /activity page)
-    if (user && loggingEnabled) {
-      const logRef = dbRef(realtimeDb, `logs/${user.uid}/${dateKey}`);
-      const newLogRef = push(logRef);
-      set(newLogRef, {
-        timestamp,
-        type: 'system', // Map to AudioLogEntry type
-        message,
-      }).catch((error) => {
-        console.error('[SimpleMonitoring] Failed to write log to Firebase:', error);
-      });
+    // Only persist key state-change events to Firebase — everything else is console-only
+    if (!user || !loggingEnabled) return;
+
+    let eventType: string | null = null;
+    let cleanMessage = message;
+
+    if (message.includes('VOICE DETECTED')) {
+      eventType = 'audio_detected';
+      cleanMessage = 'Voice detected';
+    } else if (message.includes('NEW SESSION CREATED')) {
+      eventType = 'system';
+      cleanMessage = 'Session started';
+    } else if (message.includes('SESSION CLOSED')) {
+      eventType = 'audio_silent';
+      cleanMessage = 'Session ended (silence timeout)';
+    } else if (message.includes('HARDWARE ACTIVATION COMPLETE')) {
+      eventType = 'speakers_enabled';
+      cleanMessage = 'Speakers activated';
+    } else if (message.includes('HARDWARE DEACTIVATION COMPLETE')) {
+      eventType = 'speakers_disabled';
+      cleanMessage = 'Speakers deactivated';
+    } else if (message.includes('SAVE COMPLETE')) {
+      eventType = 'system';
+      cleanMessage = 'Recording saved';
+    } else if (message.includes('Uploading:')) {
+      eventType = 'system';
+      const match = message.match(/Uploading: (.+)/);
+      cleanMessage = match ? `Uploading ${match[1]}` : 'Uploading recording';
+    } else if (message.includes('Monitoring started')) {
+      eventType = 'system';
+      cleanMessage = 'Monitoring started';
+    } else if (message.includes('Monitoring stopped')) {
+      eventType = 'system';
+      cleanMessage = 'Monitoring stopped';
     }
+
+    if (!eventType) return; // Not a key event — skip Firebase write
+
+    const logRef = dbRef(realtimeDb, `logs/${user.uid}/${dateKey}`);
+    const newLogRef = push(logRef);
+    set(newLogRef, {
+      timestamp,
+      type: eventType,
+      message: cleanMessage,
+    }).catch((error) => {
+      console.error('[SimpleMonitoring] Failed to write log to Firebase:', error);
+    });
   }, [user, loggingEnabled]);
+
+  // Set zone IP on a list of speakers (shared by SimpleRecorder and emergency controls)
+  const setSpeakersZoneIP = useCallback(async (speakers: any[], zoneIP: string) => {
+    if (speakers.length === 0) {
+      addLog(`⚠️  No speakers to control`, 'warning');
+      return;
+    }
+
+    if (emulationMode) {
+      const mode = zoneIP.includes(':50002') ? 'ACTIVE' : 'IDLE';
+      addLog(`🧪 EMULATION: Skipping API call for ${speakers.length} speakers' mcast.zone1 → ${zoneIP} (${mode})`, 'info');
+      return;
+    }
+
+    const mode = zoneIP.includes(':50002') ? 'ACTIVE' : 'IDLE';
+    addLog(`Setting ${speakers.length} speakers' mcast.zone1 to ${zoneIP} (${mode}) - in parallel`, 'info');
+
+    try {
+      const results = await Promise.allSettled(
+        speakers.map(async (speaker) => {
+          const response = await fetch("/api/algo/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ipAddress: speaker.ipAddress,
+              password: speaker.apiPassword || speaker.password,
+              authMethod: speaker.authMethod || 'basic',
+              settings: {
+                "mcast.zone1": zoneIP,
+              },
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`${speaker.name}: API returned ${response.status}`);
+          }
+
+          return { speaker: speaker.name, success: true };
+        })
+      );
+
+      const successCount = results.filter(r => r.status === 'fulfilled').length;
+      const failCount = speakers.length - successCount;
+
+      if (failCount > 0) {
+        addLog(`⚠️  ${successCount}/${speakers.length} speakers updated (${failCount} failed)`, 'warning');
+      } else {
+        addLog(`✓ All ${speakers.length} speakers' zone IP set to ${zoneIP}`, 'info');
+      }
+    } catch (error) {
+      addLog(`❌ Failed to set speaker zone IP: ${error}`, 'error');
+      throw error;
+    }
+  }, [emulationMode, addLog]);
+
+  // Emergency Controls — speakers only, never paging device
+  const emergencyKillAll = useCallback(async () => {
+    const speakers = linkedSpeakersRef.current;
+    if (speakers.length === 0) {
+      addLog('🚨 No linked speakers to mute', 'warning');
+      return;
+    }
+    addLog(`🚨 EMERGENCY: Muting all ${speakers.length} speakers (idle zone)...`, 'warning');
+    await setSpeakersZoneIP(speakers, '224.0.2.60:50022');
+  }, [setSpeakersZoneIP, addLog]);
+
+  const emergencyEnableAll = useCallback(async () => {
+    const speakers = linkedSpeakersRef.current;
+    if (speakers.length === 0) {
+      addLog('⚠️  No linked speakers to enable', 'warning');
+      return;
+    }
+    addLog(`✅ EMERGENCY: Enabling all ${speakers.length} speakers (active receiver zone)...`, 'info');
+    await setSpeakersZoneIP(speakers, '224.0.2.60:50002');
+  }, [setSpeakersZoneIP, addLog]);
+
+  const controlSingleSpeaker = useCallback(async (speakerId: string, enable: boolean) => {
+    const speakers = linkedSpeakersRef.current;
+    const speaker = speakers.find((s: any) => s.id === speakerId);
+    if (!speaker) {
+      addLog(`⚠️  Speaker ${speakerId} not found in linked speakers`, 'warning');
+      return;
+    }
+    const action = enable ? 'Enabling' : 'Muting';
+    addLog(`${action} speaker ${speaker.name}...`, 'info');
+    await setSpeakersZoneIP([speaker], enable ? '224.0.2.60:50002' : '224.0.2.60:50022');
+  }, [setSpeakersZoneIP, addLog]);
+
+  const checkSpeakerConnectivity = useCallback(async () => {
+    addLog('Checking speaker connectivity (not implemented yet)', 'warning');
+  }, []);
+
+  const triggerTestCall = useCallback((durationSeconds: number) => {
+    addLog(`Triggering test call for ${durationSeconds}s (not implemented yet)`, 'warning');
+  }, []);
 
   const value: SimpleMonitoringContextType = {
     // State
@@ -698,6 +763,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     batchDuration,
     silenceTimeout,
     playbackDelay,
+    hardwareGracePeriod,
     audioThreshold,
     sustainDuration,
     disableDelay,
@@ -749,6 +815,7 @@ export function SimpleMonitoringProvider({ children }: { children: React.ReactNo
     setBatchDuration,
     setSilenceTimeout,
     setPlaybackDelay,
+    setHardwareGracePeriod,
     setAudioThreshold,
     setSustainDuration,
     setDisableDelay,

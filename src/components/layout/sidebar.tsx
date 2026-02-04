@@ -5,7 +5,6 @@ import { usePathname } from "next/navigation";
 import {
   LayoutDashboard,
   Speaker,
-  Mic,
   Radio,
   Settings,
   LogOut,
@@ -15,7 +14,6 @@ import {
   Activity,
   Network,
   Lightbulb,
-  Gamepad2,
   FileAudio,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -36,16 +34,13 @@ const baseNavItems: NavItem[] = [
   { title: "Dashboard", href: "/", icon: LayoutDashboard, section: "Overview" },
   { title: "Station Zones", href: "/zones", icon: Map, section: "Overview" },
   { title: "Call Routing", href: "/distribute", icon: Activity, section: "Overview" },
-  { title: "Audio Input", href: "/live", icon: Mic, section: "Audio" },
-  { title: "Live V2 (Clean)", href: "/live-v2", icon: Radio, section: "Audio" },
-  { title: "PCM Streaming (Test)", href: "/live-pcm", icon: Radio, section: "Audio" },
+  { title: "Live Monitoring", href: "/live-v2", icon: Radio, section: "Audio" },
   { title: "Multi-Input Routing", href: "/input-routing", icon: Network, section: "Audio" },
   { title: "Output & Speakers", href: "/devices", icon: Speaker, section: "Audio" },
   { title: "PoE Devices", href: "/poe-devices", icon: Lightbulb, section: "Audio" },
   { title: "Activity Log", href: "/activity", icon: Activity, section: "System" },
   { title: "Settings", href: "/settings", icon: Settings, section: "System" },
   { title: "Recordings", href: "/recordings", icon: FileAudio, section: "Admin", adminOnly: true },
-  { title: "Control Center", href: "/admin/control", icon: Gamepad2, section: "Admin", adminOnly: true },
 ];
 
 interface SidebarProps {
@@ -214,7 +209,7 @@ export function Sidebar({ onLogout }: SidebarProps) {
               <div className="text-sm font-semibold text-[var(--text-primary)] truncate">
                 {user?.email?.split("@")[0] || "User"}
               </div>
-              <div className="text-xs text-[var(--text-muted)]">Administrator</div>
+              <div className="text-xs text-[var(--text-muted)]">{isAdmin ? "Administrator" : "User"}</div>
             </div>
             <button
               onClick={onLogout}

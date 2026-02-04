@@ -12,7 +12,7 @@ export function AudioMonitoringIndicator() {
   if (!isCapturing) return null;
 
   return (
-    <Link href="/live" className="lg:hidden">
+    <Link href="/live-v2" className="lg:hidden">
       <div
         className={`fixed bottom-4 right-4 z-50 flex items-center gap-3 rounded-xl border px-4 py-3 shadow-lg transition-all hover:shadow-xl ${
           speakersEnabled

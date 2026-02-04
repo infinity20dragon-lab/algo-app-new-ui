@@ -1046,7 +1046,9 @@ export function AudioMonitoringProvider({ children }: { children: React.ReactNod
           message: `Started MediaSource streaming (${recordedChunksRef.current.length} chunks from beginning)`,
         });
       } catch (playError) {
-        console.error('[Playback] Audio.play() failed:', playError);
+        if ((playError as Error).name !== 'AbortError') {
+          console.error('[Playback] Audio.play() failed:', playError);
+        }
       }
 
     } catch (error) {

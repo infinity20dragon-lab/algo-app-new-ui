@@ -4,44 +4,31 @@ import { AppLayout } from "@/components/layout/app-layout";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { PasswordInput } from "@/components/ui/password-input";
 import { Label } from "@/components/ui/label";
 import { useAuth } from "@/contexts/auth-context";
-import { Settings2, User, Info, Shield, Volume2, VolumeX, CheckCircle2, Radio } from "lucide-react";
+import { Settings2, User, Info, VolumeX, CheckCircle2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import { useState, useEffect } from "react";
+import { useSimpleMonitoring } from "@/contexts/simple-monitoring-context";
 
 export default function SettingsPage() {
   const { user } = useAuth();
+  const { loggingEnabled, setLoggingEnabled, recordingEnabled, setRecordingEnabled } = useSimpleMonitoring();
 
   const [idleVolume, setIdleVolume] = useState<number>(-45);
-  const [defaultVolume, setDefaultVolume] = useState<number>(50);
-  const [alwaysKeepPagingOn, setAlwaysKeepPagingOn] = useState<boolean>(false);
   const [savedMessage, setSavedMessage] = useState<string | null>(null);
 
   // Load settings from localStorage
   useEffect(() => {
     const savedIdleVolume = localStorage.getItem("algoapp-idle-volume");
-    const savedDefaultVolume = localStorage.getItem("algoapp-default-volume");
-    const savedPagingMode = localStorage.getItem("algoapp-always-keep-paging-on");
-
     if (savedIdleVolume) {
       setIdleVolume(parseInt(savedIdleVolume));
-    }
-    if (savedDefaultVolume) {
-      setDefaultVolume(parseInt(savedDefaultVolume));
-    }
-    if (savedPagingMode) {
-      setAlwaysKeepPagingOn(savedPagingMode === "true");
     }
   }, []);
 
   const handleSaveSettings = () => {
     try {
       localStorage.setItem("algoapp-idle-volume", idleVolume.toString());
-      localStorage.setItem("algoapp-default-volume", defaultVolume.toString());
-      localStorage.setItem("algoapp-always-keep-paging-on", alwaysKeepPagingOn.toString());
-
       setSavedMessage("Settings saved! Restart monitoring for changes to take effect.");
       setTimeout(() => setSavedMessage(null), 5000);
     } catch (error) {
@@ -92,45 +79,14 @@ export default function SettingsPage() {
                 <Settings2 className="h-5 w-5 text-[var(--accent-purple)]" />
               </div>
               <div>
-                <CardTitle>Default Settings</CardTitle>
+                <CardTitle>Audio & Recording</CardTitle>
                 <CardDescription>
-                  Default values for new devices and distributions
+                  Speaker and recording preferences
                 </CardDescription>
               </div>
             </div>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="defaultPassword" className="flex items-center gap-2">
-                <Shield className="h-4 w-4 text-[var(--text-muted)]" />
-                Default API Password
-              </Label>
-              <PasswordInput
-                id="defaultPassword"
-                defaultValue="algo"
-                placeholder="algo"
-              />
-              <p className="text-sm text-[var(--text-muted)]">
-                Used as the default password when adding new devices
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="defaultVolume" className="flex items-center gap-2">
-                <Volume2 className="h-4 w-4 text-[var(--text-muted)]" />
-                Default Volume
-              </Label>
-              <Input
-                id="defaultVolume"
-                type="number"
-                min={0}
-                max={100}
-                value={defaultVolume}
-                onChange={(e) => setDefaultVolume(parseInt(e.target.value) || 50)}
-              />
-              <p className="text-sm text-[var(--text-muted)]">
-                Default volume level for new distributions (0-100)
-              </p>
-            </div>
             <div className="space-y-2">
               <Label htmlFor="idleVolume" className="flex items-center gap-2">
                 <VolumeX className="h-4 w-4 text-[var(--text-muted)]" />
@@ -168,31 +124,21 @@ export default function SettingsPage() {
                 Volume level for speakers when idle/off (Level -5 to Level 10). Default: Level -5 (-45dB). Restart monitoring for changes to take effect.
               </p>
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="pagingMode" className="flex items-center gap-2">
-                <Radio className="h-4 w-4 text-[var(--text-muted)]" />
-                Paging Device Mode
-              </Label>
-              <div className="flex items-center gap-3 p-4 rounded-xl border border-[var(--border-color)] bg-[var(--bg-secondary)]">
-                <Switch
-                  id="pagingMode"
-                  checked={alwaysKeepPagingOn}
-                  onCheckedChange={setAlwaysKeepPagingOn}
-                />
-                <div className="flex-1">
-                  <Label htmlFor="pagingMode" className="text-sm font-medium cursor-pointer">
-                    Always Keep Paging Device in Transmitter Mode
-                  </Label>
-                  <p className="text-xs text-[var(--text-muted)] mt-1">
-                    {alwaysKeepPagingOn
-                      ? "Paging device stays in Mode 1 (transmitting) at all times - no switching"
-                      : "Paging device toggles: Mode 0 (off) when idle, Mode 1 (transmitting) when audio detected"}
-                  </p>
-                </div>
+            <div className="flex items-center justify-between">
+              <div>
+                <Label className="!text-[var(--text-primary)]">Activity Logging</Label>
+                <p className="text-xs text-[var(--text-muted)]">Log events to the activity viewer</p>
               </div>
-              <p className="text-sm text-[var(--text-muted)]">
-                Enable this if you experience delays or issues with mode switching. Keeps paging device always ready to transmit.
-              </p>
+              <Switch checked={loggingEnabled} onCheckedChange={setLoggingEnabled} />
+            </div>
+            <div className="flex items-center justify-between">
+              <div>
+                <Label className="!text-[var(--text-primary)]">Save Recordings</Label>
+                <p className="text-xs text-[var(--text-muted)]">
+                  {recordingEnabled ? "Saving to Firebase Storage" : "Not saving"}
+                </p>
+              </div>
+              <Switch checked={recordingEnabled} onCheckedChange={setRecordingEnabled} />
             </div>
             <div className="flex items-center gap-3">
               <Button onClick={handleSaveSettings}>Save Settings</Button>

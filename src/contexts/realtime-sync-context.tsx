@@ -80,6 +80,7 @@ export interface SessionState {
   // New SimpleRecorder settings (live-v2 page)
   batchDuration: number; // Batch recording duration (ms)
   silenceTimeout: number; // Silence timeout before stopping (ms)
+  hardwareGracePeriod: number; // How long to keep speakers active after session ends (ms)
   playbackRampEnabled: boolean; // Enable per-session volume ramping
   playbackRampStartVolume: number; // Ramp start volume (0-2)
   playbackRampTargetVolume: number; // Ramp target volume (0-2)

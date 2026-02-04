@@ -198,7 +198,7 @@ export default function RecordingsPage() {
 
       // Play new recording
       const audio = new Audio(recording.storageUrl);
-      audio.play();
+      audio.play().catch((e: Error) => { if (e.name !== 'AbortError') throw e; });
       audio.onended = () => setPlayingRecording(null);
       setAudioElement(audio);
       setPlayingRecording(recording.id);

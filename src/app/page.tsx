@@ -296,16 +296,16 @@ export default function DashboardPage() {
             </CardHeader>
             <CardContent className="space-y-3">
               <Link
-                href="/live"
+                href="/live-v2"
                 className="flex items-center gap-3 rounded-xl border border-[var(--border-color)] p-4 transition-all hover:border-[var(--accent-blue)]/50 hover:bg-[var(--bg-tertiary)]"
               >
                 <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--accent-blue)]/15">
                   <Mic className="h-5 w-5 text-[var(--accent-blue)]" />
                 </div>
                 <div className="flex-1">
-                  <p className="font-semibold text-[var(--text-primary)]">Audio Input</p>
+                  <p className="font-semibold text-[var(--text-primary)]">Live Monitoring</p>
                   <p className="text-sm text-[var(--text-muted)]">
-                    Monitor and broadcast audio
+                    Monitor and broadcast audio live
                   </p>
                 </div>
                 <ArrowRight className="h-4 w-4 text-[var(--text-muted)]" />
